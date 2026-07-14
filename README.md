@@ -2,7 +2,7 @@
 
 一款面向 Android 8.0 及以上系统的超轻量 WebView 浏览器，重点关注极小安装体积、本地隐私、安全边界与可调性能。
 
-> **当前版本：1.4.0-500kb-rc2（Release Candidate）**  
+> **当前版本：1.4.0（Release Candidate）**  
 > 当前版本适合源码审查和测试，不应视为已经完成大规模真机验证的稳定版。
 
 ## 核心特性
@@ -32,8 +32,6 @@
 - 包名：`com.xinyv.median.compat`
 - `minSdk 26`，`targetSdk 36`
 - 签名 APK：**189,054 字节，约 184.6 KiB**
-
-500 KiB 是发行体积预算，不代表 Android System WebView 或安装后总占用仅有 500 KiB。网页渲染能力及部分兼容性取决于设备上的 System WebView。
 
 ## 安全与隐私
 
@@ -75,25 +73,6 @@ export MEDIAN_KEYPASS='...'
 
 已完成静态检查、Java 17 编译、R8 收缩、单 DEX 打包、APK 完整性检查和 v2/v3 签名验证。
 
-仍需完成：
-
-- Android 8–16 真机与主要 OEM WebView 测试
-- 摄像头、麦克风、定位、下载和隐私窗口端到端验证
-- 冷启动、总 PSS、掉帧、耗电、温控、崩溃和 ANR 测试
-- Google Play 预发布报告与生产签名 AAB 验证
-
-## 发布文件建议
-
-最小 GitHub 发布包可包含：
-
-```text
-README.md
-MedianBrowser-1.4.0-500kb-rc2-source.zip
-MedianBrowser-1.4.0-500kb-rc2.apk
-SHA256SUMS.txt
-```
-
-测试 APK 使用测试证书，不得上传 Google Play。
 
 ## 许可
 
