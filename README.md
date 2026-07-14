@@ -1,5 +1,7 @@
 # Median Browser
 
+作者太懒了不想传文件，想看源码就解压缩包吧（doge）
+
 一款面向 Android 8.0 及以上系统的超轻量 WebView 浏览器，重点关注极小安装体积、本地隐私、安全边界与可调性能。
 
 > **当前版本：1.4.0（Release Candidate）**  
