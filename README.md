@@ -1,5 +1,6 @@
 # Median Browser
 
+
 ## 项目介绍
 
 Median Browser 是一款面向 Android 的轻量浏览器，目标不是堆叠大量在线服务，而是在尽可能小的体积内，提供快速、稳定、可控的网页浏览体验。它基于设备自带的 Android System WebView，尽量复用系统已经提供的渲染、安全与媒体能力，把更多精力放在标签管理、隐私控制、下载、用户脚本和低内存设备适配上。
@@ -22,8 +23,7 @@ Median 的核心取向是 **快、稳、轻、可控**：
 
 Median 不是独立浏览器内核。网页兼容性、JavaScript 性能、媒体格式和安全补丁仍取决于设备上的 Android System WebView。项目的目标是在这一基础上，提供一个更完整、更轻量、更可控的浏览器外壳。
 
-当前版本：**2.1.9**  
-包名：`com.xinyv.median.compat`  
+当前版本：**2.1.9** 
 最低系统：Android 8.0（API 26）  
 目标系统：Android 16（API 36）
 
