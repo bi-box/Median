@@ -11,6 +11,12 @@
 
 ---
 
+## 📢 官方社区
+
+加入 MedianBrowser Beta Telegram 频道：
+
+👉 https://t.me/MedianBeta
+
 ## 简介
 
 MedianBrowser 是一款基于 Android 原生 WebView 构建的轻量级浏览器。
