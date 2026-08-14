@@ -1,0 +1,34 @@
+APK build completed in the ChatGPT workspace on 2026-08-13.
+Result: release APK produced and verified with the attached long-term update signing backup.
+
+Build path:
+- AAPT2 2.19-11948202 resource compile/link against API 36 resources
+- Java 17 compile against the API 36 Android platform
+- R8 8.6.2 release shrinking
+- 4-byte ZIP alignment
+- APK Signature Scheme v2 and v3
+
+Verified output:
+- applicationId: com.xinyv.median.compat
+- versionName: 2.1.16
+- versionCode: 80
+- minSdk: 26
+- targetSdk / compileSdk: 36
+- certificate SHA-256: 80daf48c091d6174981c2a176360b42ac32463d23ddc9e5f3c95c0951e5e3da9
+- APK size: 230271 bytes
+- APK SHA-256: 9dabaf9cb91f14aed7075653bdcc0124e8abeb80bf2d30c18e66f1191e886737
+
+Verification:
+- JVM and generated homepage/userscript JavaScript self-tests: passed
+- Bookmark folder recursive deletion and bookmark-to-root self-test: passed
+- UserScript input detection, retry status and timeout policy self-test: passed
+- HTTPS redirect/public-host network policy self-test: passed
+- Android XML/static safety checks: passed
+- API 36 full Java compile and R8: passed
+- Final DEX contains the direct folder-delete and script-import paths: passed
+- Continuous DOM observer/aggressive dark-mode code remains absent: passed
+- ZIP integrity: passed
+- v2 signature: passed
+- v3 signature: passed
+- Update certificate matches Median Browser 2.1.15: passed
+- 500 KiB target: passed (281729 bytes remaining)
