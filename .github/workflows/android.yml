@@ -1,0 +1,40 @@
+name: Android CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+          cache-read-only: ${{ github.event_name == 'pull_request' }}
+      - name: Static security checks
+        run: ./tools/static_checks.sh
+      - name: Lint, tests and build
+        run: ./gradlew --no-daemon clean lintDebug testDebugUnitTest assembleDebug bundleRelease
+      - name: Checksums
+        run: sha256sum app/build/outputs/apk/debug/app-debug.apk app/build/outputs/bundle/release/app-release.aab | tee SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: median-ci-${{ github.sha }}
+          if-no-files-found: error
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/bundle/release/app-release.aab
+            app/build/reports/lint-results-debug.html
+            app/build/test-results/testDebugUnitTest/
+            SHA256SUMS.txt

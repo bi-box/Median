@@ -1,0 +1,51 @@
+name: Android instrumentation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  emulator:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.13'
+      - name: Install Android emulator image
+        run: |
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          AVDMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" 'platforms;android-36' 'build-tools;36.0.0' 'platform-tools' 'emulator' 'system-images;android-35;google_apis;x86_64'
+          echo no | "$AVDMANAGER" create avd --force --name median-ci --package 'system-images;android-35;google_apis;x86_64'
+      - name: Start emulator
+        run: |
+          sudo chmod 666 /dev/kvm || true
+          nohup emulator -avd median-ci -no-window -no-audio -no-boot-anim -gpu swiftshader_indirect -no-snapshot > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          timeout 300 adb wait-for-device
+          timeout 240 bash -c 'until [ "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1" ]; do sleep 2; done'
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+      - name: Run connected tests
+        run: ./gradlew --no-daemon connectedDebugAndroidTest
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: median-instrumentation-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            app/build/reports/androidTests/connected/
+            app/build/outputs/androidTest-results/connected/
+            ${{ runner.temp }}/emulator.log

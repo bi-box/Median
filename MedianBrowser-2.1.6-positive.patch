@@ -1,0 +1,408 @@
+diff -ruN MedianBrowser-2.1.6-optimized-source/ONE_CLICK_UPDATE.md MedianBrowser-2.1.6-positive-source/ONE_CLICK_UPDATE.md
+--- MedianBrowser-2.1.6-optimized-source/ONE_CLICK_UPDATE.md	1970-01-01 00:00:00.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/ONE_CLICK_UPDATE.md	2026-07-17 05:48:44.370470444 +0000
+@@ -0,0 +1,27 @@
++# Median Browser 2.1.6 Positive1 更新包
++
++这个包基于 `MedianBrowser-2.1.6-optimized-source`，保留正向优化，并把可能有负优化风险的点改成更保守的正优化。
++
++## 一键构建签名更新 APK
++
++把 `MedianBrowser-signing-backup.zip` 放在本目录、上一级目录，或直接传路径：
++
++```bash
++./build-update.sh /path/to/MedianBrowser-signing-backup.zip
++```
++
++生成文件：
++
++```text
++out/500kb/MedianBrowser-2.1.6-positive1.apk
++```
++
++要求本机已安装 Android SDK / Build Tools，并设置 `ANDROID_SDK_ROOT` 或 `ANDROID_HOME`。
++
++## 版本信息
++
++- `applicationId`: `com.xinyv.median.compat`
++- `versionCode`: `70`
++- `versionName`: `2.1.6-positive1`
++
++`versionCode` 已经高于 2.1.6 的 `69`，用于 Android 原地更新。
+diff -ruN MedianBrowser-2.1.6-optimized-source/POSITIVE_OPTIMIZATION_REPORT_2.1.6_P1.md MedianBrowser-2.1.6-positive-source/POSITIVE_OPTIMIZATION_REPORT_2.1.6_P1.md
+--- MedianBrowser-2.1.6-optimized-source/POSITIVE_OPTIMIZATION_REPORT_2.1.6_P1.md	1970-01-01 00:00:00.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/POSITIVE_OPTIMIZATION_REPORT_2.1.6_P1.md	2026-07-17 05:48:44.384667031 +0000
+@@ -0,0 +1,62 @@
++# Positive Optimization Patch 2.1.6-p1
++
++## 结论
++
++本修正版保留优化版中确定正向的优化：
++
++- 广告规则选择器去重改为 HashSet，避免 O(n²)；
++- 浏览数据写盘改为锁内快照、锁外序列化；
++- 写盘失败后延迟重试；
++- 过滤订阅更新防止重复任务堆积。
++
++同时修正可能被视为负优化或边界退化的地方。
++
++## 修正 1：URL 比较加回规范化兜底
++
++优化版把部分 `normalizeUrl(item.url).equals(normalized)` 改为 `item.url.equals(normalized)`。理论上当前写入路径都会保存规范化 URL，快路径是成立的；但为了兼容旧数据、异常导入数据、未来格式变化，本版改为：
++
++```java
++sameNormalizedUrl(stored, normalized)
++```
++
++逻辑：
++
++1. 先直接比较，保留快路径；
++2. 不相等时再对存量 URL 做 `normalizeUrl` 兜底。
++
++这避免了历史/书签去重在旧数据下退化。
++
++## 修正 2：订阅更新从“拒绝重复请求”改为“有条件合并”
++
++优化版防止重复点击导致网络任务堆积，这是正优化；但如果自动更新正在跑，用户又手动点了完整更新，直接返回“正在更新”可能让手动意图丢失。
++
++本版保留单任务队列，同时增加：
++
++```java
++manualUpdatePending
++automaticUpdateInFlight
++collectUpdateTargets(runAutomatic)
++```
++
++行为：
++
++- 手动更新撞上自动更新：排队一次完整更新；
++- 手动更新撞上手动更新：不重复排队；
++- 自动更新撞上任何更新：仍然合并，避免后台堆积。
++
++## 修正 3：版本号可原地安装
++
++- `versionCode`: 69 → 70
++- `versionName`: 2.1.6 → 2.1.6-positive1
++
++避免构建出的 APK 因版本号未提升而无法覆盖安装。
++
++## 验证
++
++已通过：
++
++```bash
++./tools/static_checks.sh
++```
++
++当前环境没有 Android SDK / Build Tools，因此没有在沙盒内生成可安装 APK。包内提供了 `build-update.sh`，在本机 Android 构建环境中可直接生成签名更新 APK。
+diff -ruN MedianBrowser-2.1.6-optimized-source/app/build.gradle MedianBrowser-2.1.6-positive-source/app/build.gradle
+--- MedianBrowser-2.1.6-optimized-source/app/build.gradle	2026-07-17 04:08:09.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/app/build.gradle	2026-07-17 05:47:18.871171103 +0000
+@@ -3,8 +3,8 @@
+ }
+ 
+ 
+-final int medianVersionCode = 69
+-final String medianVersionName = '2.1.6'
++final int medianVersionCode = 70
++final String medianVersionName = '2.1.6-positive1'
+ 
+ android {
+     namespace 'com.xinyv.median'
+diff -ruN MedianBrowser-2.1.6-optimized-source/app/src/main/java/com/xinyv/median/BrowserDataStore.java MedianBrowser-2.1.6-positive-source/app/src/main/java/com/xinyv/median/BrowserDataStore.java
+--- MedianBrowser-2.1.6-optimized-source/app/src/main/java/com/xinyv/median/BrowserDataStore.java	2026-07-17 05:29:02.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/app/src/main/java/com/xinyv/median/BrowserDataStore.java	2026-07-17 05:47:18.873423420 +0000
+@@ -107,7 +107,7 @@
+     boolean isBookmarked(String url) {
+         String normalized = normalizeUrl(url);
+         synchronized (lock) {
+-            for (Bookmark item : bookmarks) if (item.url.equals(normalized)) return true;
++            for (Bookmark item : bookmarks) if (sameNormalizedUrl(item.url, normalized)) return true;
+         }
+         return false;
+     }
+@@ -118,7 +118,7 @@
+         boolean added = true;
+         synchronized (lock) {
+             for (int i = bookmarks.size() - 1; i >= 0; i--) {
+-                if (bookmarks.get(i).url.equals(normalized)) {
++                if (sameNormalizedUrl(bookmarks.get(i).url, normalized)) {
+                     bookmarks.remove(i);
+                     added = false;
+                 }
+@@ -137,7 +137,7 @@
+         boolean changed = false;
+         synchronized (lock) {
+             for (int i = bookmarks.size() - 1; i >= 0; i--) {
+-                if (bookmarks.get(i).url.equals(normalized)) {
++                if (sameNormalizedUrl(bookmarks.get(i).url, normalized)) {
+                     bookmarks.remove(i);
+                     changed = true;
+                 }
+@@ -152,13 +152,13 @@
+         long now = System.currentTimeMillis();
+         synchronized (lock) {
+             HistoryItem previous = history.size() == 0 ? null : history.get(0);
+-            if (previous != null && previous.url.equals(normalized) && now - previous.visitedAt < 90_000L) {
++            if (previous != null && sameNormalizedUrl(previous.url, normalized) && now - previous.visitedAt < 90_000L) {
+                 history.set(0, new HistoryItem(safeTitle(title, normalized), normalized, now, previous.visits + 1));
+             } else {
+                 int visits = 1;
+                 for (int i = history.size() - 1; i >= 0; i--) {
+                     HistoryItem item = history.get(i);
+-                    if (item.url.equals(normalized)) {
++                    if (sameNormalizedUrl(item.url, normalized)) {
+                         visits = item.visits + 1;
+                         history.remove(i);
+                         break;
+@@ -303,7 +303,7 @@
+         int imported = 0;
+         synchronized (lock) {
+             HashSet<String> known = new HashSet<String>();
+-            for (Bookmark current : bookmarks) known.add(current.url);
++            for (Bookmark current : bookmarks) known.add(normalizeUrl(current.url));
+             for (int i = 0; i < incoming.length() && bookmarks.size() < MAX_BOOKMARKS; i++) {
+                 JSONObject value = incoming.optJSONObject(i);
+                 if (value == null) continue;
+@@ -503,6 +503,12 @@
+         }
+     }
+ 
++    private static boolean sameNormalizedUrl(String stored, String normalized) {
++        if (stored == null) return normalized == null || normalized.length() == 0;
++        if (stored.equals(normalized)) return true;
++        return normalizeUrl(stored).equals(normalized);
++    }
++
+     private static String normalizeUrl(String url) {
+         if (url == null) return "";
+         String value = url.trim();
+diff -ruN MedianBrowser-2.1.6-optimized-source/app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java MedianBrowser-2.1.6-positive-source/app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
+--- MedianBrowser-2.1.6-optimized-source/app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java	2026-07-17 05:29:14.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java	2026-07-17 05:47:42.443241281 +0000
+@@ -74,6 +74,8 @@
+     private final ThreadPoolExecutor worker = (ThreadPoolExecutor) Executors.newFixedThreadPool(1);
+     private final Handler main = new Handler(Looper.getMainLooper());
+     private final AtomicBoolean updateInFlight = new AtomicBoolean();
++    private final AtomicBoolean manualUpdatePending = new AtomicBoolean();
++    private volatile boolean automaticUpdateInFlight;
+     private volatile boolean closed;
+ 
+     FilterSubscriptionStore(Context context) {
+@@ -168,13 +170,18 @@
+ 
+     void updateEnabled(final boolean automatic, final Callback callback) {
+         if (closed || worker.isShutdown()) return;
+-        // A manual double tap used to enqueue another complete network refresh in the
+-        // executor's unbounded queue. Coalesce it instead so callbacks and Activities
+-        // cannot accumulate behind a slow subscription server.
++        // Keep the optimized bounded queue, but do not lose a user-triggered manual
++        // refresh that arrives while a cheaper automatic refresh is already running.
+         if (!updateInFlight.compareAndSet(false, true)) {
+-            postResult(callback, 0, 0, 0, "过滤订阅正在更新");
++            if (!automatic && automaticUpdateInFlight) {
++                manualUpdatePending.set(true);
++                postResult(callback, 0, 0, 0, "过滤订阅正在自动更新，已排队完整更新");
++            } else {
++                postResult(callback, 0, 0, 0, "过滤订阅正在更新");
++            }
+             return;
+         }
++        manualUpdatePending.set(false);
+         try {
+             worker.execute(new Runnable() {
+                 @Override public void run() {
+@@ -182,45 +189,61 @@
+                     int unchanged = 0;
+                     int failed = 0;
+                     String lastError = "";
++                    boolean runAutomatic = automatic;
+                     try {
+                         try { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND); } catch (RuntimeException ignored) {}
+-                        ArrayList<Subscription> targets = new ArrayList<Subscription>();
+-                        long now = System.currentTimeMillis();
+-                        synchronized (FilterSubscriptionStore.this) {
+-                            for (Subscription item : subscriptions) {
+-                                if (!item.enabled) continue;
+-                                if (!automatic || item.updatedAt == 0L || now - item.updatedAt >= AUTO_UPDATE_INTERVAL)
+-                                    targets.add(item.copy());
+-                            }
+-                        }
+-                        for (Subscription target : targets) {
+-                            try {
+-                                int state = updateOne(target);
+-                                if (state > 0) updated++; else unchanged++;
+-                            } catch (Exception error) {
+-                                failed++;
+-                                lastError = safeMessage(error);
+-                                updateMetadata(target.id, null, -1, null, null, lastError);
++                        while (true) {
++                            automaticUpdateInFlight = runAutomatic;
++                            ArrayList<Subscription> targets = collectUpdateTargets(runAutomatic);
++                            for (Subscription target : targets) {
++                                try {
++                                    int state = updateOne(target);
++                                    if (state > 0) updated++; else unchanged++;
++                                } catch (Exception error) {
++                                    failed++;
++                                    lastError = safeMessage(error);
++                                    updateMetadata(target.id, null, -1, null, null, lastError);
++                                }
+                             }
++                            if (!manualUpdatePending.getAndSet(false)) break;
++                            runAutomatic = false;
+                         }
+                     } catch (RuntimeException error) {
+                         failed++;
+                         lastError = safeMessage(error);
+                     } finally {
++                        automaticUpdateInFlight = false;
+                         updateInFlight.set(false);
+                         postResult(callback, updated, unchanged, failed, lastError);
+                     }
+                 }
+             });
+         } catch (RejectedExecutionException error) {
++            automaticUpdateInFlight = false;
++            manualUpdatePending.set(false);
+             updateInFlight.set(false);
+             postResult(callback, 0, 0, 1, "过滤订阅服务正忙");
+         }
+     }
+ 
++    private ArrayList<Subscription> collectUpdateTargets(boolean automatic) {
++        ArrayList<Subscription> targets = new ArrayList<Subscription>();
++        long now = System.currentTimeMillis();
++        synchronized (FilterSubscriptionStore.this) {
++            for (Subscription item : subscriptions) {
++                if (!item.enabled) continue;
++                if (!automatic || item.updatedAt == 0L || now - item.updatedAt >= AUTO_UPDATE_INTERVAL)
++                    targets.add(item.copy());
++            }
++        }
++        return targets;
++    }
++
+     void close() {
+         closed = true;
+         worker.shutdownNow();
++        manualUpdatePending.set(false);
++        automaticUpdateInFlight = false;
+         updateInFlight.set(false);
+         main.removeCallbacksAndMessages(null);
+     }
+diff -ruN MedianBrowser-2.1.6-optimized-source/build-update.sh MedianBrowser-2.1.6-positive-source/build-update.sh
+--- MedianBrowser-2.1.6-optimized-source/build-update.sh	1970-01-01 00:00:00.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/build-update.sh	2026-07-17 05:48:44.321542406 +0000
+@@ -0,0 +1,21 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")" && pwd)"
++cd "$ROOT"
++
++SIGNING_ZIP="${1:-}"
++if [[ -z "$SIGNING_ZIP" ]]; then
++  if [[ -f "$ROOT/MedianBrowser-signing-backup.zip" ]]; then
++    SIGNING_ZIP="$ROOT/MedianBrowser-signing-backup.zip"
++  elif [[ -f "$ROOT/_private_signing/MedianBrowser-signing-backup.zip" ]]; then
++    SIGNING_ZIP="$ROOT/_private_signing/MedianBrowser-signing-backup.zip"
++  elif [[ -f "$ROOT/../MedianBrowser-signing-backup.zip" ]]; then
++    SIGNING_ZIP="$ROOT/../MedianBrowser-signing-backup.zip"
++  else
++    echo "找不到 MedianBrowser-signing-backup.zip。" >&2
++    echo "用法：./build-update.sh /path/to/MedianBrowser-signing-backup.zip" >&2
++    exit 2
++  fi
++fi
++
++./tools/build_signed_update.sh "$SIGNING_ZIP"
+diff -ruN MedianBrowser-2.1.6-optimized-source/tools/build_500kb_apk.sh MedianBrowser-2.1.6-positive-source/tools/build_500kb_apk.sh
+--- MedianBrowser-2.1.6-optimized-source/tools/build_500kb_apk.sh	2026-07-17 04:09:14.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/tools/build_500kb_apk.sh	2026-07-17 05:47:18.872051016 +0000
+@@ -8,8 +8,8 @@
+ ANDROID_JAR="$SDK_ROOT/platforms/android-36/android.jar"
+ OUT="${OUT_DIR:-$ROOT/out/500kb}"
+ APPLICATION_ID="${APPLICATION_ID:-com.xinyv.median.compat}"
+-VERSION_CODE="${VERSION_CODE:-69}"
+-VERSION_NAME="${VERSION_NAME:-2.1.6}"
++VERSION_CODE="${VERSION_CODE:-70}"
++VERSION_NAME="${VERSION_NAME:-2.1.6-positive1}"
+ 
+ : "${SDK_ROOT:?Set ANDROID_SDK_ROOT or ANDROID_HOME}"
+ for tool in aapt2 zipalign apksigner; do
+diff -ruN MedianBrowser-2.1.6-optimized-source/tools/build_signed_update.sh MedianBrowser-2.1.6-positive-source/tools/build_signed_update.sh
+--- MedianBrowser-2.1.6-optimized-source/tools/build_signed_update.sh	1970-01-01 00:00:00.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/tools/build_signed_update.sh	2026-07-17 05:48:44.347694999 +0000
+@@ -0,0 +1,41 @@
++#!/usr/bin/env bash
++set -euo pipefail
++ROOT="$(cd "$(dirname "$0")/.." && pwd)"
++cd "$ROOT"
++
++SIGNING_ZIP="${1:-}"
++[[ -n "$SIGNING_ZIP" && -f "$SIGNING_ZIP" ]] || {
++  echo "需要签名备份 zip：./tools/build_signed_update.sh /path/to/MedianBrowser-signing-backup.zip" >&2
++  exit 2
++}
++
++TMP="$(mktemp -d)"
++trap 'rm -rf "$TMP"' EXIT
++unzip -q "$SIGNING_ZIP" -d "$TMP"
++KEYSTORE="$TMP/MedianBrowser-update-key.p12"
++README="$TMP/MedianBrowser-signing-key-README.txt"
++[[ -f "$KEYSTORE" && -f "$README" ]] || { echo "签名备份缺少 key 或 README。" >&2; exit 2; }
++
++STOREPASS="$(awk -F': ' '/^Store password:/ {print $2}' "$README" | head -n1)"
++KEYPASS="$(awk -F': ' '/^Key password:/ {print $2}' "$README" | head -n1)"
++ALIAS="$(awk -F': ' '/^Alias:/ {print $2}' "$README" | head -n1)"
++[[ -n "$STOREPASS" && -n "$KEYPASS" && -n "$ALIAS" ]] || { echo "无法从签名 README 读取密码或 alias。" >&2; exit 2; }
++
++export MEDIAN_KEYSTORE="$KEYSTORE"
++export MEDIAN_STOREPASS="$STOREPASS"
++export MEDIAN_KEY_ALIAS="$ALIAS"
++export MEDIAN_KEYPASS="$KEYPASS"
++
++if [[ -z "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}" ]]; then
++  echo "请先设置 ANDROID_SDK_ROOT 或 ANDROID_HOME。" >&2
++  exit 2
++fi
++
++# Fast, self-contained signed APK build path. Override VERSION_CODE/NAME only if you know what you are doing.
++export VERSION_CODE="${VERSION_CODE:-70}"
++export VERSION_NAME="${VERSION_NAME:-2.1.6-positive1}"
++./tools/build_500kb_apk.sh
++
++echo
++echo "已生成签名更新 APK：out/500kb/MedianBrowser-${VERSION_NAME}.apk"
++echo "SHA-256：$(cat "out/500kb/MedianBrowser-${VERSION_NAME}.apk.sha256")"
+diff -ruN MedianBrowser-2.1.6-optimized-source/tools/static_checks.sh MedianBrowser-2.1.6-positive-source/tools/static_checks.sh
+--- MedianBrowser-2.1.6-optimized-source/tools/static_checks.sh	2026-07-17 05:30:41.000000000 +0000
++++ MedianBrowser-2.1.6-positive-source/tools/static_checks.sh	2026-07-17 05:47:50.410102456 +0000
+@@ -20,8 +20,8 @@
+   echo 'Stale release/debug metadata found.' >&2
+   exit 1
+ fi
+-rg -q "medianVersionCode = 69" app/build.gradle
+-rg -q "medianVersionName = '2.1.6'" app/build.gradle
++rg -q "medianVersionCode = 70" app/build.gradle
++rg -q "medianVersionName = '2.1.6-positive1'" app/build.gradle
+ rg -q "applicationId 'com.xinyv.median.compat'" app/build.gradle
+ rg -q 'targetSdk 36' app/build.gradle
+ if rg -n '^[[:space:]]*implementation[[:space:]]' app/build.gradle; then
+@@ -56,6 +56,7 @@
+ rg -Fq 'if (!changed) return' app/src/main/java/com/xinyv/median/BrowserDataStore.java
+ rg -Fq 'if (!dirty) return' app/src/main/java/com/xinyv/median/BrowserDataStore.java
+ rg -Fq 'bookmarkSnapshot = new ArrayList<Bookmark>(bookmarks)' app/src/main/java/com/xinyv/median/BrowserDataStore.java
++rg -Fq 'sameNormalizedUrl(item.url, normalized)' app/src/main/java/com/xinyv/median/BrowserDataStore.java
+ rg -Fq 'io.postDelayed(writer, WRITE_RETRY_MS)' app/src/main/java/com/xinyv/median/BrowserDataStore.java
+ rg -Fq 'matchCache.put(url, stable)' app/src/main/java/com/xinyv/median/UserScriptStore.java
+ rg -Fq 'HashMap<String, JSONObject> cache' app/src/main/java/com/xinyv/median/ScriptValueStore.java
+@@ -99,6 +100,8 @@
+   exit 1
+ fi
+ rg -Fq 'updateInFlight.compareAndSet(false, true)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
++rg -Fq 'manualUpdatePending.set(true)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
++rg -Fq 'collectUpdateTargets(runAutomatic)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
+ rg -Fq 'cosmeticInjected.putIfAbsent(source, Boolean.TRUE)' app/src/main/java/com/xinyv/median/MainActivity.java
+ rg -Fq 'services = new BrowserServices(this)' app/src/main/java/com/xinyv/median/MainActivity.java
+ rg -Fq 'DownloadFileTypes.correctCompletedApk' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
