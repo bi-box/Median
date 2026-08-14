@@ -24,7 +24,7 @@ MedianBrowser 是一款基于 Android 原生 WebView 构建的轻量级浏览器
 项目目标不是简单封装网页浏览能力，而是在极小体积下提供接近现代浏览器的核心体验，包括：
 
 - 多标签浏览
-- 隐私窗口
+- 独立隐私窗口
 - 下载管理
 - UserScript 用户脚本支持
 - 密码自动填充
@@ -35,7 +35,7 @@ MedianBrowser 是一款基于 Android 原生 WebView 构建的轻量级浏览器
 - 高兼容 WebView 增强
 
 项目针对 Android System WebView 的实际运行环境进行了大量优化，重点解决不同厂商 WebView 行为差异、冷启动失败、脚本注入不稳定等问题。
-
+本项目对标（碰瓷）via，希望大家多提意见，一起助力median的伟大！！
 ---
 
 ## 项目特点
