@@ -28,7 +28,7 @@ jobs:
         run: ./gradlew --no-daemon clean lintDebug testDebugUnitTest assembleDebug bundleRelease
       - name: Checksums
         run: sha256sum app/build/outputs/apk/debug/app-debug.apk app/build/outputs/bundle/release/app-release.aab | tee SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: median-ci-${{ github.sha }}
           if-no-files-found: error
