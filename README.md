@@ -10,7 +10,7 @@
 广告过滤 · 本地密码库 · 用户脚本 · 离线阅读</p>
 
 <p>
-  <a href="https://github.com/bi-box/Median/releases/download/v2.4.0/MedianBrowser-2.4.0.apk">
+  <a href="https://github.com/bi-box/Median/releases/tag/2.4.0">
     <img src="https://img.shields.io/badge/Download-APK%202.4.0-2F6FEB?style=for-the-badge&amp;logo=android&amp;logoColor=white" alt="下载 Android APK 2.4.0">
   </a>
 </p>
@@ -20,6 +20,12 @@
   <img src="https://img.shields.io/badge/Engine-System%20WebView-181A1F?style=for-the-badge" alt="Android System WebView">
   <img src="https://img.shields.io/badge/APK-~300%20KB-E8A33D?style=for-the-badge" alt="APK 约 300 KB">
   <img src="https://img.shields.io/badge/License-All%20rights%20reserved-6E7681?style=for-the-badge" alt="保留所有权利">
+</p>
+
+<p>
+  <a href="https://t.me/MedianBeta">💬 加入 Telegram 社区</a>
+  &nbsp;·&nbsp;
+  <a href="https://github.com/bi-box/Median/issues">🐞 问题反馈</a>
 </p>
 
 <sub><a href="#设计哲学">设计哲学</a> &nbsp;·&nbsp; <a href="#核心功能">核心功能</a> &nbsp;·&nbsp; <a href="#界面预览">界面预览</a> &nbsp;·&nbsp; <a href="#立即安装">立即安装</a> &nbsp;·&nbsp; <a href="#隐私与安全">隐私与安全</a> &nbsp;·&nbsp; <a href="#常见问题">常见问题</a> &nbsp;·&nbsp; <a href="#开发者">开发者</a></sub>
@@ -132,7 +138,7 @@ Median 用设备自带的 **Android System WebView** 渲染网页，因此应用
 ## 立即安装
 
 <p>
-  <a href="[https://github.com/bi-box/Median/releases/download/v2.4.0/MedianBrowser-2.4.0.apk](https://github.com/bi-box/Median/releases/tag/2.4.0)"><strong>⬇ 下载 Median Browser 2.4.0（单 APK）</strong></a>
+  <a href="https://github.com/bi-box/Median/releases/tag/2.4.0"><strong>⬇ 下载 Median Browser 2.4.0（单 APK）</strong></a>
 </p>
 
 1. 下载 `MedianBrowser-2.4.0.apk`。
@@ -249,9 +255,11 @@ Median 用设备自带的 **Android System WebView** 渲染网页，因此应用
 </details>
 
 <details>
-<summary><strong>如何报告问题或安全漏洞？</strong></summary>
+<summary><strong>在哪里交流、反馈问题或报告安全漏洞？</strong></summary>
 
-一般问题与功能建议请使用 [GitHub Issues](https://github.com/bi-box/Median/issues)。安全问题请阅读[安全策略](SECURITY.md)，不要在公开问题中提交密码、Cookie、私钥或其他个人数据。
+- **Telegram 社区**：[t.me/MedianBeta](https://t.me/MedianBeta)，日常交流、版本试用与使用问题。
+- **GitHub Issues**：[提交问题或功能建议](https://github.com/bi-box/Median/issues)。
+- **安全漏洞**：请阅读[安全策略](SECURITY.md)，不要在公开渠道提交密码、Cookie、私钥或其他个人数据。
 
 </details>
 
@@ -303,6 +311,6 @@ Release 附件只上传 `MedianBrowser-2.4.0.apk`，SHA-256：
 
 <sub>Median Browser · 无限进步，无限优化，无限极速</sub>
 
-<sub><a href="https://github.com/bi-box/Median">项目主页</a> &nbsp;·&nbsp; <a href="https://github.com/bi-box/Median/releases">版本发布</a> &nbsp;·&nbsp; <a href="https://github.com/bi-box/Median/issues">问题反馈</a> &nbsp;·&nbsp; <a href="LICENSE">许可</a></sub>
+<sub><a href="https://github.com/bi-box/Median">项目主页</a> &nbsp;·&nbsp; <a href="https://github.com/bi-box/Median/releases">版本发布</a> &nbsp;·&nbsp; <a href="https://t.me/MedianBeta">Telegram 社区</a> &nbsp;·&nbsp; <a href="https://github.com/bi-box/Median/issues">问题反馈</a> &nbsp;·&nbsp; <a href="LICENSE">许可</a></sub>
 
 </div>
