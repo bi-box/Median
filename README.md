@@ -132,7 +132,7 @@ Median 用设备自带的 **Android System WebView** 渲染网页，因此应用
 ## 立即安装
 
 <p>
-  <a href="https://github.com/bi-box/Median/releases/download/v2.4.0/MedianBrowser-2.4.0.apk"><strong>⬇ 下载 Median Browser 2.4.0（单 APK）</strong></a>
+  <a href="[https://github.com/bi-box/Median/releases/download/v2.4.0/MedianBrowser-2.4.0.apk](https://github.com/bi-box/Median/releases/tag/2.4.0)"><strong>⬇ 下载 Median Browser 2.4.0（单 APK）</strong></a>
 </p>
 
 1. 下载 `MedianBrowser-2.4.0.apk`。
