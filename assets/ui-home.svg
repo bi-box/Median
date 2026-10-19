@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 860" width="400" height="860" role="img" aria-labelledby="t">
+  <title id="t">Median Browser 起始页示意</title>
+  <defs>
+    <clipPath id="screen"><rect x="9" y="9" width="382" height="842" rx="38"/></clipPath>
+    <style>
+      .cn { font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif; }
+      .lat { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect x="0.75" y="0.75" width="398.5" height="858.5" rx="46" fill="#0B0E12" stroke="#252D38" stroke-width="1.5"/>
+
+  <g clip-path="url(#screen)">
+    <rect x="9" y="9" width="382" height="842" fill="#0F1318"/>
+
+    <!-- 地址栏 -->
+    <rect x="24" y="30" width="352" height="50" rx="25" fill="#161C24" stroke="#242C36"/>
+    <path d="M38 47l14-5 14 5v9c0 7-6 12-14 15-8-3-14-8-14-15z" fill="#4B8DF8" fill-opacity="0.16" stroke="#4B8DF8" stroke-width="1.4"/>
+    <path d="M45 55l5 5 9-10" fill="none" stroke="#4B8DF8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+    <rect x="82" y="48" width="140" height="9" rx="4.5" fill="#2A3340"/>
+    <circle cx="344" cy="55" r="8.5" fill="none" stroke="#6E7785" stroke-width="1.7"/>
+    <path d="M351 49l-3 6 6 1z" fill="#6E7785"/>
+
+    <!-- 品牌 -->
+    <text class="lat" x="200" y="214" font-size="46" font-weight="700" letter-spacing="-1.2" fill="#E8EBF0" text-anchor="middle">median</text>
+
+    <!-- 搜索框 -->
+    <rect x="46" y="288" width="308" height="66" rx="33" fill="#11161C" stroke="#2A3340"/>
+    <circle cx="87" cy="318" r="10.5" fill="none" stroke="#8A93A0" stroke-width="2"/>
+    <path d="M94.5 325.5l7 7" stroke="#8A93A0" stroke-width="2" stroke-linecap="round"/>
+    <rect x="116" y="313" width="148" height="10" rx="5" fill="#2A3340"/>
+
+    <!-- 搜索引擎 -->
+    <rect x="112" y="396" width="84" height="32" rx="16" fill="#4B8DF8"/>
+    <text class="lat" x="154" y="417" font-size="12.5" font-weight="600" fill="#FFFFFF" text-anchor="middle">Google</text>
+    <text class="cn" x="232" y="417" font-size="13.5" fill="#A7B0BC" text-anchor="middle">百度</text>
+    <text class="lat" x="294" y="417" font-size="13.5" fill="#A7B0BC" text-anchor="middle">Bing</text>
+
+    <!-- 常用书签 -->
+    <rect x="46" y="468" width="308" height="66" rx="14" fill="none" stroke="#2A3340" stroke-dasharray="6 6"/>
+    <text class="cn" x="200" y="508" font-size="13.5" fill="#8A93A0" text-anchor="middle">添加常用书签</text>
+
+    <!-- 底部导航 -->
+    <path d="M9 798h382" stroke="#1C232B"/>
+    <path d="M62 822l-8 8 8 8" fill="none" stroke="#6E7785" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M126 822l8 8-8 8" fill="none" stroke="#6E7785" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M188 831l12-9 12 9v11h-9v-7h-6v7h-9z" fill="none" stroke="#6E7785" stroke-width="2" stroke-linejoin="round"/>
+    <rect x="258" y="819" width="20" height="19" rx="4" fill="none" stroke="#6E7785" stroke-width="2"/>
+    <text class="lat" x="268" y="834" font-size="11" fill="#6E7785" text-anchor="middle">1</text>
+    <path d="M328 821h20M328 829h20M328 837h20" stroke="#6E7785" stroke-width="2" stroke-linecap="round"/>
+  </g>
+</svg>

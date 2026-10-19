@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 860" width="400" height="860" role="img" aria-labelledby="t">
+  <title id="t">Median Browser 主菜单示意</title>
+  <defs>
+    <clipPath id="screen"><rect x="9" y="9" width="382" height="842" rx="38"/></clipPath>
+    <style>
+      .cn { font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif; }
+      .lat { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect x="0.75" y="0.75" width="398.5" height="858.5" rx="46" fill="#0B0E12" stroke="#252D38" stroke-width="1.5"/>
+
+  <g clip-path="url(#screen)">
+    <rect x="9" y="9" width="382" height="842" fill="#0F1318"/>
+
+    <!-- 背景页面（变暗） -->
+    <rect x="24" y="30" width="352" height="50" rx="25" fill="#161C24"/>
+    <rect x="82" y="48" width="140" height="9" rx="4.5" fill="#2A3340"/>
+    <text class="lat" x="200" y="230" font-size="40" font-weight="700" letter-spacing="-1" fill="#E8EBF0" fill-opacity="0.55" text-anchor="middle">median</text>
+    <rect x="9" y="9" width="382" height="842" fill="#04060A" fill-opacity="0.55"/>
+
+    <!-- 面板 -->
+    <rect x="9" y="240" width="382" height="620" rx="26" fill="#121821" stroke="#232C38"/>
+    <rect x="176" y="262" width="48" height="4" rx="2" fill="#2E3742"/>
+
+    <text class="lat" x="32" y="312" font-size="18" font-weight="600" fill="#EDF0F4">Median</text>
+    <text class="cn" x="32" y="334" font-size="11.5" fill="#7C8695">example.com · 标准模式</text>
+    <path d="M352 296l14 14M366 296l-14 14" stroke="#A7B0BC" stroke-width="1.6" stroke-linecap="round"/>
+
+    <!-- 浏览 -->
+    <text class="cn" x="32" y="372" font-size="10.5" letter-spacing="1.5" fill="#5B8DEF">浏览</text>
+
+    <g stroke="#C9D2DD" stroke-width="1.8" stroke-linecap="round" fill="none">
+      <path d="M30 406h24M42 394v24"/>
+      <rect x="31" y="449" width="20" height="20" rx="4"/>
+      <text x="42" y="464" font-size="10" stroke="none" fill="#C9D2DD" text-anchor="middle" class="lat">1</text>
+      <path d="M42 503v16M34 514l8 8 8-8M31 528h22"/>
+      <path d="M38 557l4-1.5 4 1.5v6c0 4-3.5 7-8 9-4.5-2-8-5-8-9v-6z"/>
+    </g>
+    <g class="cn" font-size="15" fill="#DFE4EA">
+      <text x="76" y="411">新建标签页</text>
+      <text x="76" y="465">标签页工具</text>
+      <text x="76" y="519">下载中心</text>
+      <text x="76" y="573">新建独立隐私窗口</text>
+    </g>
+    <g stroke="#5A6472" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M350 458l5 5-5 5"/>
+      <path d="M350 512l5 5-5 5"/>
+    </g>
+
+    <!-- 当前页面 -->
+    <text class="cn" x="32" y="612" font-size="10.5" letter-spacing="1.5" fill="#5B8DEF">当前页面</text>
+
+    <g stroke="#C9D2DD" stroke-width="1.8" stroke-linecap="round" fill="none">
+      <path d="M33 634h18v24l-9-7-9 7z"/>
+      <rect x="31" y="689" width="22" height="16" rx="2"/>
+      <path d="M42 705v5M36 710h12"/>
+      <path d="M42 742l2.6 6.4L51 751l-6.4 2.6L42 760l-2.6-6.4L33 751l6.4-2.6z"/>
+      <path d="M30 799h24M30 807h16M30 815h20"/>
+    </g>
+    <g class="cn" font-size="15" fill="#DFE4EA">
+      <text x="76" y="651">收藏当前页面</text>
+      <text x="76" y="705">桌面网站</text>
+      <text x="76" y="759">深色模式</text>
+      <text x="76" y="813">页面工具</text>
+    </g>
+
+    <rect x="326" y="689" width="40" height="22" rx="11" fill="#2A3340"/>
+    <circle cx="337" cy="700" r="9" fill="#C9D1DB"/>
+    <rect x="326" y="743" width="40" height="22" rx="11" fill="#4B8DF8"/>
+    <circle cx="355" cy="754" r="9" fill="#FFFFFF"/>
+    <path d="M350 807l5 5-5 5" stroke="#5A6472" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+</svg>

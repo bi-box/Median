@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 860" width="400" height="860" role="img" aria-labelledby="t">
+  <title id="t">Median Browser 用户脚本面板示意</title>
+  <defs>
+    <clipPath id="screen"><rect x="9" y="9" width="382" height="842" rx="38"/></clipPath>
+    <style>
+      .cn { font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif; }
+      .lat { font-family: system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+    </style>
+  </defs>
+
+  <rect x="0.75" y="0.75" width="398.5" height="858.5" rx="46" fill="#0B0E12" stroke="#252D38" stroke-width="1.5"/>
+
+  <g clip-path="url(#screen)">
+    <rect x="9" y="9" width="382" height="842" fill="#0F1318"/>
+
+    <rect x="24" y="30" width="352" height="50" rx="25" fill="#161C24"/>
+    <rect x="82" y="48" width="140" height="9" rx="4.5" fill="#2A3340"/>
+    <text class="lat" x="200" y="230" font-size="40" font-weight="700" letter-spacing="-1" fill="#E8EBF0" fill-opacity="0.55" text-anchor="middle">median</text>
+    <rect x="9" y="9" width="382" height="842" fill="#04060A" fill-opacity="0.55"/>
+
+    <rect x="9" y="240" width="382" height="620" rx="26" fill="#121821" stroke="#232C38"/>
+    <rect x="176" y="262" width="48" height="4" rx="2" fill="#2E3742"/>
+
+    <text class="cn" x="32" y="312" font-size="18" font-weight="600" fill="#EDF0F4">用户脚本</text>
+    <text class="cn" x="32" y="334" font-size="11.5" fill="#7C8695">尚未安装脚本 · 仅安装你信任的来源</text>
+    <path d="M352 296l14 14M366 296l-14 14" stroke="#A7B0BC" stroke-width="1.6" stroke-linecap="round"/>
+
+    <text class="cn" x="32" y="372" font-size="10.5" letter-spacing="1.5" fill="#5B8DEF">获取与管理</text>
+
+    <g stroke="#C9D2DD" stroke-width="1.8" fill="none" stroke-linecap="round">
+      <circle cx="41" cy="404" r="7"/>
+      <path d="M46 409l6 6"/>
+      <circle cx="41" cy="458" r="7"/>
+      <path d="M46 463l6 6"/>
+      <path d="M30 514h24M42 502v24"/>
+      <circle cx="42" cy="566" r="8.5" stroke-dasharray="40 12" transform="rotate(-45 42 566)"/>
+      <path d="M49 553.5l1.5 7-7-1.5z" fill="#C9D2DD" stroke="none"/>
+    </g>
+    <g class="cn" font-size="15" fill="#DFE4EA">
+      <text x="76" y="411">浏览 Greasy Fork</text>
+      <text x="76" y="465">查找当前网站脚本</text>
+      <text x="76" y="519">粘贴链接或脚本代码安装</text>
+      <text x="76" y="573">检查并更新全部脚本</text>
+    </g>
+
+    <rect x="30" y="628" width="340" height="118" rx="16" fill="none" stroke="#2A3340" stroke-dasharray="6 6"/>
+    <text class="cn" x="200" y="686" font-size="13.5" fill="#8A93A0" text-anchor="middle">还没有安装脚本</text>
+    <text class="cn" x="200" y="710" font-size="11.5" fill="#5E6876" text-anchor="middle">从上方入口添加第一个</text>
+  </g>
+</svg>

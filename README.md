@@ -1,484 +1,308 @@
 <div align="center">
 
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:4285F4,100:34A853&height=220&section=header&text=Median%20Browser&fontSize=58&fontColor=ffffff&animation=fadeIn&fontAlignY=38&desc=Local-First%20Android%20Privacy%20Browser&descAlignY=58&descSize=20&descColor=ffffff" width="100%"/>
+<img src="assets/median-browser-icon.svg" width="104" alt="Median Browser 应用图标">
 
-**无限进步，无限优化，无限极速**
-**基于 Android System WebView，原生 Java 实现，广告拦截 + 密码库 + 用户脚本 + 离线阅读+ 高自由自定义主页等功能。**
+<h1>Median Browser</h1>
 
-<br/>
+<p><strong>无限进步，无限优化，无限极速</strong></p>
 
-![Platform](https://img.shields.io/badge/Platform-Android%208.0%2B-3DDC84?style=for-the-badge&logo=android&logoColor=white)
-![Version](https://img.shields.io/badge/Version-2.3.0-blue?style=for-the-badge)
-![Language](https://img.shields.io/badge/Language-Java%2017-ED8B00?style=for-the-badge&logo=openjdk&logoColor=white)
-![Engine](https://img.shields.io/badge/Engine-System%20WebView-4285F4?style=for-the-badge&logo=googlechrome&logoColor=white)
-![Telemetry](https://img.shields.io/badge/Telemetry-Zero-success?style=for-the-badge)
-![License](https://img.shields.io/badge/License-Source%20Available-orange?style=for-the-badge)
+<p>基于 Android System WebView 的轻量浏览器<br>
+广告过滤 · 本地密码库 · 用户脚本 · 离线阅读</p>
 
-<br/>
+<p>
+  <a href="https://github.com/bi-box/Median/releases/download/v2.4.0/MedianBrowser-2.4.0.apk">
+    <img src="https://img.shields.io/badge/Download-APK%202.4.0-2F6FEB?style=for-the-badge&amp;logo=android&amp;logoColor=white" alt="下载 Android APK 2.4.0">
+  </a>
+</p>
 
-[💬 加入 Telegram 社区](https://t.me/MedianBeta) ·
-[🐞 反馈问题](#-问题反馈) ·
-[🏗 编译指南](#-编译项目) ·
-[❓ 常见问题](#-常见问题-faq)
+<p>
+  <img src="https://img.shields.io/badge/Android-8.0%2B-3DDC84?style=for-the-badge&amp;logo=android&amp;logoColor=white" alt="Android 8.0+">
+  <img src="https://img.shields.io/badge/Engine-System%20WebView-181A1F?style=for-the-badge" alt="Android System WebView">
+  <img src="https://img.shields.io/badge/APK-~300%20KB-E8A33D?style=for-the-badge" alt="APK 约 300 KB">
+  <img src="https://img.shields.io/badge/License-All%20rights%20reserved-6E7681?style=for-the-badge" alt="保留所有权利">
+</p>
 
-**如果这个项目对你有帮助，请点一个 ⭐️ Star，这是对独立开发者最好的支持。**
-
-|:---:|:---:|:---:|:---:|:---:|
-
-<img src="https://capsule-render.vercel.app/api?type=waving&color=0:34A853,100:4285F4&height=80&section=footer" width="100%"/>
+<sub><a href="#设计哲学">设计哲学</a> &nbsp;·&nbsp; <a href="#核心功能">核心功能</a> &nbsp;·&nbsp; <a href="#界面预览">界面预览</a> &nbsp;·&nbsp; <a href="#立即安装">立即安装</a> &nbsp;·&nbsp; <a href="#隐私与安全">隐私与安全</a> &nbsp;·&nbsp; <a href="#常见问题">常见问题</a> &nbsp;·&nbsp; <a href="#开发者">开发者</a></sub>
 
 </div>
 
 ---
 
-## 📖 目录
+## 一个浏览器，只做你需要的事
 
-- [Median Browser 是什么](#-median-browser-是什么)
-- [核心特性](#-核心特性)
-- [Median 与普通浏览器的区别](#-median-与普通浏览器的区别)
-- [隐私与数据边界](#-隐私与数据边界)
-- [技术架构](#-技术架构)
-- [编译项目](#-编译项目)
-- [项目结构](#-项目结构)
-- [权限说明](#-权限说明)
-- [Roadmap](#-roadmap)
-- [常见问题 FAQ](#-常见问题-faq)
-- [安全策略](#-安全策略)
-- [贡献指南](#-贡献指南)
-- [问题反馈](#-问题反馈)
-- [License](#-license)
+Median 用设备自带的 **Android System WebView** 渲染网页，因此应用本身可以保持得很小；广告过滤、密码管理、用户脚本、下载与离线阅读都在应用内完成，不必再装插件。书签、历史、密码等数据默认留在本机，备份文件由你自己保管。
 
----
+## 设计哲学
 
-## 🔍 Median Browser 是什么
+<img src="assets/philosophy.svg" alt="无限进步，无限优化，无限极速">
 
-> **Median Browser 是一款运行在 Android 系统 WebView 之上的本地优先浏览器**，用原生 Java 编写，不依赖 Chromium 私有内核、不集成广告 / 分析 / 崩溃上报 SDK，也没有开发者运营的账号或同步服务器。书签、历史、密码、用户脚本、下载记录等数据默认只保存在设备本地。
+- **无限进步** —— 没有「做完了」的版本：主菜单、页面恢复、过滤引擎、脚本 API，每一版都在修上一版的粗糙处，改动全部公开在[更新记录](CHANGELOG.md)里。
+- **无限优化** —— 单 APK 约 300 KB，不打包私有内核；网络拦截、启动与数据加载在关键路径上反复打磨，能少做的事就不做。
+- **无限极速** —— 把等待留给网络，而不是应用本身：渲染交给系统 WebView，交互与导航尽量直接，不让外壳拖慢页面。
 
-一句话回答（适合快速引用）：
-
-- **Median 是什么** → 一个基于 WebView 的原生 Android 浏览器，主打广告拦截、本地密码库、用户脚本和离线阅读。
-- **Median 是不是开源** → 源码公开可读，但采用「保留所有权利」的源码可见许可，**并非 MIT / GPL 意义上的开源协议**，转发 / 二次分发前请先阅读 [License](#-license)。
-- **Median 会不会收集用户数据** → 不会。应用内没有分析、广告或遥测后台，网络请求只发生在用户主动访问的网站与服务之间。
-
----
-
-## 🚀 核心特性
+## 核心功能
 
 <table>
 <tr>
 <td width="50%" valign="top">
 
-### 🛡️ 广告拦截 · AdBlockEngine
+<h3>🛡️ 广告过滤</h3>
 
-- 基于 ABP / hosts 规则的过滤引擎，专为 WebView 请求回调优化
-- 支持在线过滤订阅源，可自定义添加与更新（`FilterSubscriptionStore`）
-- 元素隐藏、跟踪参数清理、逐站点开关
+**减少页面干扰，让内容更清楚。**
 
-</td>
-<td width="50%" valign="top">
-
-### 🔐 密码库 · PasswordVault
-
-- 基于 **Android Keystore + AES-GCM** 的本地加密密码库
-- HTTPS 自动填充默认开启，登录后自动提示保存
-- 支持多账号、多步登录、Shadow DOM 与同源 iframe
-
-</td>
-</tr>
-
-<tr>
-<td width="50%" valign="top">
-
-### 📥 下载中心 · Download Center
-
-- 分段下载、暂停 / 恢复、断点续传、自适应重试策略
-- 前台服务保活（`AdaptiveDownloadService`），大文件不中断
-- 独立下载内容提供者，安装包 / 文件均可直接管理
+支持 ABP / hosts 规则、过滤订阅、逐站点开关和页面元素隐藏。你可以自行挑选规则列表，也可以按网站调整过滤状态。
 
 </td>
 <td width="50%" valign="top">
 
-### 📴 离线与阅读
+<h3>🔐 本地密码库</h3>
 
-- 本地 MHTML 离线网页归档，**页面字节不出设备**
-- 阅读模式、系统朗读（TTS）、网页翻译、页内查找
-- 首页收藏、收藏夹、Favicon 本地缓存
+**常用账号，安全地留在自己的设备上。**
+
+密码库由 Android Keystore 与 AES-GCM 保护，支持 HTTPS 页面自动填充、保存提示和加密备份；备份口令由你设置。
 
 </td>
 </tr>
-
 <tr>
 <td width="50%" valign="top">
 
-### 🧩 用户脚本 · UserScript
+<h3>🧩 用户脚本</h3>
 
-- 类 Tampermonkey 的用户脚本引擎，`document-start` 原生桥接注入
-- 显式权限声明与 `@connect` 目标校验，最小权限执行
-- GM 兼容层：正则匹配、相对 URL 解析、UTF-8 资源回退
+**按自己的习惯增强网页。**
+
+支持用户脚本与常用 GM / GM4 API，可按网站匹配运行，并对特权网络请求的授权范围做检查。第三方脚本请从可信来源安装。
 
 </td>
 <td width="50%" valign="top">
 
-### 🕵️ 独立隐私窗口
+<h3>📥 下载与离线阅读</h3>
 
-- 与普通标签完全隔离的私密浏览会话
-- **无法可靠隔离时不会伪装成"无痕模式"欺骗用户**
-- 独立 Activity 进程边界，退出即清除
+**想看的内容，留给稍后。**
+
+下载中心支持暂停、继续与断点续传；网页可保存为本地离线页面，并提供阅读模式、系统朗读、网页翻译和页内查找。
 
 </td>
 </tr>
-
 <tr>
 <td width="50%" valign="top">
 
-### 🎬 媒体探测 · MediaResourceSniffer
+<h3>🕶️ 独立隐私窗口</h3>
 
-- 有界、只读元数据的媒体资源索引
-- 覆盖 HLS / DASH / Smooth Streaming 清单解析
-- 显示轨道、分辨率、码率、加密与直播 / 点播标记
+**需要清静时，切换到独立会话。**
 
-</td>
-<td width="50%" valign="top">
-
-### ⚡ 三档性能模式
-
-- `PerformanceMonitor` 实时帧耗时与掉帧监控
-- 性能 / 标准 / 低功耗三档渲染策略可切换
-- `RendererWatchdog` 自动检测并恢复无响应渲染进程
-
-</td>
-</tr>
-
-<tr>
-<td width="50%" valign="top">
-
-### 🔒 TLS 证书检查
-
-- `TlsInspector` 按需发起独立证书探测
-- 展示证书链、加密套件、颁发者与有效期
-- 仅在用户主动触发时执行，不做后台监听
+隐私窗口与普通浏览会话彼此隔离，退出时清理本地会话数据。它隔离的是设备上的浏览数据，不是匿名网络通道。
 
 </td>
 <td width="50%" valign="top">
 
-### 💾 加密备份与手势导航
+<h3>🎛️ 主页与标签自定义</h3>
 
-- `PortableBackupCodec`：密码加密的便携式备份，无需服务器
-- 边缘滑动手势前进 / 后退（`EdgeNavigationController`）
-- 逐站点权限（JS / 图片 / 定位等）精细控制
+**让浏览方式贴合自己的习惯。**
+
+可调整主页背景、布局、搜索入口与常用网站，配合标签管理、主题切换、逐站点权限和边缘滑动导航，拼出顺手的操作方式。
 
 </td>
 </tr>
 </table>
 
----
+## 界面预览
 
-## ⚔️ Median 与普通浏览器的区别
+<table>
+<tr>
+<td align="center" width="33%" valign="top">
+<img src="assets/ui-home.svg" width="260" alt="Median 起始页示意">
+<br>
+<sub><strong>起始页</strong> · 搜索入口与常用网站</sub>
+</td>
+<td align="center" width="33%" valign="top">
+<img src="assets/ui-menu.svg" width="260" alt="Median 主菜单示意">
+<br>
+<sub><strong>主菜单</strong> · 浏览、页面工具与设置</sub>
+</td>
+<td align="center" width="33%" valign="top">
+<img src="assets/ui-scripts.svg" width="260" alt="Median 用户脚本面板示意">
+<br>
+<sub><strong>用户脚本</strong> · 安装、匹配与更新</sub>
+</td>
+</tr>
+</table>
 
-| 维度 | Median Browser | 常见商业浏览器 |
-|---|:---:|:---:|
-| 渲染内核 | 系统 WebView（跟随系统更新） | 自带 Chromium 分支，体积大 |
-| 广告 / 分析 SDK | ❌ 无 | 通常内置多个 |
-| 遥测 / 崩溃上报 | ❌ 无 | 默认开启 |
-| 账号与云同步 | ❌ 无开发者服务器 | 强制或默认绑定账号 |
-| 密码存储方式 | Android Keystore + AES-GCM，本地 | 部分依赖云端同步 |
-| 用户脚本支持 | ✅ 原生桥接注入 | 需第三方插件商店 |
-| 安装包体积 | 约 **215 KB** 级别 | 普遍数十至上百 MB |
-| 隐私窗口真实性 | 隔离失败会明确提示 | 部分产品仍标注"无痕" |
+<sub>以上为代码绘制的界面示意图，用于说明布局结构，细节以应用内实际效果为准。</sub>
 
-**功能模块一览**（源码中实际存在的独立模块，无一依赖云端）：
+## 立即安装
 
-| 模块 | 是否本地运行 | 是否需要网络权限外的额外权限 |
-|---|:---:|:---:|
-| 广告拦截引擎 | ✅ 完全本地 | ❌ |
-| 密码库 + 自动填充 | ✅ Keystore 加密本地 | ❌ |
-| 下载中心 | ✅ 本地 | 前台服务通知权限 |
-| 用户脚本引擎 | ✅ 本地注入 | ❌ |
-| 离线归档 + 阅读 | ✅ 纯本地 MHTML | ❌ |
-| 遥测 / 分析 SDK | 🚫 不存在 | — |
+<p>
+  <a href="https://github.com/bi-box/Median/releases/download/v2.4.0/MedianBrowser-2.4.0.apk"><strong>⬇ 下载 Median Browser 2.4.0（单 APK）</strong></a>
+</p>
 
----
+1. 下载 `MedianBrowser-2.4.0.apk`。
+2. 首次侧载时，按 Android 提示允许当前应用「安装未知应用」。
+3. 打开 APK，确认安装，完成后即可启动。
 
-## 🧭 隐私与数据边界
-
-Median 遵循**本地优先（local-first）**原则，这是代码和隐私政策中明确的边界，而不是营销口号：
-
-- ✅ 应用**不**运行开发者账号、同步服务器、广告网络、分析或遥测后台
-- ✅ 书签、历史、标签会话、Cookie、下载记录、离线页面、过滤规则、用户脚本、密码与设置**默认只存于本机**
-- ✅ 密码库使用 Android Keystore 生成的密钥 + AES-GCM 加密；导出备份需用户自定义密码二次加密
-- ⚠️ 浏览、搜索、翻译、更新过滤订阅、安装用户脚本、下载文件时，**目标网站 / 服务**会按其自身隐私政策收到正常网络请求 —— 这是浏览器的基本工作方式，Median 不会中转或截留这些流量
-- ⚠️ 用户脚本是用户主动安装的第三方代码，权限高于普通网页，请只从可信来源安装
-
-更多细节见仓库中的 [`PRIVACY_POLICY.md`](PRIVACY_POLICY.md) 与 [`PLAY_DATA_SAFETY.md`](PLAY_DATA_SAFETY.md)。
-
----
-
-## 🏗 技术架构
-
-| 类别 | 选型 |
+| 项目 | 信息 |
 |---|---|
-| 目标平台 | Android 8.0 (API 26) 及以上，`compileSdk` / `targetSdk` 36 |
-| 渲染引擎 | Android System WebView（含 AndroidX WebKit 兼容层） |
-| 开发语言 | Java 17 |
-| 构建系统 | Gradle（AGP 8.13.2） |
-| 包名 / 命名空间 | `com.xinyv.median`，`applicationId com.xinyv.median.compat` |
-| 加密方案 | Android Keystore、AES-GCM、PBKDF2 便携备份 |
-| 压缩与混淆 | R8 `minifyEnabled` + `shrinkResources` |
+| 版本 | 2.4.0（versionCode 103） |
+| 安装包 | `MedianBrowser-2.4.0.apk`，SHA-256 见[开发者](#开发者) |
+| 包名 | `com.xinyv.median.compat` |
+| 最低系统 | Android 8.0（API 26）；隐私窗口需 Android 9.0（API 28） |
+| 网页引擎 | 设备提供的 Android System WebView |
+| 升级 | 与既有正式版同签名，可覆盖安装 |
 
-**模块关系图**（GitHub 原生渲染 Mermaid）：
+> [!IMPORTANT]
+> 网页兼容性与安全补丁取决于设备的 System WebView，建议保持系统和 WebView 更新。从旧版升级前，先用浏览器内的备份功能导出重要数据。
 
-```mermaid
-flowchart TB
-    UI["MainActivity<br/>浏览器 UI / 多标签"] --> WV["System WebView<br/>渲染引擎"]
-    WV --> ADB["AdBlockEngine<br/>广告过滤"]
-    WV --> MRS["MediaResourceSniffer<br/>媒体探测"]
-    UI --> PV["PasswordVault<br/>Keystore 加密密码库"]
-    PV --> CA["CredentialAutofill<br/>自动填充脚本"]
-    UI --> US["UserScriptStore<br/>用户脚本引擎"]
-    UI --> DC["DownloadCenterActivity"]
-    DC --> ADS["AdaptiveDownloadService<br/>前台下载服务"]
-    UI --> OPS["OfflinePageStore<br/>本地 MHTML"]
-    UI --> PA["PrivateActivity<br/>独立隐私窗口"]
-    UI --> TLS["TlsInspector<br/>证书探测"]
-    UI --> PBC["PortableBackupCodec<br/>加密备份"]
-    WV --> PM["PerformanceMonitor"]
-    WV --> RW["RendererWatchdog"]
+## 隐私与安全
 
-    style UI fill:#4285F4,color:#fff
-    style WV fill:#3DDC84,color:#fff
-    style PV fill:#F4B400,color:#fff
-    style ADB fill:#DB4437,color:#fff
+<table>
+<tr>
+<td width="50%" valign="top">
+
+<h3>默认保存在设备上</h3>
+
+书签、历史、密码、脚本、下载记录、过滤规则和离线页面默认写入本机。密码库由 Android Keystore 与 AES-GCM 保护。
+
+</td>
+<td width="50%" valign="top">
+
+<h3>网络请求由你发起</h3>
+
+浏览、搜索、翻译、更新订阅、安装脚本或下载文件时，Median 会连接对应站点。应用没有广告、分析或崩溃遥测 SDK，也没有开发者运营的账号与同步服务器。
+
+</td>
+</tr>
+</table>
+
+> [!WARNING]
+> 隐私窗口不是 VPN，也不提供匿名网络：你访问的网站与所在网络仍能看到正常的网络连接。用户脚本可能读取其匹配网站上的内容，请谨慎选择来源。
+
+完整说明见[隐私政策](PRIVACY_POLICY.md)与[安全策略](SECURITY.md)。
+
+## 常见问题
+
+### 使用
+
+<details>
+<summary><strong>Median 支持哪些 Android 版本？</strong></summary>
+
+最低支持 Android 8.0（API 26）。独立隐私窗口需要 Android 9.0（API 28）或更新版本。
+
+</details>
+
+<details>
+<summary><strong>下载后怎么安装？</strong></summary>
+
+打开下载的 APK，按 Android 安装器提示，允许你下载 APK 所用的应用「安装未知应用」，然后确认安装。
+
+</details>
+
+<details>
+<summary><strong>能从旧版本直接覆盖升级吗？</strong></summary>
+
+可以，但包名与签名需要与已安装版本一致。若已安装的版本来自其他渠道（例如测试包），通常无法覆盖，需要先卸载；卸载会清除本机数据，请先导出备份。
+
+</details>
+
+<details>
+<summary><strong>广告过滤的效果如何？</strong></summary>
+
+支持 ABP / hosts 规则、过滤订阅、逐站点控制和页面元素隐藏。实际效果取决于所选规则列表与网站实现，个别广告或页面功能可能仍需手动处理。
+
+</details>
+
+<details>
+<summary><strong>支持 Tampermonkey 用户脚本吗？</strong></summary>
+
+支持用户脚本与常用 GM / GM4 API，包括脚本值、菜单和网络请求等能力。不同脚本用到的 API 不同，无法保证兼容所有桌面扩展；安装前请检查来源与权限。
+
+</details>
+
+### 隐私与数据
+
+<details>
+<summary><strong>密码保存在哪里？</strong></summary>
+
+保存在本机的加密密码库中，由 Android Keystore 与 AES-GCM 保护，不会上传到任何开发者服务器。备份文件由你自行保管，口令丢失后无法恢复。
+
+</details>
+
+<details>
+<summary><strong>隐私窗口会让我在网上匿名吗？</strong></summary>
+
+不会。隐私窗口隔离并清理本机会话数据，但访问网站时仍会产生网络连接；它不是 VPN，也不隐藏网络地址。
+
+</details>
+
+<details>
+<summary><strong>Median 会收集使用数据吗？</strong></summary>
+
+应用不包含广告、分析或崩溃遥测 SDK。你在浏览、搜索、翻译或更新订阅时产生的请求会直接发往对应网站或服务，受其隐私政策约束。
+
+</details>
+
+### 项目
+
+<details>
+<summary><strong>Median 是开源软件吗？</strong></summary>
+
+源码在 GitHub 上公开可读，但许可证为「保留所有权利」，并非 MIT、Apache 或 GPL 等开源许可证。使用、修改、分发或商用前，请先阅读 [LICENSE](LICENSE) 并取得所需授权。
+
+</details>
+
+<details>
+<summary><strong>如何报告问题或安全漏洞？</strong></summary>
+
+一般问题与功能建议请使用 [GitHub Issues](https://github.com/bi-box/Median/issues)。安全问题请阅读[安全策略](SECURITY.md)，不要在公开问题中提交密码、Cookie、私钥或其他个人数据。
+
+</details>
+
+## 开发者
+
+### 技术选型
+
+| 项目 | 信息 |
+|---|---|
+| 平台 | Android 8.0+，compileSdk / targetSdk 36 |
+| 网页渲染 | Android System WebView 与 WebKit 兼容接口 |
+| 主要语言 | Java 17 |
+| 构建工具 | Gradle、Android Gradle Plugin |
+| 数据保护 | Android Keystore、AES-GCM；备份使用用户设置的密码 |
+
+### 本地构建
+
+需要 JDK 17 与 Android SDK 36。生成可覆盖正式安装的 APK 需要正式签名配置；签名私钥与密码不得提交到仓库。
+
+**Windows**
+
+```powershell
+.\gradlew.bat lintRelease testReleaseUnitTest assembleRelease
 ```
 
-**隐私数据流向图** —— 注意图中不存在任何"开发者服务器"节点：
-
-```mermaid
-flowchart LR
-    Device["📱 你的设备<br/>书签 / 历史 / 密码 / 脚本"]
-    Site["🌐 你主动访问的网站"]
-    Search["🔍 你选择的搜索引擎"]
-    Filter["📋 广告过滤订阅源"]
-    DevServer["🚫 开发者服务器<br/>（不存在）"]
-
-    Device -- "仅本人主动请求" --> Site
-    Device -- "仅本人主动请求" --> Search
-    Device -- "仅本人主动请求" --> Filter
-    Device -.-> DevServer
-
-    style DevServer fill:#eee,stroke:#999,stroke-dasharray: 5 5,color:#999
-    style Device fill:#34A853,color:#fff
-```
-
-**核心模块一览（节选自源码）：**
-
-```
-AdBlockEngine          广告与规则过滤引擎
-PasswordVault          Keystore 加密密码库
-CredentialAutofill     跨 Shadow DOM / iframe 的自动填充脚本生成器
-FilterSubscriptionStore 广告过滤订阅源管理
-UserScriptStore         用户脚本存储与匹配
-MediaResourceSniffer    媒体资源探测（HLS/DASH/Smooth Streaming）
-OfflinePageStore        本地 MHTML 离线归档
-DownloadCenterActivity  下载中心 UI 与管理
-AdaptiveDownloadService 前台下载服务
-TlsInspector            按需 TLS/证书探测
-PortableBackupCodec     密码加密便携备份
-PerformanceMonitor      帧耗时 / 卡顿监控
-RendererWatchdog        WebView 渲染进程看门狗
-EdgeNavigationController 边缘手势导航
-SiteSettingsStore        逐站点权限设置
-```
-
----
-
-## 📦 编译项目
-
-### 环境要求
-
-- Android Studio（最新稳定版）
-- JDK 17+
-- Android SDK（`compileSdk` 36）
-
-### 克隆项目
+**macOS / Linux**
 
 ```bash
-git clone https://github.com/bi-box/Median.git
-cd Median
+./gradlew lintRelease testReleaseUnitTest assembleRelease
 ```
 
-### 编译 Debug / Release
+Release 附件只上传 `MedianBrowser-2.4.0.apk`，SHA-256：
 
-```bash
-# Debug 包
-./gradlew assembleDebug
-
-# Release 包（如需签名，先配置以下环境变量）
-# MEDIAN_KEYSTORE / MEDIAN_STOREPASS / MEDIAN_KEY_ALIAS / MEDIAN_KEYPASS
-./gradlew assembleRelease
+```text
+833AD242C1F2EDA23475767CE9D8A81E51D186D1C9A37F6B3E9B529E07486D50
 ```
 
-产物路径：
+### 项目文档
 
-```
-app/build/outputs/apk/
-```
-
----
-
-## 📂 项目结构
-
-```
-Median
-├── app
-│   ├── src/main/java/com/xinyv/median   # 浏览器核心源码（广告拦截、密码库、下载、脚本…）
-│   ├── src/main/java/androidx/webkit    # WebView 兼容层
-│   └── src/main/res                     # 界面资源
-├── gradle                               # Gradle Wrapper 配置
-├── tools                                # 开发辅助脚本
-├── build.gradle / settings.gradle       # 构建配置
-├── SECURITY.md                          # 安全策略与威胁模型
-├── PRIVACY_POLICY.md                    # 隐私政策
-├── PLAY_DATA_SAFETY.md                  # Google Play 数据安全申报草稿
-├── CHANGELOG.md                         # 版本变更记录
-└── THIRD_PARTY_NOTICES.md               # 第三方组件与许可证
-```
-
----
-
-## 🔑 权限说明
-
-| 权限 | 用途 | 触发条件 |
-|---|---|---|
-| Camera / Microphone | 网页调用摄像头 / 麦克风 | 仅 HTTPS 页面主动请求且用户授权后生效 |
-| Location | 网页定位 | 仅 HTTPS 页面主动请求且用户授权后生效 |
-| Notifications / Foreground Service | 展示与控制下载进度 | 下载进行中 |
-| Network State / Wake Lock | 保证下载约束与传输完整 | 仅下载期间，普通浏览不持有唤醒锁 |
-| Install Packages | 安装下载到本地的 APK | 用户主动点击安装 |
-
----
-
-## 🛣 Roadmap
-
-**✅ 已实现（源码可见）**
-
-- 广告过滤订阅 + 元素隐藏
-- Keystore 加密密码库与自动填充
-- 分段下载 / 断点续传 / 下载中心
-- 用户脚本引擎（document-start 注入）
-- 离线网页归档 + 阅读模式 + 翻译 + 朗读
-- 独立隐私窗口、逐站点权限、边缘手势导航
-- TLS 证书探测、加密便携备份、性能与渲染看门狗
-
-**🔄 计划中**
-
-- 更多浏览器自定义选项
-- 更完善的隐私控制面板
-- 更丰富的辅助功能支持
-
----
-
-## ❓ 常见问题 FAQ
-
-<details>
-<summary><b>Median Browser 是原生浏览器还是套壳浏览器？</b></summary><br/>
-
-Median 使用 Android **System WebView** 渲染网页，不打包私有 Chromium 内核，因此安装包体积极小（约 215 KB 级别），网页兼容性和渲染性能跟随系统 WebView 版本更新。
-</details>
-
-<details>
-<summary><b>Median 支持广告拦截吗？</b></summary><br/>
-
-支持。内置 <code>AdBlockEngine</code> 过滤引擎，兼容 ABP / hosts 规则，可订阅在线过滤列表，并支持元素隐藏与跟踪参数清理。
-</details>
-
-<details>
-<summary><b>密码保存在哪里，安全吗？</b></summary><br/>
-
-密码保存在设备本地的 <code>PasswordVault</code> 中，密钥由 Android Keystore 生成并使用 AES-GCM 加密，不会上传到任何服务器。导出的便携备份需用户自定义密码二次加密。
-</details>
-
-<details>
-<summary><b>Median 支持用户脚本（类似 Tampermonkey）吗？</b></summary><br/>
-
-支持。<code>UserScriptStore</code> 与原生 <code>document-start</code> 桥接实现了类 Tampermonkey 的脚本注入能力，并对脚本权限和 <code>@connect</code> 目标做最小化校验。
-</details>
-
-<details>
-<summary><b>私密浏览窗口是真的无痕吗？</b></summary><br/>
-
-Median 的隐私窗口是与普通标签隔离的独立会话；如果某些场景无法可靠隔离，Median 不会伪装成"无痕模式"来误导用户，这一点在代码注释和安全策略中明确写明。
-</details>
-
-<details>
-<summary><b>Median 会收集我的浏览数据吗？</b></summary><br/>
-
-不会。应用不集成广告、分析或遥测 SDK，也没有开发者运营的同步服务器。网络请求只发生在你主动访问的网站与服务之间。
-</details>
-
-<details>
-<summary><b>Median Browser 是开源软件吗？可以拿去二次分发吗？</b></summary><br/>
-
-源码在仓库中公开可读，但许可证为"保留所有权利"的源码可见许可，<b>不是</b> MIT / Apache / GPL 等开源协议。复制、修改、分发或商用前，请先取得版权持有者的书面授权，详见 <a href="#-license">License</a>。
-</details>
-
-<details>
-<summary><b>支持哪些 Android 版本？</b></summary><br/>
-
-最低支持 Android 8.0（API 26），编译与目标 SDK 均为 36。
-</details>
-
----
-
-## 🔐 安全策略
-
-Median 的威胁模型信任 Android 操作系统、Android Keystore 与已安装的 System WebView；普通网页默认不可信，敏感权限要求 HTTPS、来源匹配与运行时授权。用户脚本作为第三方代码拥有更高权限，Median 执行最小权限与匹配范围校验，但无法保证任意脚本无恶意行为。
-
-发现安全漏洞？请优先通过 GitHub Private Vulnerability Reporting 提交，详见 [`SECURITY.md`](SECURITY.md)。
-
----
-
-## 🤝 贡献指南
-
-欢迎参与 Median Browser 开发：
-
-- 提交 Bug 或复现步骤清晰的 Issue
-- 提出功能建议
-- 提交 Pull Request
-- 改进代码、注释与文档
-
-提交前请确保：修改内容明确、代码结构清晰、不包含无关文件。
-
----
-
-## 🐞 问题反馈
-
-提交 Issue 时建议包含：
-
-- Android 版本与设备型号
-- Android System WebView 版本
-- 问题描述与复现步骤
-- 是否涉及用户脚本、下载、密码库或离线页面
-
----
-
-## 📄 License
-
-本项目源码**公开可读，但版权保留**（Source Available，All Rights Reserved）：
-
-> 未经版权持有者另行书面授权，不得使用、复制、修改、合并、发布、分发、再许可或出售本软件的副本。
-
-完整条款见仓库中的 [`LICENSE`](LICENSE) 文件。第三方组件许可证见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
-
----
+- [版本更新记录](CHANGELOG.md)
+- [隐私政策](PRIVACY_POLICY.md)
+- [安全策略](SECURITY.md)
+- [第三方组件声明](THIRD_PARTY_NOTICES.md)
+- [软件许可](LICENSE)
 
 <div align="center">
 
-### 🙏 致谢
+<br>
 
-感谢所有开源项目、依赖库与社区贡献者。
+<sub>Median Browser · 无限进步，无限优化，无限极速</sub>
 
-**Made with ❤️ by the Median Browser team**
-
-[⭐ Star this repo](https://github.com/bi-box/Median) · [💬 Telegram](https://t.me/MedianBeta)
+<sub><a href="https://github.com/bi-box/Median">项目主页</a> &nbsp;·&nbsp; <a href="https://github.com/bi-box/Median/releases">版本发布</a> &nbsp;·&nbsp; <a href="https://github.com/bi-box/Median/issues">问题反馈</a> &nbsp;·&nbsp; <a href="LICENSE">许可</a></sub>
 
 </div>
