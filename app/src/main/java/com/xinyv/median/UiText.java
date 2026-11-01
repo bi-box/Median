@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Median Browser contributors
+
 package com.xinyv.median;
 
 /** Small Unicode-safe helpers for labels that are persisted or rendered outside TextView. */

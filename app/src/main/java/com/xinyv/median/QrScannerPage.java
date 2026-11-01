@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Median Browser contributors
+
 package com.xinyv.median;
 
 /** Lightweight QR camera page backed by the WebView/provider BarcodeDetector when available. */

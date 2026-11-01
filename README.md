@@ -303,6 +303,7 @@ Release 附件只上传 `MedianBrowser-2.4.0.apk`，SHA-256：
 - [隐私政策](PRIVACY_POLICY.md)
 - [安全策略](SECURITY.md)
 - [第三方组件声明](THIRD_PARTY_NOTICES.md)
+- [版权与许可声明](NOTICE)
 - [软件许可](LICENSE)
 
 ### 许可

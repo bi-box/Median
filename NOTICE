@@ -1,0 +1,28 @@
+# Median Browser — Copyright and License Notice
+
+Copyright (C) 2026 Median Browser contributors
+
+Median Browser is free software: you can redistribute it and/or modify it
+under the terms of the GNU General Public License as published by the Free
+Software Foundation, version 3 of the License.
+
+Median Browser is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+more details.
+
+You should have received a copy of the GNU General Public License along with
+this program. If not, see <https://www.gnu.org/licenses/>.
+
+The full license text is in [`LICENSE`](LICENSE). Source files carry
+`SPDX-License-Identifier: GPL-3.0-only` headers.
+
+---
+
+Median Browser 是自由软件：你可以依据自由软件基金会发布的 GNU 通用公共许可证
+第 3 版条款重新分发或修改它。本程序不提供任何担保，包括适销性或特定用途适用性
+的默示担保；完整条款见 [`LICENSE`](LICENSE)。
+
+随源码分发的第三方组件保留其原始许可（AndroidX WebKit 兼容代码 Apache-2.0、
+Chromium support-library boundary BSD-style、测试依赖 EPL 等），详见
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。

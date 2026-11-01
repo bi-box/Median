@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Median Browser contributors
+
 package com.xinyv.median;
 
 /** Safe mini-markup for multi-color and gradient text logos. No raw HTML is accepted. */

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-only
+// Copyright (C) 2026 Median Browser contributors
+
 package com.xinyv.median;
 
 /** Pure task-state rules shared by the download center UI and its self-test. */
