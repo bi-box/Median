@@ -21,8 +21,10 @@ final class LocalDataIo {
     }
 
     static synchronized void release() {
-        if (--users != 0) return;
-        thread.quitSafely();
+        if (users <= 0) return;
+        users--;
+        if (users != 0) return;
+        if (thread != null) thread.quitSafely();
         thread = null;
         handler = null;
     }

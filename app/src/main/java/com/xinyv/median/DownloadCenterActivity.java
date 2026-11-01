@@ -67,6 +67,7 @@ public final class DownloadCenterActivity extends Activity {
     private static final int CLEAN_PROBLEMS = 0;
     private static final int CLEAN_COMPLETED = 1;
     private static final int CLEAN_TERMINAL = 2;
+    private static final int DOWNLOAD_DIRECTORY_REQUEST = 412;
 
     private final Handler handler = new Handler(Looper.getMainLooper());
     private final Runnable refresher = new Runnable() {
@@ -165,6 +166,15 @@ public final class DownloadCenterActivity extends Activity {
         title.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         bar.addView(title, new LinearLayout.LayoutParams(0, -1, 1f));
 
+        Button directory = button("目录", false, false);
+        directory.setContentDescription("修改下载文件夹");
+        directory.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                DownloadDirectory.showPickerDialog(DownloadCenterActivity.this, DOWNLOAD_DIRECTORY_REQUEST, null);
+            }
+        });
+        bar.addView(directory, new LinearLayout.LayoutParams(dp(64), dp(38)));
+
         Button clean = button("清理", false, false);
         clean.setContentDescription("清理下载记录");
         clean.setOnClickListener(new View.OnClickListener() {
@@ -172,6 +182,14 @@ public final class DownloadCenterActivity extends Activity {
         });
         bar.addView(clean, new LinearLayout.LayoutParams(dp(64), dp(38)));
         return bar;
+    }
+
+    @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == DOWNLOAD_DIRECTORY_REQUEST)
+            DownloadDirectory.handlePickerResult(this, resultCode, data, new Runnable() {
+                @Override public void run() { refreshData(); }
+            });
     }
 
     private View buildSummary() {

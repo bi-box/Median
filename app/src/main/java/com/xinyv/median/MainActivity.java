@@ -5,6 +5,7 @@ import static com.xinyv.median.ByteFormat.humanBytes;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ActivityNotFoundException;
 import android.app.DownloadManager;
 import android.app.PictureInPictureParams;
 import android.print.PrintManager;
@@ -34,12 +35,14 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.text.InputType;
-import android.util.TypedValue;
 import android.util.Rational;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewConfiguration;
+import android.view.ViewPropertyAnimator;
 import android.view.Window;
 import android.view.WindowManager;
 import android.view.inputmethod.EditorInfo;
@@ -57,8 +60,10 @@ import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebResourceError;
 import android.webkit.WebSettings;
+import android.webkit.WebStorage;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
+import android.webkit.WebViewDatabase;
 import android.widget.Button;
 import android.widget.AdapterView;
 import android.widget.BaseAdapter;
@@ -78,6 +83,8 @@ import androidx.webkit.ScriptHandler;
 import androidx.webkit.WebSettingsCompat;
 import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
+import androidx.webkit.WebViewNavigationWarmupCompat;
+import androidx.webkit.WebViewStartupCompat;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -85,13 +92,14 @@ import org.json.JSONTokener;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
-import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -103,16 +111,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.security.MessageDigest;
 import java.util.Iterator;
 
@@ -123,38 +126,54 @@ public final class MainActivity extends Activity implements Runnable {
     private static final int WEB_PERMISSION_REQUEST = 404;
     private static final int GEOLOCATION_PERMISSION_REQUEST = 405;
     private static final int VAULT_UNLOCK_REQUEST = 406;
+    private static final long VAULT_UNLOCK_WINDOW_MS = 105_000L;
     private static final int FULL_BACKUP_EXPORT_REQUEST = 407;
     private static final int FULL_BACKUP_IMPORT_REQUEST = 408;
-    private static final int HOME_WALLPAPER_REQUEST = 409;
-    private static final int HOME_LOGO_REQUEST = 410;
+    private static final int HOME_WALLPAPER_REQUEST = HomeCustomizationController.REQUEST_WALLPAPER;
+    private static final int HOME_LOGO_REQUEST = HomeCustomizationController.REQUEST_LOGO;
+    private static final int QR_SCAN_REQUEST = 411;
+    private static final int DOWNLOAD_DIRECTORY_REQUEST = 412;
     private static final String PREFS = "median_browser_v2";
     private static final String HOME_URL = "https://median.invalid/";
+    private static final String QR_URL = "https://median.invalid/scan";
     private static final String STATE_WEBVIEW = "median.webview.state";
+    private static final String STATE_TABS = "median.tabs.state";
     private static final String PREF_STARTUP_DIAGNOSTIC = "startup_diagnostic_v1";
-    private static final String HOME_TOKEN = UrlCleaner.randomToken();
     private static final int MAX_TABS = 64;
-    private static final long INITIAL_NAVIGATION_ACK_MS = 450L;
+    // Automatic subscription refresh is useful after startup, but its network traffic should not
+    // compete with the first page's remaining resources.
+    private static final long FILTER_SUBSCRIPTION_IDLE_DELAY_MS = 3200L;
+    // A cold Chromium provider can take longer than one frame to dispatch its first callback.
+    // Retrying at 450 ms often opens a second socket before the original request is accepted;
+    // wait long enough for the normal acknowledgement path and keep the retry one-shot.
+    private static final long INITIAL_NAVIGATION_ACK_MS = 1400L;
     private static final int MAX_WEBVIEW_STATE_BYTES = 262144;
+    private static final int MAX_TAB_METADATA_BYTES = 262144;
+    private static final int MAX_SAVED_TAB_URL_CHARS = 16384;
+    private static final int MAX_SAVED_TAB_TITLE_CHARS = 256;
+    // The bridge is transported through window.prompt. Reject oversized messages before
+    // JSONObject allocates a tree on the UI thread.
+    private static final int SCRIPT_BRIDGE_MAX_MESSAGE_CHARS = 256 * 1024;
+    private static final int SCRIPT_ASSET_MAX_BYTES = 8 * 1024 * 1024;
+    private static final long SCRIPT_ASSET_TOTAL_MAX_BYTES = 32L * 1024L * 1024L;
     private static final byte[] EMPTY_RESPONSE = new byte[0];
     private static final String MODE_PERFORMANCE = "performance";
     private static final String MODE_STANDARD = "standard";
     private static final String MODE_POWER_SAVE = "power_save";
-    private static final int HOME_SECTION_MAIN = 0;
-    private static final int HOME_SECTION_LAYOUT = 1;
-    private static final int HOME_SECTION_LOGO = 2;
-    private static final int HOME_SECTION_SEARCH = 3;
-    private static final int HOME_SECTION_BACKGROUND = 4;
-    private static final int HOME_SECTION_SHORTCUTS = 5;
-    private static final int HOME_SECTION_CODE = 6;
+
+    // Track user navigation to prevent unwanted home page redirects
+    private boolean userHasNavigated = false;
     private static final int SHEET_ROW_NAVIGATE = 0;
     private static final int SHEET_ROW_ACTION = 1;
     private static final int SHEET_ROW_TOGGLE_OFF = 2;
     private static final int SHEET_ROW_TOGGLE_ON = 3;
-    private static final String SHEET_TAG_SURFACE = "median:sheet:surface";
-    private static final String SHEET_TAG_HANDLE = "median:sheet:handle";
-    private static final String SHEET_TAG_PRIMARY = "median:sheet:primary";
-    private static final String SHEET_TAG_MUTED = "median:sheet:muted";
-    private static final String SHEET_TAG_ACCENT = "median:sheet:accent";
+    private static final int SHEET_TAG_SURFACE = 1;
+    private static final int SHEET_TAG_HANDLE = 2;
+    private static final int SHEET_TAG_PRIMARY = 3;
+    private static final int SHEET_TAG_MUTED = 4;
+    private static final int SHEET_TAG_ACCENT = 5;
+    private static final int SHEET_TAG_ROW = 6;
+    private static final int SHEET_TAG_PLAIN_SURFACE = 7;
     private static final String PREF_COMMUNITY_NOTICE_SHOWN = "community_notice_shown_v1";
     private static final String GITHUB_URL = "https://github.com/bi-box/Median";
     private static final String TELEGRAM_URL = "https://telegram.me/MedianBeta";
@@ -162,16 +181,29 @@ public final class MainActivity extends Activity implements Runnable {
             "项目更新、版本发布与问题反馈：\n" + GITHUB_URL +
             "\n\n官方测试频道与公告：\n" + TELEGRAM_URL;
 
-    private static final int WHITE = Color.rgb(255, 255, 255);
-    private static final int TEXT = Color.rgb(32, 33, 36);
-    private static final int MUTED = Color.rgb(95, 99, 104);
-    private static final int SURFACE = Color.rgb(241, 243, 244);
-    private static final int BLUE = Color.rgb(26, 115, 232);
+    // Modern color palette with refined tonal progression
+    private static final int WHITE = 0xFFFCFCFD;
+    private static final int TEXT = 0xFF0A0D12;
+    private static final int MUTED = 0xFF6B7280;
+    private static final int SURFACE = 0xFFF4F6F8;
+    private static final int BLUE = 0xFF3B82F6;
+    private static final int DARK_WEB = 0xFF05070C;
+    private static final int DARK_SHEET = 0xFF0F131C;
+    private static final int DARK_OVERLAY = 0xCC000000;
+    private static final int LIGHT_OVERLAY = 0x4D000000;
+    private static final int DARK_BACKGROUND = 0xFF0A0D12;
+    private static final int DARK_CARD = 0xFF161D2B;
+    private static final int DARK_SURFACE = 0xFF1E2636;
+    private static final int DARK_TEXT = 0xFFF0F1F3;
+    private static final int DARK_MUTED = 0xFF9CA3AF;
+    private static final int DARK_ACCENT = 0xFF60A5FA;
 
     private FrameLayout rootFrame;
-    private LinearLayout browserChrome;
+    private FrameLayout browserChrome;
     private LinearLayout topBar;
     private LinearLayout bottomBar;
+    private View statusBarBackground;
+    private View navigationBarBackground;
     private FrameLayout webContainer;
     private WebView webView;
     private EditText addressBar;
@@ -182,12 +214,23 @@ public final class MainActivity extends Activity implements Runnable {
     private BrowserIconView tabButton;
     private BrowserIconView shieldButton;
     private BrowserIconView refreshButton;
+    private View startupSurface;
+    private TextView startupStatus;
     private ValueCallback<Uri[]> fileChooserCallback;
+    private WebView fileChooserView;
+    private String fileChooserDocumentUrl = "";
+    private String homeToken;
+    private String adPickToken;
+    private String qrToken;
     private final Handler uiHandler = new Handler(Looper.getMainLooper());
     private ExecutorService startupExecutor;
+    private StartupDataLoader startupDataLoader;
+    private ExecutorService webViewStartupExecutor;
+    private String webViewStartupDiagnostic = "兼容初始化";
     private ThreadPoolExecutor navigationExecutor;
     private ExecutorService scriptExecutor;
     private ExecutorService scriptNetworkExecutor;
+    private UserScriptNetwork userScriptNetwork;
     private boolean activityResumed;
     private volatile boolean activityDestroyed;
     private boolean startupReady;
@@ -196,12 +239,20 @@ public final class MainActivity extends Activity implements Runnable {
     private long startupNavigationAt;
     private volatile long scriptRegistrationGeneration;
     private final StartupReadiness startupReadiness = new StartupReadiness(
-            StartupReadiness.VIEW | StartupReadiness.DATA | StartupReadiness.RESUMED);
+            StartupReadiness.VIEW | StartupReadiness.DATA | StartupReadiness.FILTERS | StartupReadiness.RESUMED);
     private Bundle startupSavedState;
     private String startupExternalUrl = "";
     private String startupScriptToken = "";
-    private String startupScriptSource = "";
+    private List<UserScriptStore.DocumentStartPayload> startupScriptPayloads = Collections.emptyList();
+    private boolean startupScriptPayloadsApplied;
     private String pendingStartupInput;
+    // The first navigation must not wait for the large local stores. Their decoded snapshots
+    // are attached later on the UI thread and only refresh data that is actually visible.
+    private boolean startupFastPosted;
+    private boolean startupFastStarted;
+    private boolean startupDataReady;
+    private boolean startupCustomRulesReady;
+    private boolean startupSessionPending;
     private long lastExecutorBusyToastAt;
     private boolean deferredStartupPending;
     private boolean deferredStartupComplete;
@@ -209,23 +260,11 @@ public final class MainActivity extends Activity implements Runnable {
         @Override public void run() {
             deferredStartupPending = false;
             if (deferredStartupComplete || isFinishing() || !activityResumed) return;
+            // Local rules start alongside provider initialization. Only subscription network
+            // refresh waits for the completed page's idle window.
+            if (!pageFinished || !isNetworkPage(currentPageUrl)) return;
             deferredStartupComplete = true;
-            executeTask(scriptExecutor, new Runnable() {
-                @Override public void run() {
-                    try { Process.setThreadPriority(scriptThreadPriority()); } catch (RuntimeException ignored) {}
-                    rebuildAdBlockRules();
-                    uiHandler.post(new Runnable() {
-                        @Override public void run() {
-                            if (!activityDestroyed) updateFilterSubscriptions(true);
-                        }
-                    });
-                }
-            });
-            executeTask(startupExecutor, new Runnable() {
-                @Override public void run() {
-                    if (!activityDestroyed && services != null) services.warmLocalIndexes();
-                }
-            });
+            updateFilterSubscriptions(true);
         }
     };
     private View customView;
@@ -234,17 +273,23 @@ public final class MainActivity extends Activity implements Runnable {
     private boolean activeOverlaySheet;
     private boolean overlayDismissInProgress;
     private Runnable activeOverlayBackAction;
+    private Runnable activeOverlayDismissAction;
     private Object predictiveBackCallback;
-    private Runnable homeCustomizationBackAction;
+    private HomeCustomizationController homeCustomizationController;
     private Runnable bookmarkFolderRootBackAction;
-    private int pendingHomeImageReturnSection = HOME_SECTION_MAIN;
+    private Runnable filterCenterBackAction;
+    private Runnable scriptCenterBackAction;
+    private Runnable passwordMenuBackAction;
     private WebChromeClient.CustomViewCallback customViewCallback;
     private int previousOrientation;
     private int previousSystemUi;
 
     private final AdBlockEngine adBlock = new AdBlockEngine();
+    private AdBlockRuleLoader adBlockRuleLoader;
+    private NavigationConnectionHints connectionHints;
     private UserScriptStore scriptStore;
     private final MediaResourceSniffer mediaSniffer = new MediaResourceSniffer();
+    private long liveMediaCaptureSequence = -1L;
     private BrowserServices services;
     private BrowserDataStore dataStore;
     private BookmarkFolderStore bookmarkFolders;
@@ -257,26 +302,50 @@ public final class MainActivity extends Activity implements Runnable {
     private volatile boolean adBlockEnabled;
     private boolean desktopMode;
     private boolean nightMode;
+    private boolean edgeNavigationEnabled;
     private boolean httpsOnly;
     private boolean restoreTabs;
     private boolean acceptThirdPartyCookies;
     private String searchEngine;
     private volatile String performanceMode;
-    private volatile boolean performanceNetworkDirect;
     private volatile Set<String> siteExceptions;
     private int blockedAtPageStart;
     private volatile boolean scriptDownloadInProgress;
     private final ConcurrentHashMap<WebView, String> scriptBridgeTokens = new ConcurrentHashMap<WebView, String>();
-    private final ConcurrentHashMap<WebView, ScriptHandler> scriptHandlers = new ConcurrentHashMap<WebView, ScriptHandler>();
-    private final ConcurrentHashMap<WebView, String> credentialCaptureTokens = new ConcurrentHashMap<WebView, String>();
+    private final ConcurrentHashMap<WebView, Long> scriptDocumentGenerations = new ConcurrentHashMap<WebView, Long>();
+    private final ConcurrentHashMap<WebView, List<ScriptHandler>> scriptHandlers =
+            new ConcurrentHashMap<WebView, List<ScriptHandler>>();
+    private final ConcurrentHashMap<WebView, String> scriptTabIds = new ConcurrentHashMap<WebView, String>();
+    private final ScriptTabStateStore scriptTabValues = new ScriptTabStateStore();
+    private long scriptTabSequence;
     private final Set<WebView> documentStartScriptViews = ConcurrentHashMap.newKeySet();
-    private final ConcurrentHashMap<String, HttpURLConnection> scriptConnections = new ConcurrentHashMap<String, HttpURLConnection>();
     private volatile boolean filterUpdateInProgress;
     private boolean autoPictureInPicture;
+    private boolean immersiveScrollChrome;
+    private boolean clearDataOnExit;
+    private boolean exitDataCleared;
+    private boolean chromeHiddenByScroll;
+    private boolean immersivePageLayout;
+    private boolean immersiveGestureActive;
+    private boolean immersiveGestureDirectionLocked;
+    private boolean immersiveGestureVertical;
+    private float immersiveGestureDownX;
+    private float immersiveGestureDownY;
+    private float immersiveGestureY;
+    private float immersiveGestureOffset;
+    private boolean immersiveGestureStartHidden;
+    private boolean keyboardVisible;
+    private int legacyKeyboardOverlap;
+    private int systemKeyboardBottom;
+    private boolean systemKeyboardVisible;
+    private int systemInsetLeft;
+    private int systemInsetTop;
+    private int systemInsetRight;
+    private int systemInsetBottom;
     private boolean cleanTrackingParameters;
     private boolean passwordAutofillEnabled;
     private boolean passwordSavePromptsEnabled;
-    private final AtomicBoolean cookieFlushPending = new AtomicBoolean(false);
+    private final CookieFlushScheduler cookieFlushScheduler = new CookieFlushScheduler();
     private boolean compatibilityDialogShowing;
     private String lastCompatibilityOfferHost = "";
     private long lastCompatibilityOfferAt;
@@ -284,16 +353,32 @@ public final class MainActivity extends Activity implements Runnable {
     // WebView request callbacks run off the UI thread. Never call WebView methods there.
     private volatile String currentPageUrl = HOME_URL;
     private volatile String currentPageHost = "";
+    private boolean homeThemeRepairPending;
     private final ConcurrentHashMap<WebView, String> pageHosts = new ConcurrentHashMap<WebView, String>();
+    private final ConcurrentHashMap<WebView, String> startedPageUrls = new ConcurrentHashMap<WebView, String>();
     private final ConcurrentHashMap<WebView, Boolean> adBlockActiveByView = new ConcurrentHashMap<WebView, Boolean>();
     private final ConcurrentHashMap<WebView, String> mobileUserAgents = new ConcurrentHashMap<WebView, String>();
     private final ConcurrentHashMap<WebView, String> appliedSiteSettings = new ConcurrentHashMap<WebView, String>();
     private final ConcurrentHashMap<WebView, InitialNavigationGuard> initialNavigationGuards =
             new ConcurrentHashMap<WebView, InitialNavigationGuard>();
-    private final ConcurrentHashMap<WebView, Boolean> cosmeticInjected = new ConcurrentHashMap<WebView, Boolean>();
+    private final ConcurrentHashMap<WebView, NavigationGestureGuard> navigationGestureGuards =
+            new ConcurrentHashMap<WebView, NavigationGestureGuard>();
+    private final ConcurrentHashMap<WebView, String> navigationSourceDocuments = new ConcurrentHashMap<WebView, String>();
+    private final ConcurrentHashMap<WebView, MainFrameNavigationContext> mainFrameNavigationContexts =
+            new ConcurrentHashMap<WebView, MainFrameNavigationContext>();
+    private final ConcurrentHashMap<WebView, String> popupSourceDocuments = new ConcurrentHashMap<WebView, String>();
+    private final ConcurrentHashMap<WebView, Object> cosmeticInjected = new ConcurrentHashMap<WebView, Object>();
     private final Set<WebView> unresponsiveWebViews = ConcurrentHashMap.newKeySet();
     private final Set<WebView> trustedHomeViews = ConcurrentHashMap.newKeySet();
     private final Set<WebView> customHomeViews = ConcurrentHashMap.newKeySet();
+    private final Set<WebView> adPickerViews = ConcurrentHashMap.newKeySet();
+    private static final class AdPickerSession {
+        final String documentUrl;
+        AdPickerSession(String url) { documentUrl = navigationDocumentUrl(url); }
+    }
+    private final ConcurrentHashMap<WebView, AdPickerSession> adPickerSessions = new ConcurrentHashMap<WebView, AdPickerSession>();
+    private final Set<WebView> qrScannerViews = ConcurrentHashMap.newKeySet();
+    private final Set<String> faviconFetchQueued = ConcurrentHashMap.newKeySet();
     private final ConcurrentHashMap<WebView, String> renderedHomeKeys = new ConcurrentHashMap<WebView, String>();
     private String cachedHomeKey = "";
     private String cachedHomeHtml = "";
@@ -322,12 +407,21 @@ public final class MainActivity extends Activity implements Runnable {
     private String pendingGeolocationOrigin;
     private WebView pendingGeolocationView;
     private Runnable pendingVaultAction;
+    private Runnable pendingVaultCancelAction;
     private long vaultUnlockedUntil;
-    private String handledCredentialPageKey = "";
     private PasswordVault.Credential stagedCredential;
     private long stagedCredentialAt;
     private String lastCredentialOfferKey = "";
     private long lastCredentialOfferAt;
+    private final Runnable vaultLock = new Runnable() {
+        @Override public void run() {
+            vaultUnlockedUntil = 0L;
+            if (stagedCredential != null) stagedCredential.clear();
+            stagedCredential = null;
+            stagedCredentialAt = 0L;
+            if (services != null) services.lockVault();
+        }
+    };
 
     private static final class PreparedInjection {
         final long sequence;
@@ -344,22 +438,13 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private static final class BrowserTab {
+        String scriptTabId;
         String title = "新标签页";
         String url = HOME_URL;
         Bundle state;
         WebView liveView;
         long lastActiveAt;
         boolean pinned;
-    }
-
-    private static final class StartupLoad {
-        final AtomicInteger remaining = new AtomicInteger(2);
-        BrowserDataStore data;
-        BookmarkFolderStore folders;
-        SiteSettingsStore sites;
-        UserScriptStore scripts;
-        String scriptToken = "";
-        String scriptSource = "";
     }
 
     private final ArrayList<BrowserTab> tabs = new ArrayList<BrowserTab>();
@@ -374,14 +459,26 @@ public final class MainActivity extends Activity implements Runnable {
         nightMode = prefs.getBoolean("night_mode", false);
         setTheme(nightMode ? R.style.AppThemeDark : R.style.AppTheme);
         super.onCreate(state);
+        // Prepare the provider before any WebView API, in parallel with native UI and disk work.
+        beginWebViewStartup();
         Window window = getWindow();
-        int startupChrome = nightMode ? Color.rgb(27, 29, 32) : WHITE;
+        // Use modern surface colors instead of harsh white/black
+        int startupChrome = nightMode ? 0xFF0A0D12 : 0xFFFAFBFC;
         window.setStatusBarColor(startupChrome);
         window.setNavigationBarColor(startupChrome);
-        window.getDecorView().setSystemUiVisibility(nightMode ? 0 :
-                (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR));
+        int layoutFlags = View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+        window.getDecorView().setSystemUiVisibility(layoutFlags | (nightMode ? 0 :
+                (View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR)));
         window.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         if (Build.VERSION.SDK_INT >= 30) window.setDecorFitsSystemWindows(false);
+        if (Build.VERSION.SDK_INT >= 28) {
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            // DEFAULT letterboxes a fullscreen window around the camera cutout on some
+            // devices. Showing/hiding the status bar would then still resize the page.
+            attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            window.setAttributes(attributes);
+        }
 
         deviceProfile = DeviceProfile.detect(this);
         migrateLegacyLogoExample();
@@ -389,16 +486,20 @@ public final class MainActivity extends Activity implements Runnable {
         favicons = new FaviconStore(this);
         searchEngines = new SearchEngineStore(prefs);
         adBlockEnabled = prefs.getBoolean("adblock", true);
+        startupCustomRulesReady = !adBlockEnabled;
+        startupReadiness.set(StartupReadiness.FILTERS, startupCustomRulesReady);
         desktopMode = prefs.getBoolean("desktop", false);
+        edgeNavigationEnabled = prefs.getBoolean("edge_navigation", true);
         httpsOnly = prefs.getBoolean("https_only", true);
         restoreTabs = HomeOpenPolicy.restoresLast(prefs.getString("home_open_mode", ""),
-                prefs.getBoolean("restore_tabs", true));
+                prefs.getBoolean("restore_tabs", false));
         acceptThirdPartyCookies = prefs.getBoolean("accept_third_party_cookies", false);
         searchEngine = prefs.getString("search_engine", "google");
         if (!searchEngines.contains(searchEngine)) searchEngine = "google";
         performanceMode = prefs.getString("performance_mode", MODE_STANDARD);
-        performanceNetworkDirect = prefs.getBoolean("performance_network_direct", false);
         autoPictureInPicture = prefs.getBoolean("auto_picture_in_picture", false);
+        immersiveScrollChrome = prefs.getBoolean("immersive_scroll_chrome", true);
+        clearDataOnExit = prefs.getBoolean("clear_data_on_exit", false);
         cleanTrackingParameters = prefs.getBoolean("clean_tracking_parameters", true);
         passwordAutofillEnabled = prefs.getBoolean("password_autofill", true);
         passwordSavePromptsEnabled = prefs.getBoolean("password_save_prompts", true);
@@ -409,133 +510,191 @@ public final class MainActivity extends Activity implements Runnable {
         navigationExecutor = BackgroundExecutor.create(1, 2, "median-navigation", true);
         scriptExecutor = BackgroundExecutor.create(1, 64, "median-work", false);
         scriptNetworkExecutor = BackgroundExecutor.create(3, 96, "median-network", false);
+        connectionHints = new NavigationConnectionHints(uiHandler, prefs, adBlock,
+                new NavigationConnectionHints.Host() {
+                    @Override public boolean isCurrentPageCallback(WebView source, long sequence) {
+                        return !exitDataCleared && MainActivity.this.isCurrentPageCallback(source, sequence);
+                    }
+                    @Override public boolean isAdBlockEnabled() { return adBlockEnabled; }
+                });
+        adBlockRuleLoader = new AdBlockRuleLoader(adBlock, prefs, services, uiHandler,
+                new AdBlockRuleLoader.TaskQueue() {
+                    @Override public boolean execute(Runnable task) { return executeTask(scriptExecutor, task); }
+                }, new AdBlockRuleLoader.Listener() {
+                    @Override public void onPublished(boolean notifyUser) { onAdBlockRulesLoaded(notifyUser); }
+                    @Override public void onFailed() { onAdBlockRulesLoadFailed(); }
+                });
+        // Publish the small custom-rule snapshot first, then compile cached subscriptions in
+        // the same background task. Neither operation waits for onPageFinished or uses the UI.
+        rebuildAdBlockRulesAsync(false);
 
         BrowserTab first = new BrowserTab();
         tabs.add(first);
+        // Start both disk decoders before constructing the view hierarchy and WebView. Previously
+        // the synchronous Chromium startup completed first, so the advertised parallel path was
+        // actually serialized on every cold launch.
+        beginStartupLoad(state, getIntent());
         buildUi();
         registerPredictiveBack();
-        // Creating the first WebView directly is the most compatible startup path. Some vendor
-        // providers advertise asynchronous startup but lose its completion callback, which used
-        // to leave the browser apparently unable to open a page until a three-second fallback.
-        initializeInitialWebView();
-        beginStartupLoad(state, getIntent());
     }
 
     /**
-     * Constructs the first WebView through the framework's normal synchronous path. This avoids
-     * depending on optional OEM support-library startup callbacks before navigation can begin.
+     * Uses the provider's supported async protocol when available. The callback is always posted
+     * to the main looper, so onCreate finishes building the native surface before it is delivered.
      */
+    private void beginWebViewStartup() {
+        webViewStartupExecutor = BackgroundExecutor.createStartup(1, 32, "median-webview-startup");
+        WebViewStartupCompat.startUpWebView(webViewStartupExecutor, new WebViewStartupCompat.Callback() {
+            @Override public void onSuccess(WebViewStartupCompat.Result result) {
+                finishWebViewStartupExecutor();
+                if (activityDestroyed || isFinishing()) return;
+                webViewStartupDiagnostic = result.usedAsyncStartup() ? "异步初始化" : "兼容初始化";
+                if (result.getTotalTimeInUiThreadMillis() != null)
+                    webViewStartupDiagnostic += " · UI " + result.getTotalTimeInUiThreadMillis() + " ms";
+                if (result.getMaxTimePerTaskInUiThreadMillis() != null)
+                    webViewStartupDiagnostic += " · 最长任务 " + result.getMaxTimePerTaskInUiThreadMillis() + " ms";
+                postAfterUiTransition(new Runnable() {
+                    @Override public void run() { initializeInitialWebView(); }
+                });
+            }
+
+            @Override public void onFailure(Throwable error) {
+                finishWebViewStartupExecutor();
+                if (activityDestroyed || isFinishing()) return;
+                // A real provider startup failure makes further WebView API calls unsafe.
+                // Keep the native surface visible rather than retrying new WebView here.
+                if (startupStatus != null) startupStatus.setText("网页引擎启动失败，请关闭后重新打开 Median");
+            }
+        });
+    }
+
+    private void finishWebViewStartupExecutor() {
+        if (webViewStartupExecutor != null) webViewStartupExecutor.shutdown();
+        webViewStartupExecutor = null;
+    }
+
+    /** Constructs the view only after provider preparation, or on the older-provider fallback. */
     private void initializeInitialWebView() {
         if (activityDestroyed || isFinishing() || webView != null || webContainer == null) return;
-        webContainer.removeAllViews();
+
         webView = createConfiguredWebView();
-        webContainer.addView(webView, new FrameLayout.LayoutParams(
+        // Keep the startup surface until view construction has actually succeeded.
+        if (startupSurface != null && startupSurface.getParent() == webContainer) {
+            Motion.fadeOutStartup(startupSurface, reduceMotion(), new Runnable() {
+                @Override public void run() {
+                    if (startupSurface != null && startupSurface.getParent() == webContainer) {
+                        webContainer.removeView(startupSurface);
+                        startupSurface = null;
+                    }
+                }
+            });
+        } else {
+            webContainer.removeAllViews();
+        }
+
+        final WebView initialView = webView;
+        // Keep the startup surface above the newly created view until its short fade completes.
+        webContainer.addView(initialView, 0, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        // WebView already renders through the provider's hardware pipeline. A temporary forced
+        // layer duplicates its backing surface and delays the first useful frame on cold startup,
+        // so let the view draw immediately while the startup surface fades away.
+        initialView.setAlpha(1f);
+
         // configureWebView() runs before this field is assigned, so its generic renderer policy
         // cannot yet know that this is the visible tab. Promote it immediately after binding;
         // otherwise the first homepage/network navigation may run at background priority.
         applyPerformanceMode(webView);
         BrowserTab first = tabs.get(0);
-        first.liveView = webView;
+        bindWebViewToTab(first, webView);
         first.lastActiveAt = SystemClock.uptimeMillis();
         if (activityResumed) webView.onResume();
-        // Do not start a placeholder WebView navigation here. The stores usually finish while
-        // that navigation is still committing; replacing it with a restored/network page can be
-        // dropped by some WebView providers and leaves the user needing a manual refresh.
-        // completeStartup() owns the one and only initial navigation.
+        // Do not start a placeholder navigation here. maybeStartFastStartup() owns the first
+        // useful navigation and can run before the background stores have finished decoding.
         startupReadiness.set(StartupReadiness.VIEW, true);
         updateChrome();
+        maybeStartFastStartup();
         maybeCompleteStartup();
     }
 
-    /**
-     * Large user state is decoded away from the first-frame path. WebView navigation begins only
-     * after per-site policy and document-start scripts are ready, so startup never races a
-     * placeholder page and speed never weakens privacy semantics.
-     */
+    /** Starts the first useful page as soon as the native view and Activity are resumed. */
+    private void maybeStartFastStartup() {
+        if (startupReady || startupFastStarted || startupFastPosted || webView == null || !activityResumed ||
+                !startupCustomRulesReady)
+            return;
+        startupFastPosted = true;
+        final Runnable launch = new Runnable() {
+            @Override public void run() {
+                if (activityDestroyed || isFinishing() || webView == null || !activityResumed) {
+                    startupFastPosted = false;
+                    return;
+                }
+                startupFastPosted = false;
+                startupFastStarted = true;
+                Bundle savedState = startupSavedState;
+                String externalUrl = startupExternalUrl;
+                startupSavedState = null;
+                startupExternalUrl = "";
+                completeStartup(savedState, externalUrl);
+            }
+        };
+        // An attached WebView is ready to accept the first navigation now. A second queue hop
+        // adds main-thread latency without warming Chromium or improving renderer readiness.
+        // Keep the attach-aware frame fallback for OEMs that resume before the first attach.
+        if (webView.isAttachedToWindow()) launch.run();
+        else postAfterUiTransition(launch);
+    }
+
+    /** Decodes larger user state away from the first-frame path. */
     private void beginStartupLoad(final Bundle savedState, Intent intent) {
         final String externalUrl = isExternalHttpIntent(intent) ? intent.getData().toString() : "";
+        if (externalUrl.length() > 0) WebViewNavigationWarmupCompat.enqueueForStartup(externalUrl);
         startupSavedState = savedState;
         startupExternalUrl = externalUrl;
-        final StartupLoad load = new StartupLoad();
-        if (!executeTask(startupExecutor, new Runnable() {
-            @Override public void run() {
-                BrowserDataStore data = null;
-                BookmarkFolderStore folders = null;
-                try {
-                    data = new BrowserDataStore(getApplicationContext());
-                    folders = new BookmarkFolderStore(getApplicationContext());
-                } catch (RuntimeException ignored) {}
-                load.data = data;
-                load.folders = folders;
-                finishStartupLoadPart(load);
-            }
-        })) finishStartupLoadPart(load);
-        if (!executeTask(startupExecutor, new Runnable() {
-            @Override public void run() {
-                SiteSettingsStore sites = null;
-                UserScriptStore scripts = null;
-                try {
-                    sites = new SiteSettingsStore(getApplicationContext());
-                    scripts = new UserScriptStore(getApplicationContext());
-                } catch (RuntimeException ignored) {}
-                String preparedToken = "";
-                String preparedSource = "";
-                if (scripts != null && scripts.hasEnabledScripts()) {
-                    try {
-                        preparedToken = UrlCleaner.randomToken();
-                        preparedSource = scripts.buildDocumentStartScript(preparedToken);
-                    } catch (RuntimeException ignored) {
-                        preparedToken = "";
-                        preparedSource = "";
+        startupDataLoader = new StartupDataLoader(getApplicationContext(), prefs, uiHandler,
+                new StartupDataLoader.TaskQueue() {
+                    @Override public boolean execute(Runnable task) { return executeTask(startupExecutor, task); }
+                }, new StartupDataLoader.Listener() {
+                    @Override public void onConnectionHintsReady(ConnectionHintsStore hints) {
+                        if (activityDestroyed || exitDataCleared || !connectionHints.publishRestored(hints)) return;
+                        if (webView != null && !pageFinished && isNetworkPage(currentPageUrl)) {
+                            prepareNavigationConnections(currentPageUrl);
+                            installConnectionHintScript(webView, currentPageUrl, true);
+                        }
                     }
-                }
-                load.sites = sites;
-                load.scripts = scripts;
-                load.scriptToken = preparedToken;
-                load.scriptSource = preparedSource;
-                finishStartupLoadPart(load);
-            }
-        })) finishStartupLoadPart(load);
-    }
 
-    private void finishStartupLoadPart(final StartupLoad load) {
-        if (load.remaining.decrementAndGet() != 0) return;
-        if (activityDestroyed) {
-            closeStartupStores(load.data, load.sites, load.scripts);
-            return;
-        }
-        uiHandler.post(new Runnable() {
-            @Override public void run() {
-                if (activityDestroyed || isFinishing()) {
-                    closeStartupStores(load.data, load.sites, load.scripts);
-                } else if (load.data == null || load.sites == null || load.folders == null || load.scripts == null) {
-                    closeStartupStores(load.data, load.sites, load.scripts);
-                    toast("本地浏览数据无法读取，请重新启动 Median");
-                    finishAfterTransition();
-                } else {
-                    dataStore = load.data;
-                    bookmarkFolders = load.folders;
-                    siteSettingsStore = load.sites;
-                    scriptStore = load.scripts;
-                    startupScriptToken = load.scriptToken;
-                    startupScriptSource = load.scriptSource;
-                    startupReadiness.set(StartupReadiness.DATA, true);
-                    maybeCompleteStartup();
-                }
-            }
-        });
-    }
+                    @Override public boolean onLoaded(StartupDataLoader.Result load) {
+                        if (activityDestroyed || isFinishing()) return false;
+                        dataStore = load.data;
+                        bookmarkFolders = load.folders;
+                        siteSettingsStore = load.sites;
+                        scriptStore = load.scripts;
+                        connectionHints.publishRestored(load.connectionHints);
+                        startupScriptToken = load.scriptToken;
+                        startupScriptPayloads = load.scriptPayloads;
+                        startupDataReady = true;
+                        startupReadiness.set(StartupReadiness.DATA, true);
+                        onStartupDataReady();
+                        maybeCompleteStartup();
+                        return true;
+                    }
 
-    private static void closeStartupStores(BrowserDataStore data, SiteSettingsStore sites,
-                                           UserScriptStore scripts) {
-        if (data != null) data.close();
-        if (sites != null) sites.close();
-        if (scripts != null) scripts.close();
+                    @Override public void onFailed() {
+                        if (activityDestroyed || isFinishing()) return;
+                        toast("本地浏览数据无法读取，请重新启动 Median");
+                        finishAfterTransition();
+                    }
+
+                    @Override public void onWorkersFinished() {
+                        if (startupExecutor != null) startupExecutor.shutdown();
+                    }
+                });
+        startupDataLoader.start();
     }
 
     private void maybeCompleteStartup() {
-        if (startupReady || webView == null || !startupReadiness.claimPost()) return;
+        if (startupReady || startupFastPosted || startupFastStarted || webView == null ||
+                !startupReadiness.claimPost()) return;
         postAfterUiTransition(new Runnable() {
             @Override public void run() {
                 if (!startupReadiness.begin() || activityDestroyed || isFinishing() || webView == null) return;
@@ -551,18 +710,22 @@ public final class MainActivity extends Activity implements Runnable {
     private void completeStartup(Bundle savedState, String externalUrl) {
         startupReady = true;
         startupReadyAt = SystemClock.elapsedRealtime();
-        installPreparedDocumentStartUserScripts(webView);
-        BrowserTab active = tabs.get(0);
+        if (startupDataReady) installPreparedDocumentStartUserScripts(webView);
+        boolean restoredTabs = restoreTabMetadata(savedState);
+        BrowserTab active = tabs.get(currentTabIndex);
         Bundle webViewState = savedState == null ? null :
-                (savedState.containsKey(STATE_WEBVIEW) ? savedState.getBundle(STATE_WEBVIEW) : savedState);
+                (savedState.containsKey(STATE_WEBVIEW) ? savedState.getBundle(STATE_WEBVIEW) :
+                        savedState.containsKey(STATE_TABS) ? null : savedState);
         String directInput = StartupNavigationPolicy.preferredInput(pendingStartupInput, externalUrl);
         pendingStartupInput = null;
         if (directInput.length() > 0) {
             // Typed input is newer than an external launch intent. Loading the homepage/session
             // first and this destination immediately afterwards recreates the cold-start race
             // fixed above, so execute only the selected direct navigation.
+            startupSessionPending = false;
             loadInput(directInput);
-        } else if (webViewState != null && webView.restoreState(webViewState) != null) {
+        } else if (restoreWebViewState(webView, webViewState)) {
+            startupSessionPending = false;
             active.url = webView.getUrl() == null ? HOME_URL : webView.getUrl();
             if (isHomeUrl(active.url)) {
                 // A restored WebView can contain the placeholder homepage rendered before the
@@ -570,10 +733,12 @@ public final class MainActivity extends Activity implements Runnable {
                 // now-ready stores so long-idle/process-death restores cannot show stale/empty data.
                 renderedHomeKeys.remove(webView);
                 showHome();
+            } else if (isQrScannerUrl(active.url)) {
+                showQrScannerPage();
             } else if (isNetworkPage(active.url)) {
                 currentPageUrl = active.url;
                 currentPageHost = hostOf(active.url);
-                prepareNetworkDestination(webView, active.url);
+                prepareNetworkDestination(webView, active.url, currentPageHost);
                 watchInitialNetworkNavigation(webView, active.url);
             } else if (isOfflineUrl(active.url)) {
                 currentPageUrl = active.url;
@@ -585,49 +750,77 @@ public final class MainActivity extends Activity implements Runnable {
                 applyPageAccessPolicy(webView, active.url);
                 appliedSiteSettings.remove(webView);
             }
+        } else if (restoredTabs) {
+            // Activity recreation is independent of the fresh-launch homepage preference.
+            // Metadata also retains the selected URL if Chromium could not save its history.
+            startupSessionPending = false;
+            if (isHomeUrl(active.url)) showHome();
+            else if (isQrScannerUrl(active.url)) showQrScannerPage();
+            else loadNetworkUrl(webView, active.url);
         } else {
-            List<BrowserDataStore.SessionTab> saved = restoreTabs
-                    ? dataStore.restoreSession() : Collections.<BrowserDataStore.SessionTab>emptyList();
-            if (!saved.isEmpty()) {
-                tabs.clear();
-                for (BrowserDataStore.SessionTab item : saved) {
-                    BrowserTab restored = new BrowserTab();
-                    restored.title = item.title;
-                    restored.url = item.url;
-                    restored.pinned = item.pinned;
-                    tabs.add(restored);
-                }
-                currentTabIndex = Math.min(dataStore.restoredSessionIndex(), tabs.size() - 1);
-                active = tabs.get(currentTabIndex);
-                active.liveView = webView;
-                active.lastActiveAt = SystemClock.uptimeMillis();
-            } else {
+            startupSessionPending = restoreTabs && dataStore == null;
+            if (!restoreStartupSession()) {
                 active.url = configuredHomeUrl();
-            }
-            if (isHomeUrl(active.url)) {
-                showHome();
-            } else {
-                currentPageUrl = active.url;
-                currentPageHost = hostOf(active.url);
-                pageHosts.put(webView, currentPageHost);
-                loadNetworkUrl(webView, active.url);
+                if (isHomeUrl(active.url)) showHome();
+                else loadNetworkUrl(webView, active.url);
             }
         }
         requestChromeUpdate();
-        scheduleDeferredStartupWork();
         showCommunityNoticeOnFirstLaunch(savedState);
     }
 
-    /** Heavy rule parsing and subscription I/O must not compete with the first frame. */
+    private boolean restoreStartupSession() {
+        if (!restoreTabs || dataStore == null || webView == null) return false;
+        List<BrowserDataStore.SessionTab> saved = dataStore.restoreSession();
+        if (saved.isEmpty()) return false;
+        tabs.clear();
+        for (BrowserDataStore.SessionTab item : saved) {
+            BrowserTab restored = new BrowserTab();
+            restored.title = item.title;
+            restored.url = item.url;
+            restored.pinned = item.pinned;
+            tabs.add(restored);
+        }
+        currentTabIndex = Math.min(dataStore.restoredSessionIndex(), tabs.size() - 1);
+        BrowserTab active = tabs.get(currentTabIndex);
+        bindWebViewToTab(active, webView);
+        active.lastActiveAt = SystemClock.uptimeMillis();
+        if (isHomeUrl(active.url)) showHome();
+        else loadNetworkUrl(webView, active.url);
+        return true;
+    }
+
+    /** Publishes decoded stores after first paint without replacing an active user navigation. */
+    private void onStartupDataReady() {
+        if (activityDestroyed || webView == null) return;
+        installPreparedDocumentStartUserScripts(webView);
+        if (startupSessionPending && isHomeUrl(currentPageUrl) && isHomeUrl(webView.getUrl())) {
+            startupSessionPending = false;
+            if (restoreStartupSession()) {
+                requestChromeUpdate();
+                return;
+            }
+        }
+        // The cache key includes every persisted site setting. Publishing the stores does not
+        // invalidate an identical default policy; avoid resending settings during the first load.
+        // A real site override changes the key and is still applied below.
+        // Only apply settings or show home if the current page matches what WebView is actually showing
+        // AND the user hasn't navigated away from the initial state
+        String actualUrl = webView.getUrl();
+        if (!pageFinished && isNetworkPage(currentPageUrl)) prepareNavigationConnections(currentPageUrl);
+        if (isNetworkPage(currentPageUrl) && isNetworkPage(actualUrl)) {
+            applySiteSettings(webView, currentPageHost);
+        } else if (!userHasNavigated && isHomeUrl(currentPageUrl) && isHomeUrl(actualUrl)) {
+            showHome();
+        }
+    }
+
+    /** Network refresh yields to page completion; local filtering is already initialized. */
     private void scheduleDeferredStartupWork() {
         if (!startupReady) return;
         if (deferredStartupComplete || deferredStartupPending) return;
-        // Large filter subscriptions and local indexes must not start while the first website is
-        // still painting. Built-in network rules remain available during this idle delay.
-        long delay = MODE_POWER_SAVE.equals(performanceMode) ? 8000L :
-                (MODE_PERFORMANCE.equals(performanceMode) ? 4000L : 5500L);
         deferredStartupPending = true;
-        uiHandler.postDelayed(deferredStartup, delay);
+        uiHandler.postDelayed(deferredStartup, FILTER_SUBSCRIPTION_IDLE_DELAY_MS);
     }
 
     private boolean executeTask(ExecutorService executor, Runnable task) {
@@ -657,6 +850,21 @@ public final class MainActivity extends Activity implements Runnable {
         return false;
     }
 
+    private String homeToken() {
+        if (homeToken == null) homeToken = UrlCleaner.randomToken();
+        return homeToken;
+    }
+
+    private String adPickToken() {
+        if (adPickToken == null) adPickToken = UrlCleaner.randomToken();
+        return adPickToken;
+    }
+
+    private String qrToken() {
+        if (qrToken == null) qrToken = UrlCleaner.randomToken();
+        return qrToken;
+    }
+
     /**
      * 2.1.5 wrote its editor example into real preferences before the user
      * pressed Save. Repair only the exact inconsistent legacy state once.
@@ -677,90 +885,107 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void buildUi() {
         rootFrame = new FrameLayout(this);
-        rootFrame.setBackgroundColor(nightMode ? Color.rgb(17, 19, 21) : WHITE);
+        rootFrame.setBackgroundColor(nightMode ? DARK_WEB : WHITE);
+        int chromeBackground = nightMode ? DARK_BACKGROUND : WHITE;
+        int chromeSurface = nightMode ? DARK_SURFACE : SURFACE;
+        int chromeText = nightMode ? DARK_TEXT : TEXT;
+        int chromeHint = nightMode ? DARK_MUTED : 0xff80868b;
 
-        browserChrome = new LinearLayout(this);
-        browserChrome.setOrientation(LinearLayout.VERTICAL);
-        browserChrome.setBackgroundColor(WHITE);
+        browserChrome = new FrameLayout(this);
+        browserChrome.setBackgroundColor(chromeBackground);
         rootFrame.addView(browserChrome, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
         topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
         topBar.setGravity(Gravity.CENTER_VERTICAL);
-        topBar.setPadding(dp(10), dp(7), dp(10), dp(7));
-        topBar.setBackgroundColor(WHITE);
+        topBar.setPadding(dp(12), dp(8), dp(12), dp(8));
+        topBar.setBackgroundColor(chromeBackground);
 
         addressPill = new LinearLayout(this);
         addressPill.setOrientation(LinearLayout.HORIZONTAL);
         addressPill.setGravity(Gravity.CENTER_VERTICAL);
-        addressPill.setPadding(dp(3), 0, dp(3), 0);
-        addressPill.setBackground(roundRect(SURFACE, 22));
+        addressPill.setPadding(dp(4), 0, dp(4), 0);
+        addressPill.setBackground(roundRect(chromeSurface, 999));
+        addressPill.setElevation(0.5f * getResources().getDisplayMetrics().density);
 
         shieldButton = iconButton(BrowserIconView.SHIELD, "保护与脚本");
-        addressPill.addView(shieldButton, new LinearLayout.LayoutParams(dp(40), dp(42)));
+        addressPill.addView(shieldButton, new LinearLayout.LayoutParams(dp(42), dp(42)));
 
         addressBar = new EditText(this);
         addressBar.setSingleLine(true);
-        addressBar.setTextSize(15f);
-        addressBar.setTextColor(TEXT);
-        addressBar.setHintTextColor(Color.rgb(128, 134, 139));
+        addressBar.setTextSize(15.5f);
+        addressBar.setTextColor(chromeText);
+        addressBar.setHintTextColor(chromeHint);
         addressBar.setHint("搜索或输入网址");
         addressBar.setSelectAllOnFocus(true);
         addressBar.setImeOptions(EditorInfo.IME_ACTION_GO);
         addressBar.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         addressBar.setBackgroundColor(Color.TRANSPARENT);
-        addressBar.setPadding(dp(3), 0, dp(3), 0);
-        addressPill.addView(addressBar, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        addressBar.setPadding(dp(8), 0, dp(8), 0);
+        addressPill.addView(addressBar, new LinearLayout.LayoutParams(0, dp(46), 1f));
 
         refreshButton = iconButton(BrowserIconView.RELOAD, "刷新");
-        addressPill.addView(refreshButton, new LinearLayout.LayoutParams(dp(40), dp(42)));
-        topBar.addView(addressPill, new LinearLayout.LayoutParams(0, dp(44), 1f));
+        addressPill.addView(refreshButton, new LinearLayout.LayoutParams(dp(42), dp(42)));
+        topBar.addView(addressPill, new LinearLayout.LayoutParams(0, dp(46), 1f));
 
-        browserChrome.addView(topBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
+        topBar.setElevation(dp(8));
+        browserChrome.addView(topBar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(62), Gravity.TOP));
 
         progressBar = new ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal);
         progressBar.setMax(100);
         progressBar.setProgressTintList(android.content.res.ColorStateList.valueOf(BLUE));
         progressBar.setVisibility(View.GONE);
-        browserChrome.addView(progressBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2)));
+        progressBar.setElevation(dp(9));
+        FrameLayout.LayoutParams progressParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2), Gravity.TOP);
+        progressParams.topMargin = dp(62);
+        browserChrome.addView(progressBar, progressParams);
 
         webContainer = new FrameLayout(this);
-        webContainer.setBackgroundColor(Color.rgb(5, 5, 5));
-        LinearLayout startupSurface = new LinearLayout(this);
-        startupSurface.setOrientation(LinearLayout.VERTICAL);
-        startupSurface.setGravity(Gravity.CENTER);
+        webContainer.setBackgroundColor(nightMode ? DARK_WEB : WHITE);
+        startupSurface = new LinearLayout(this);
+        ((LinearLayout) startupSurface).setOrientation(LinearLayout.VERTICAL);
+        ((LinearLayout) startupSurface).setGravity(Gravity.CENTER);
         startupSurface.setPadding(dp(24), dp(24), dp(24), dp(24));
+        startupSurface.setBackgroundColor(nightMode ? DARK_WEB : WHITE);
         ImageView startupMark = new ImageView(this);
         startupMark.setImageResource(R.drawable.ic_launcher_foreground);
         startupMark.setContentDescription("Median");
         startupMark.setScaleType(ImageView.ScaleType.CENTER_INSIDE);
-        startupSurface.addView(startupMark, new LinearLayout.LayoutParams(dp(88), dp(88)));
+        ((LinearLayout) startupSurface).addView(startupMark, new LinearLayout.LayoutParams(dp(88), dp(88)));
         TextView startupName = new TextView(this);
         startupName.setText("median");
-        startupName.setTextColor(Color.WHITE);
+        startupName.setTextColor(chromeText);
         startupName.setTextSize(23f);
         startupName.setGravity(Gravity.CENTER);
         startupName.setLetterSpacing(0.08f);
-        startupSurface.addView(startupName, new LinearLayout.LayoutParams(
+        ((LinearLayout) startupSurface).addView(startupName, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        TextView startupStatus = new TextView(this);
+        startupStatus = new TextView(this);
         startupStatus.setText("正在准备网页引擎…");
-        startupStatus.setTextColor(Color.rgb(154, 160, 166));
+        startupStatus.setTextColor(nightMode ? DARK_MUTED : MUTED);
         startupStatus.setTextSize(12f);
         startupStatus.setGravity(Gravity.CENTER);
         startupStatus.setPadding(0, dp(8), 0, 0);
-        startupSurface.addView(startupStatus, new LinearLayout.LayoutParams(
+        ((LinearLayout) startupSurface).addView(startupStatus, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         webContainer.addView(startupSurface, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-        browserChrome.addView(webContainer, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        // Apply smooth fade-in animation to startup screen
+        Motion.fadeInStartup(startupSurface, reduceMotion(), null);
+
+        FrameLayout.LayoutParams pageParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT);
+        pageParams.topMargin = dp(62);
+        pageParams.bottomMargin = dp(62);
+        browserChrome.addView(webContainer, 0, pageParams);
 
         bottomBar = new LinearLayout(this);
         bottomBar.setOrientation(LinearLayout.HORIZONTAL);
         bottomBar.setGravity(Gravity.CENTER);
-        bottomBar.setPadding(dp(8), dp(2), dp(8), dp(2));
-        bottomBar.setBackgroundColor(WHITE);
-        bottomBar.setElevation(dp(6));
+        bottomBar.setPadding(dp(10), dp(4), dp(10), dp(4));
+        bottomBar.setBackgroundColor(chromeBackground);
+        bottomBar.setElevation(dp(8));
 
         backButton = iconButton(BrowserIconView.BACK, "后退");
         forwardButton = iconButton(BrowserIconView.FORWARD, "前进");
@@ -768,8 +993,17 @@ public final class MainActivity extends Activity implements Runnable {
         tabButton = iconButton(BrowserIconView.TABS, "标签页");
         BrowserIconView menu = iconButton(BrowserIconView.MENU, "菜单");
         BrowserIconView[] bottomButtons = new BrowserIconView[] { backButton, forwardButton, home, tabButton, menu };
-        for (BrowserIconView button : bottomButtons) bottomBar.addView(button, new LinearLayout.LayoutParams(0, dp(52), 1f));
-        browserChrome.addView(bottomBar, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)));
+        for (BrowserIconView button : bottomButtons) bottomBar.addView(button, new LinearLayout.LayoutParams(0, dp(54), 1f));
+        browserChrome.addView(bottomBar, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(62), Gravity.BOTTOM));
+
+        statusBarBackground = new View(this);
+        navigationBarBackground = new View(this);
+        statusBarBackground.setBackgroundColor(chromeBackground);
+        navigationBarBackground.setBackgroundColor(chromeBackground);
+        statusBarBackground.setElevation(dp(8));
+        navigationBarBackground.setElevation(dp(8));
+        browserChrome.addView(statusBarBackground, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, Gravity.TOP));
+        browserChrome.addView(navigationBarBackground, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, Gravity.BOTTOM));
 
         setContentView(rootFrame);
         installSystemBarInsets(rootFrame);
@@ -788,10 +1022,11 @@ public final class MainActivity extends Activity implements Runnable {
         });
         addressBar.setOnFocusChangeListener(new View.OnFocusChangeListener() {
             @Override public void onFocusChange(View v, boolean hasFocus) {
+                if (hasFocus) showBrowserChrome(false);
                 Motion.focusPill(addressPill, hasFocus, reduceMotion());
                 if (hasFocus) {
                     String url = currentPageUrl;
-                    if (isHomeUrl(url)) addressBar.setText("");
+                    if (isInternalBrowserUrl(url) || "about:blank".equalsIgnoreCase(url)) addressBar.setText("");
                     else if (url != null && !url.contentEquals(addressBar.getText())) addressBar.setText(url);
                     addressBar.selectAll();
                 } else {
@@ -805,7 +1040,8 @@ public final class MainActivity extends Activity implements Runnable {
                 if (isHomeUrl(currentPageUrl)) {
                     renderedHomeKeys.remove(webView);
                     showHome();
-                } else webView.reload();
+                } else if (isQrScannerUrl(currentPageUrl)) showQrScannerPage();
+                else reloadWebView(webView);
             }
         });
         refreshButton.setOnLongClickListener(new View.OnLongClickListener() {
@@ -821,12 +1057,15 @@ public final class MainActivity extends Activity implements Runnable {
         });
         backButton.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
-                if (webView != null && webView.canGoBack()) webView.goBack();
+                if (webView != null && webView.canGoBack()) {
+                    goBackWebView(webView);
+                    scheduleRestoredHomeRepair(webView);
+                }
             }
         });
         forwardButton.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) {
-                if (webView != null && webView.canGoForward()) webView.goForward();
+                if (webView != null && webView.canGoForward()) goForwardWebView(webView);
             }
         });
         home.setOnClickListener(new View.OnClickListener() {
@@ -849,35 +1088,427 @@ public final class MainActivity extends Activity implements Runnable {
 
 
     private void installSystemBarInsets(final View target) {
-        if (target == null || Build.VERSION.SDK_INT < 30) return;
+        if (target == null) return;
         target.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
             @Override public android.view.WindowInsets onApplyWindowInsets(View view, android.view.WindowInsets insets) {
-                android.graphics.Insets bars = insets.getInsets(
-                        android.view.WindowInsets.Type.systemBars() | android.view.WindowInsets.Type.displayCutout());
-                view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
-                return insets;
+                int imeBottom;
+                boolean imeVisible;
+                if (Build.VERSION.SDK_INT >= 30) {
+                    android.graphics.Insets bars = insets.getInsetsIgnoringVisibility(
+                            android.view.WindowInsets.Type.systemBars() | android.view.WindowInsets.Type.displayCutout());
+                    systemInsetLeft = bars.left;
+                    systemInsetTop = bars.top;
+                    systemInsetRight = bars.right;
+                    systemInsetBottom = bars.bottom;
+                    imeBottom = insets.getInsets(android.view.WindowInsets.Type.ime()).bottom;
+                    imeVisible = insets.isVisible(android.view.WindowInsets.Type.ime());
+                } else {
+                    systemInsetLeft = insets.getStableInsetLeft();
+                    systemInsetTop = insets.getStableInsetTop();
+                    systemInsetRight = insets.getStableInsetRight();
+                    systemInsetBottom = insets.getStableInsetBottom();
+                    if (Build.VERSION.SDK_INT >= 28 && insets.getDisplayCutout() != null) {
+                        android.view.DisplayCutout cutout = insets.getDisplayCutout();
+                        systemInsetLeft = Math.max(systemInsetLeft, cutout.getSafeInsetLeft());
+                        systemInsetTop = Math.max(systemInsetTop, cutout.getSafeInsetTop());
+                        systemInsetRight = Math.max(systemInsetRight, cutout.getSafeInsetRight());
+                        systemInsetBottom = Math.max(systemInsetBottom, cutout.getSafeInsetBottom());
+                    }
+                    // On these releases adjustResize already removes the keyboard area from
+                    // the window. Do not subtract its height a second time as root padding.
+                    imeVisible = insets.getSystemWindowInsetBottom() > systemInsetBottom + dp(100);
+                    imeBottom = 0;
+                }
+                systemKeyboardBottom = imeBottom;
+                systemKeyboardVisible = imeVisible;
+                applyPageInsets();
+                return Build.VERSION.SDK_INT >= 30 ? insets : insets.consumeSystemWindowInsets();
             }
         });
+        if (Build.VERSION.SDK_INT < 30) {
+            target.getViewTreeObserver().addOnGlobalLayoutListener(new android.view.ViewTreeObserver.OnGlobalLayoutListener() {
+                private final android.graphics.Rect visibleFrame = new android.graphics.Rect();
+                private final int[] location = new int[2];
+                @Override public void onGlobalLayout() {
+                    if (activityDestroyed) return;
+                    target.getWindowVisibleDisplayFrame(visibleFrame);
+                    target.getLocationOnScreen(location);
+                    int overlap = Math.max(0, location[1] + target.getHeight() - visibleFrame.bottom);
+                    // FULLSCREEN makes adjustResize ineffective on Android 8-10. Subtract
+                    // only the keyboard portion still covering this window, not one already
+                    // removed by the system. Status/nav changes never cross this threshold.
+                    int next = overlap > dp(100) ? overlap : 0;
+                    if (next == legacyKeyboardOverlap) return;
+                    legacyKeyboardOverlap = next;
+                    applyPageInsets();
+                }
+            });
+        }
         target.requestApplyInsets();
+    }
+
+    private void applyPageInsets() {
+        if (rootFrame == null) return;
+        boolean fullSurface = immersivePageLayout || customView != null || isInPictureInPictureMode();
+        keyboardVisible = systemKeyboardVisible || legacyKeyboardOverlap > 0;
+        int imeBottom = Math.max(systemKeyboardBottom, legacyKeyboardOverlap);
+        int top = fullSurface ? 0 : systemInsetTop;
+        int bottom = fullSurface || keyboardVisible ? imeBottom : systemInsetBottom;
+        if (rootFrame.getPaddingLeft() != systemInsetLeft || rootFrame.getPaddingTop() != top ||
+                rootFrame.getPaddingRight() != systemInsetRight || rootFrame.getPaddingBottom() != bottom) {
+            rootFrame.setPadding(systemInsetLeft, top, systemInsetRight, bottom);
+        }
+        updateChromeInsets();
+    }
+
+    private void updateChromeInsets() {
+        if (topBar == null || bottomBar == null) return;
+        int top = immersivePageLayout ? systemInsetTop : 0;
+        int bottom = immersivePageLayout && !keyboardVisible ? systemInsetBottom : 0;
+        FrameLayout.LayoutParams topParams = (FrameLayout.LayoutParams) topBar.getLayoutParams();
+        FrameLayout.LayoutParams bottomParams = (FrameLayout.LayoutParams) bottomBar.getLayoutParams();
+        FrameLayout.LayoutParams progressParams = (FrameLayout.LayoutParams) progressBar.getLayoutParams();
+        if (topParams.topMargin != top) {
+            topParams.topMargin = top;
+            topBar.setLayoutParams(topParams);
+        }
+        if (bottomParams.bottomMargin != bottom) {
+            bottomParams.bottomMargin = bottom;
+            bottomBar.setLayoutParams(bottomParams);
+        }
+        if (progressParams.topMargin != top + dp(62)) {
+            progressParams.topMargin = top + dp(62);
+            progressBar.setLayoutParams(progressParams);
+        }
+        updateSystemBarBackgrounds();
+        updatePageMargins();
+    }
+
+    private void updateSystemBarBackgrounds() {
+        if (statusBarBackground == null || navigationBarBackground == null) return;
+        FrameLayout.LayoutParams status = (FrameLayout.LayoutParams) statusBarBackground.getLayoutParams();
+        FrameLayout.LayoutParams navigation = (FrameLayout.LayoutParams) navigationBarBackground.getLayoutParams();
+        if (status.height != systemInsetTop) {
+            status.height = systemInsetTop;
+            statusBarBackground.setLayoutParams(status);
+        }
+        int bottom = keyboardVisible ? 0 : systemInsetBottom;
+        if (navigation.height != bottom) {
+            navigation.height = bottom;
+            navigationBarBackground.setLayoutParams(navigation);
+        }
+        int visible = immersivePageLayout && !chromeHiddenByScroll && !isInPictureInPictureMode() ?
+                View.VISIBLE : View.INVISIBLE;
+        statusBarBackground.setVisibility(visible);
+        navigationBarBackground.setVisibility(visible);
+    }
+
+    private void updatePageMargins() {
+        if (webContainer == null) return;
+        // Changing the viewport while WebView is tracking a finger changes its scroll
+        // geometry mid-gesture. Commit the new space after UP/CANCEL instead.
+        if (immersiveGestureActive && immersivePageLayout && !keyboardVisible &&
+                customView == null && !isInPictureInPictureMode()) return;
+        boolean fullscreen = isInPictureInPictureMode() || (immersivePageLayout && chromeHiddenByScroll);
+        int top = fullscreen ? 0 : dp(62) + (immersivePageLayout ? systemInsetTop : 0);
+        int bottom = fullscreen ? 0 : dp(62) +
+                (immersivePageLayout && !keyboardVisible ? systemInsetBottom : 0);
+        FrameLayout.LayoutParams params = (FrameLayout.LayoutParams) webContainer.getLayoutParams();
+        if (params.topMargin == top && params.bottomMargin == bottom) return;
+        // Native space is required here: an overlay makes a page's first and last
+        // controls unreachable at its scroll limits. Resize once per chrome state,
+        // never on scroll callbacks or on every toolbar animation frame.
+        params.topMargin = top;
+        params.bottomMargin = bottom;
+        webContainer.setLayoutParams(params);
+    }
+
+    private void updateImmersivePageLayout() {
+        if (webContainer == null || rootFrame == null) return;
+        boolean next = immersiveScrollChrome && isNetworkPage(currentPageUrl);
+        if (next == immersivePageLayout) return;
+        immersivePageLayout = next;
+        immersiveGestureActive = false;
+        updatePageMargins();
+        updateChromeInsets();
+        applyPageInsets();
+        if (!next) showBrowserChrome(false);
+        else setImmersiveSystemBars(chromeHiddenByScroll);
+        rootFrame.requestApplyInsets();
+    }
+
+    /** Keeps the page edge-to-edge while the scroll chrome is hidden. */
+    private void setImmersiveSystemBars(boolean hidden) {
+        hidden = hidden || customView != null || isInPictureInPictureMode();
+        Window window = getWindow();
+        if (Build.VERSION.SDK_INT >= 30) {
+            window.setStatusBarColor(Color.TRANSPARENT);
+            window.setNavigationBarColor(Color.TRANSPARENT);
+            android.view.WindowInsetsController controller = window.getInsetsController();
+            if (controller != null) {
+                int bars = android.view.WindowInsets.Type.statusBars() |
+                        android.view.WindowInsets.Type.navigationBars();
+                controller.setSystemBarsBehavior(
+                        android.view.WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+                if (hidden) controller.hide(bars); else controller.show(bars);
+            }
+            return;
+        }
+
+        View decor = window.getDecorView();
+        int flags = decor.getSystemUiVisibility();
+        int immersiveFlags = View.SYSTEM_UI_FLAG_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY |
+                View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
+                View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+        flags &= ~immersiveFlags;
+        // Root padding owns safe areas on every page. Keep these flags in ordinary mode
+        // too, otherwise the system and root would both subtract the bar insets.
+        flags |= View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION |
+                View.SYSTEM_UI_FLAG_LAYOUT_STABLE;
+        if (hidden) flags |= immersiveFlags;
+        else {
+            if (nightMode) {
+                flags &= ~(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
+            } else {
+                flags |= View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
+            }
+        }
+        decor.setSystemUiVisibility(flags);
     }
 
     private BrowserIconView iconButton(int icon, String description) {
         BrowserIconView button = new BrowserIconView(this, icon);
         button.setContentDescription(description);
-        button.setBackgroundResource(selectableBorderless());
+        // Platform selectable drawables retain the Activity's original theme. Drawing the
+        // bounded pressed halo in BrowserIconView keeps theme switches deterministic and avoids
+        // a drawable allocation for every toolbar icon.
+        button.setBackground(null);
         return button;
     }
 
     private WebView createConfiguredWebView() {
         WebView view = new WebView(this);
+        // The window already uses hardware acceleration. A permanent View layer adds
+        // a full-viewport texture on top of Chromium's own compositor, including hot tabs.
         styleWebView(view);
         configureWebView(view);
         pageHosts.put(view, "");
         return view;
     }
 
+    /** Observe actual finger direction; resize, fling and script scrolls are not gestures. */
+    private void observeImmersiveTouch(WebView source, MotionEvent event) {
+        if (source != webView || activityDestroyed || event == null) return;
+        int action = event.getActionMasked();
+        // A sheet, custom video view, or window transition may appear between DOWN and CANCEL.
+        // Consume the terminal event for our bookkeeping before checking those transient modes.
+        if (action == MotionEvent.ACTION_CANCEL || action == MotionEvent.ACTION_UP) {
+            boolean wasActive = immersiveGestureActive;
+            boolean startHidden = immersiveGestureStartHidden;
+            float offset = immersiveGestureOffset;
+            immersiveGestureActive = false;
+            if (wasActive) {
+                boolean eligible = immersivePageLayout && activeOverlay == null && customView == null &&
+                        !isInPictureInPictureMode();
+                if (action == MotionEvent.ACTION_UP && eligible) settleImmersiveChrome(offset >= .5f, true);
+                else resetImmersiveChromeVisual(startHidden);
+            }
+            if (!immersivePageLayout || activeOverlay != null || customView != null ||
+                    isInPictureInPictureMode()) return;
+        }
+        if (!immersivePageLayout || activeOverlay != null || customView != null ||
+                isInPictureInPictureMode()) return;
+        if (action == MotionEvent.ACTION_DOWN) {
+            immersiveGestureActive = true;
+            immersiveGestureDirectionLocked = false;
+            immersiveGestureVertical = false;
+            immersiveGestureDownX = event.getRawX();
+            immersiveGestureDownY = event.getRawY();
+            immersiveGestureY = event.getRawY();
+            immersiveGestureStartHidden = chromeHiddenByScroll;
+            immersiveGestureOffset = chromeOffsetFromViews(chromeHiddenByScroll);
+            cancelChromeAnimationsForGesture();
+            applyChromeGestureOffset(immersiveGestureOffset);
+        } else if (event.getPointerCount() > 1 && immersiveGestureActive) {
+            immersiveGestureActive = false;
+            resetImmersiveChromeVisual(immersiveGestureStartHidden);
+            updatePageMargins();
+        } else if (action == MotionEvent.ACTION_MOVE && immersiveGestureActive) {
+            float rawX = event.getRawX();
+            float rawY = event.getRawY();
+            float dx = rawX - immersiveGestureDownX;
+            float dy = rawY - immersiveGestureDownY;
+            float deltaY = rawY - immersiveGestureY;
+            immersiveGestureY = rawY;
+            if (!immersiveGestureDirectionLocked) {
+                float slop = Math.max(dp(8), ViewConfiguration.get(source.getContext()).getScaledTouchSlop());
+                if (Math.hypot(dx, dy) <= slop) return;
+                immersiveGestureDirectionLocked = true;
+                immersiveGestureVertical = Math.abs(dy) > Math.abs(dx) * 1.2f;
+                if (!immersiveGestureVertical) {
+                    immersiveGestureActive = false;
+                    resetImmersiveChromeVisual(immersiveGestureStartHidden);
+                    return;
+                }
+                // Consume only movement beyond slop when the direction first locks.
+                deltaY = Math.signum(dy) * (Math.abs(dy) - slop);
+            }
+            if (immersiveGestureVertical) {
+                float travel = Math.max(dp(62), Math.max(topBar.getHeight(), bottomBar.getHeight()));
+                // Clamp each increment: overscroll must not create a dead zone on reversal.
+                immersiveGestureOffset = clamp01(immersiveGestureOffset - deltaY / travel);
+                applyChromeGestureOffset(immersiveGestureOffset);
+            }
+        }
+    }
+
+    private void hideBrowserChrome() {
+        settleImmersiveChrome(true, false);
+    }
+
+    private void showBrowserChrome(boolean animate) {
+        if (topBar == null || bottomBar == null || isInPictureInPictureMode()) return;
+        if (animate && immersivePageLayout) {
+            settleImmersiveChrome(false, true);
+            return;
+        }
+        immersiveGestureActive = false;
+        resetImmersiveChromeVisual(false);
+        setImmersiveSystemBars(false);
+    }
+
+    private void settleImmersiveChrome(boolean hidden, boolean force) {
+        if (!immersivePageLayout || topBar == null || bottomBar == null ||
+                isInPictureInPictureMode() || (!force && hidden == chromeHiddenByScroll)) return;
+        float offset = chromeOffsetFromViews(chromeHiddenByScroll);
+        chromeHiddenByScroll = hidden;
+        updatePageMargins();
+        updateSystemBarBackgrounds();
+        setImmersiveSystemBars(hidden);
+        long duration = Math.max(60L, Math.round((reduceMotion() ? 80L : 180L) *
+                Math.abs((hidden ? 1f : 0f) - offset)));
+        cancelViewAnimationIfRunning(topBar);
+        cancelViewAnimationIfRunning(bottomBar);
+        cancelViewAnimationIfRunning(progressBar);
+        applyChromeGestureOffset(offset);
+        topBar.animate().translationY(hidden ? -topBar.getHeight() : 0f).alpha(hidden ? 0f : 1f).setDuration(duration)
+                .withEndAction(new Runnable() {
+                    @Override public void run() {
+                        if (chromeHiddenByScroll) {
+                            topBar.setVisibility(View.INVISIBLE);
+                            topBar.setTranslationY(0f);
+                            topBar.setAlpha(1f);
+                        }
+                    }
+                }).start();
+        bottomBar.animate().translationY(hidden ? bottomBar.getHeight() : 0f).alpha(hidden ? 0f : 1f).setDuration(duration)
+                .withEndAction(new Runnable() {
+                    @Override public void run() {
+                        if (chromeHiddenByScroll) {
+                            bottomBar.setVisibility(View.INVISIBLE);
+                            bottomBar.setTranslationY(0f);
+                            bottomBar.setAlpha(1f);
+                        }
+                    }
+                }).start();
+        if (progressBar != null) {
+            syncChromeProgress(offset);
+            if (!hidden && renderedProgress >= 0 && renderedProgress < 100) {
+                progressBar.setProgress(renderedProgress);
+                progressBar.setVisibility(View.VISIBLE);
+                progressBar.animate().translationY(0f).alpha(1f).setDuration(duration).start();
+            } else {
+                progressBar.setVisibility(View.GONE);
+            }
+        }
+    }
+
+    private float chromeOffsetFromViews(boolean hidden) {
+        if (topBar == null || bottomBar == null) return 0f;
+        if (topBar.getVisibility() != View.VISIBLE && bottomBar.getVisibility() != View.VISIBLE)
+            return hidden ? 1f : 0f;
+        float topHeight = Math.max(1f, topBar.getHeight());
+        float bottomHeight = Math.max(1f, bottomBar.getHeight());
+        float topOffset = -topBar.getTranslationY() / topHeight;
+        float bottomOffset = bottomBar.getTranslationY() / bottomHeight;
+        return clamp01((topOffset + bottomOffset) * .5f);
+    }
+
+    private void cancelChromeAnimationsForGesture() {
+        cancelViewAnimationIfRunning(topBar);
+        cancelViewAnimationIfRunning(bottomBar);
+        cancelViewAnimationIfRunning(progressBar);
+        topBar.setVisibility(View.VISIBLE);
+        bottomBar.setVisibility(View.VISIBLE);
+    }
+
+    /** Cancel only an active property animation and detach stale callbacks first. */
+    private static void cancelViewAnimationIfRunning(View view) {
+        if (view == null) return;
+        ViewPropertyAnimator animator = view.animate();
+        // ViewPropertyAnimator has no isRunning() API. Clearing callbacks before
+        // cancel() makes this safe for both an active and an already-idle animator.
+        animator.setListener(null).setUpdateListener(null).withEndAction(null).cancel();
+    }
+
+    private void applyChromeGestureOffset(float offset) {
+        if (topBar == null || bottomBar == null) return;
+        offset = clamp01(offset);
+        topBar.setVisibility(View.VISIBLE);
+        bottomBar.setVisibility(View.VISIBLE);
+        topBar.setTranslationY(-topBar.getHeight() * offset);
+        bottomBar.setTranslationY(bottomBar.getHeight() * offset);
+        topBar.setAlpha(1f - offset);
+        bottomBar.setAlpha(1f - offset);
+        syncChromeProgress(offset);
+    }
+
+    private void syncChromeProgress(float offset) {
+        if (progressBar == null) return;
+        progressBar.setTranslationY(-topBar.getHeight() * offset);
+        progressBar.setAlpha(1f - offset);
+        boolean loading = renderedProgress >= 0 && renderedProgress < 100 &&
+                !isInPictureInPictureMode() && customView == null;
+        progressBar.setVisibility(loading && offset < 1f ? View.VISIBLE : View.GONE);
+    }
+
+    private void resetImmersiveChromeVisual(boolean hidden) {
+        hidden = hidden && immersivePageLayout;
+        chromeHiddenByScroll = hidden;
+        cancelChromeAnimationsForGesture();
+        applyChromeGestureOffset(hidden ? 1f : 0f);
+        if (hidden || isInPictureInPictureMode() || customView != null) {
+            topBar.setVisibility(View.INVISIBLE);
+            bottomBar.setVisibility(View.INVISIBLE);
+            topBar.setTranslationY(0f);
+            bottomBar.setTranslationY(0f);
+            topBar.setAlpha(1f);
+            bottomBar.setAlpha(1f);
+        }
+        updatePageMargins();
+        updateSystemBarBackgrounds();
+    }
+
+    private float clamp01(float value) {
+        return Math.max(0f, Math.min(1f, value));
+    }
+
+    private void bindWebViewToTab(BrowserTab tab, WebView view) {
+        if (tab == null || view == null) return;
+        tab.liveView = view;
+        scriptTabIds.put(view, scriptTabId(tab));
+    }
+
+    private String scriptTabId(BrowserTab tab) {
+        if (tab.scriptTabId == null) tab.scriptTabId = "t" + Long.toString(++scriptTabSequence, 36);
+        return tab.scriptTabId;
+    }
+
     private void styleWebView(WebView view) {
-        view.setBackgroundColor(nightMode ? Color.rgb(17, 19, 21) : WHITE);
+        view.setBackgroundColor(nightMode ? DARK_WEB : WHITE);
         view.setFocusable(true);
         view.setFocusableInTouchMode(true);
         view.setClickable(true);
@@ -891,7 +1522,7 @@ public final class MainActivity extends Activity implements Runnable {
     /** WebView owns its input surface. Never animate or leave transforms on that surface. */
     private void resetWebViewTransform(WebView view) {
         if (view == null) return;
-        view.animate().cancel();
+        cancelViewAnimationIfRunning(view);
         view.setAlpha(1f);
         view.setTranslationX(0f);
         view.setTranslationY(0f);
@@ -933,16 +1564,6 @@ public final class MainActivity extends Activity implements Runnable {
         void onItem(int index);
     }
 
-    /** One object handles both dialog cancellation paths instead of allocating two listeners. */
-    private final class HomeDialogReturn implements DialogInterface.OnClickListener,
-            DialogInterface.OnCancelListener, Runnable {
-        private final int section;
-        HomeDialogReturn(int section) { this.section = section; }
-        @Override public void onClick(DialogInterface dialog, int which) { postAfterUiTransition(this); }
-        @Override public void onCancel(DialogInterface dialog) { postAfterUiTransition(this); }
-        @Override public void run() { showHomeSection(section); }
-    }
-
     private final class SettingsDialogReturn implements DialogInterface.OnClickListener, DialogInterface.OnCancelListener {
         private final Runnable action;
         SettingsDialogReturn(Runnable action) { this.action = action; }
@@ -955,6 +1576,77 @@ public final class MainActivity extends Activity implements Runnable {
         HomeOpenDialogReturn(boolean customization) { this.customization = customization; }
         @Override public void onClick(DialogInterface dialog, int which) { continueHomeOpenSettings(customization); }
         @Override public void onCancel(DialogInterface dialog) { continueHomeOpenSettings(customization); }
+    }
+
+    /** Gives the handle and title strip a forgiving drag path without stealing list-row gestures. */
+    private void installSheetDrag(final View target, final View panel) {
+        if (target == null || panel == null) return;
+        final float touchSlop = Math.max(dp(8), ViewConfiguration.get(target.getContext()).getScaledTouchSlop());
+        target.setOnTouchListener(new View.OnTouchListener() {
+            // The target is a child of panel. Use raw coordinates so panel translation does not
+            // feed back into the next event's local coordinates while the finger is down.
+            float downRawX;
+            float downRawY;
+            float downPanelTranslation;
+            long downAt;
+            boolean dragging;
+            boolean cancelled;
+
+            @Override public boolean onTouch(View view, MotionEvent event) {
+                int action = event.getActionMasked();
+                if (action == MotionEvent.ACTION_DOWN) {
+                    cancelViewAnimationIfRunning(panel);
+                    downRawX = event.getRawX();
+                    downRawY = event.getRawY();
+                    downPanelTranslation = panel.getTranslationY();
+                    downAt = event.getEventTime();
+                    dragging = false;
+                    cancelled = false;
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_MOVE) {
+                    float dx = event.getRawX() - downRawX;
+                    float dy = event.getRawY() - downRawY;
+                    if (!dragging && !cancelled && (Math.abs(dx) > touchSlop || Math.abs(dy) > touchSlop)) {
+                        // Lock after slop. Only a clearly downward gesture owns the panel; this
+                        // keeps a title tap, horizontal control swipe, or upward scroll intact.
+                        dragging = dy > touchSlop && dy > Math.abs(dx) * 1.12f;
+                        if (!dragging) cancelled = true;
+                    }
+                    if (dragging) {
+                        // Keep the surface under the finger. The measured height works for short
+                        // landscape panels and avoids a second hidden threshold.
+                        float maximum = panel.getHeight() > 0 ? panel.getHeight() : dp(480);
+                        panel.setTranslationY(Math.max(0f, Math.min(maximum,
+                                downPanelTranslation + dy)));
+                    }
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_UP) {
+                    float dx = event.getRawX() - downRawX;
+                    float dy = event.getRawY() - downRawY;
+                    long elapsed = Math.max(1L, event.getEventTime() - downAt);
+                    float dismissDistance = Math.max(dp(64), panel.getHeight() > 0 ? panel.getHeight() * .25f : dp(120));
+                    boolean quickDismiss = dy >= dp(24) && dy * 1000f / elapsed >= dp(820);
+                    boolean close = dragging && (dy >= dismissDistance || quickDismiss) &&
+                            dy > Math.abs(dx) * 1.05f;
+                    if (close && panel == activeOverlayPanel) dismissOverlay();
+                    else if (dragging)
+                        panel.animate().translationY(0f).setDuration(reduceMotion() ? 80L : 150L).start();
+                    dragging = false;
+                    cancelled = false;
+                    return true;
+                }
+                if (action == MotionEvent.ACTION_CANCEL) {
+                    if (dragging)
+                        panel.animate().translationY(0f).setDuration(reduceMotion() ? 80L : 120L).start();
+                    dragging = false;
+                    cancelled = false;
+                    return true;
+                }
+                return true;
+            }
+        });
     }
 
     /** Shared denial path for auth, Web permission and geolocation dialogs. */
@@ -972,16 +1664,22 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showActionSheet(String title, String subtitle, String[] items, int[] icons, final SheetHandler handler) {
-        showActionSheet(title, subtitle, items, icons, null, null, null, handler);
+        showActionSheet(title, subtitle, items, icons, null, null, null, null, handler);
     }
 
     private void showActionSheet(String title, String subtitle, String[] items, int[] icons,
                                  int[] rowKinds, String[] sectionHeaders, final Runnable backAction,
                                  final SheetHandler handler) {
+        showActionSheet(title, subtitle, items, icons, rowKinds, sectionHeaders, backAction, null, handler);
+    }
+
+    private void showActionSheet(String title, String subtitle, String[] items, int[] icons,
+                                 int[] rowKinds, String[] sectionHeaders, final Runnable backAction,
+                                 final Runnable dismissAction, final SheetHandler handler) {
         dismissOverlayForNavigation();
-        final int sheetSurface = nightMode ? Color.rgb(35, 38, 42) : WHITE;
-        final int sheetText = nightMode ? Color.rgb(232, 234, 237) : TEXT;
-        final int sheetMuted = nightMode ? Color.rgb(154, 160, 166) : MUTED;
+        final int sheetSurface = nightMode ? DARK_SHEET : WHITE;
+        final int sheetText = nightMode ? DARK_TEXT : TEXT;
+        final int sheetMuted = nightMode ? DARK_MUTED : MUTED;
         final FrameLayout overlay = new FrameLayout(this);
         overlay.setBackgroundColor(Color.argb(104, 0, 0, 0));
         overlay.setClickable(true);
@@ -992,27 +1690,29 @@ public final class MainActivity extends Activity implements Runnable {
         LinearLayout panel = new LinearLayout(this);
         panel.setTag(SHEET_TAG_SURFACE);
         panel.setOrientation(LinearLayout.VERTICAL);
-        panel.setBackground(roundRect(sheetSurface, 24));
-        panel.setPadding(dp(10), dp(8), dp(10), dp(12));
+        panel.setBackground(roundRect(sheetSurface, 20));
+        panel.setPadding(dp(8), dp(7), dp(8), dp(8));
         panel.setClickable(true);
         panel.setElevation(dp(12));
 
         View handle = new View(this);
         handle.setTag(SHEET_TAG_HANDLE);
-        handle.setBackground(roundRect(Color.argb(nightMode ? 80 : 54, 95, 99, 104), 2));
-        LinearLayout.LayoutParams handleParams = new LinearLayout.LayoutParams(dp(36), dp(4));
+        handle.setBackground(sheetHandleDrawable());
+        LinearLayout.LayoutParams handleParams = new LinearLayout.LayoutParams(dp(48), dp(32));
         handleParams.gravity = Gravity.CENTER_HORIZONTAL;
-        handleParams.setMargins(0, 0, 0, dp(4));
+        handleParams.setMargins(0, 0, 0, 0);
         panel.addView(handle, handleParams);
+        handle.setContentDescription("下拉关闭");
+        installSheetDrag(handle, panel);
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
         header.setGravity(Gravity.CENTER_VERTICAL);
-        header.setPadding(backAction == null ? dp(12) : dp(2), dp(2), dp(4), dp(4));
+        header.setPadding(backAction == null ? dp(10) : 0, 0, dp(2), dp(2));
         if (backAction != null) {
             BrowserIconView back = iconButton(BrowserIconView.BACK, "返回上一级");
             back.setTintColor(sheetText);
-            header.addView(back, new LinearLayout.LayoutParams(dp(44), dp(44)));
+            header.addView(back, new LinearLayout.LayoutParams(dp(42), dp(42)));
             back.setOnClickListener(new View.OnClickListener() {
                 @Override public void onClick(View v) { navigateOverlayBack(); }
             });
@@ -1023,7 +1723,7 @@ public final class MainActivity extends Activity implements Runnable {
         heading.setTag(SHEET_TAG_PRIMARY);
         heading.setText(title);
         heading.setTextColor(sheetText);
-        heading.setTextSize(19f);
+        heading.setTextSize(18f);
         heading.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
         titles.addView(heading);
         if (subtitle != null && subtitle.length() > 0) {
@@ -1031,21 +1731,29 @@ public final class MainActivity extends Activity implements Runnable {
             sub.setTag(SHEET_TAG_MUTED);
             sub.setText(subtitle);
             sub.setTextColor(sheetMuted);
-            sub.setTextSize(12.5f);
-            sub.setPadding(0, dp(3), 0, 0);
+            sub.setTextSize(12f);
+            sub.setPadding(0, dp(2), 0, 0);
             titles.addView(sub);
         }
         header.addView(titles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         BrowserIconView close = iconButton(BrowserIconView.CLOSE, "关闭");
         close.setTintColor(sheetText);
-        header.addView(close, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        header.addView(close, new LinearLayout.LayoutParams(dp(42), dp(42)));
         panel.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+        // The title strip is a generous drag target. Child buttons still receive their own taps,
+        // while a swipe that starts beside them behaves like the native bottom-sheet gesture.
+        installSheetDrag(header, panel);
 
         ScrollView scroll = new ScrollView(this);
+        scroll.setTag(SHEET_TAG_PLAIN_SURFACE);
         scroll.setFillViewport(false);
+        scroll.setVerticalScrollBarEnabled(false);
+        scroll.setBackgroundColor(sheetSurface);
         LinearLayout list = new LinearLayout(this);
+        list.setTag(SHEET_TAG_PLAIN_SURFACE);
         list.setOrientation(LinearLayout.VERTICAL);
-        list.setPadding(0, dp(4), 0, dp(4));
+        list.setPadding(0, dp(2), 0, dp(2));
+        list.setBackgroundColor(sheetSurface);
         scroll.addView(list);
         int rowsHeight = 0;
         for (int i = 0; i < items.length; i++) {
@@ -1055,15 +1763,15 @@ public final class MainActivity extends Activity implements Runnable {
                 TextView sectionLabel = new TextView(this);
                 sectionLabel.setTag(SHEET_TAG_ACCENT);
                 sectionLabel.setText(section.trim());
-                sectionLabel.setTextColor(BLUE);
-                sectionLabel.setTextSize(12f);
+                sectionLabel.setTextColor(nightMode ? DARK_ACCENT : BLUE);
+                sectionLabel.setTextSize(11.5f);
                 sectionLabel.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
                 sectionLabel.setGravity(Gravity.BOTTOM | Gravity.START);
-                sectionLabel.setPadding(dp(16), dp(7), dp(8), dp(5));
+                sectionLabel.setPadding(dp(12), dp(5), dp(8), dp(3));
                 sectionLabel.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
                 list.addView(sectionLabel, new LinearLayout.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, dp(32)));
-                rowsHeight += 32;
+                        ViewGroup.LayoutParams.MATCH_PARENT, dp(24)));
+                rowsHeight += 24;
             }
             String item = items[i] == null ? "" : items[i];
             int detailBreak = item.indexOf('\n');
@@ -1071,44 +1779,55 @@ public final class MainActivity extends Activity implements Runnable {
             String detailText = detailBreak < 0 ? "" : item.substring(detailBreak + 1).trim();
             final int rowKind = rowKinds != null && i < rowKinds.length ? rowKinds[i] : SHEET_ROW_NAVIGATE;
             final boolean toggleRow = rowKind == SHEET_ROW_TOGGLE_OFF || rowKind == SHEET_ROW_TOGGLE_ON;
-            int rowHeight = detailText.length() == 0 ? 56 : 70;
+            int rowHeight = detailText.length() == 0 ? 48 : 60;
             rowsHeight += rowHeight;
             LinearLayout row = new LinearLayout(this);
+            row.setTag(SHEET_TAG_ROW);
             row.setOrientation(LinearLayout.HORIZONTAL);
             row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding(dp(8), 0, dp(8), 0);
-            row.setBackgroundResource(selectableBounded());
+            row.setPadding(dp(6), 0, dp(6), 0);
+            // Never inherit a selectable drawable from the Activity's original theme. Explicitly
+            // painting the row surface prevents stale dark rounded blocks after a live theme
+            // switch; BrowserIconView supplies the small pressed affordance independently.
+            row.setBackgroundColor(sheetSurface);
+            row.setForeground(null);
+            row.setStateListAnimator(null);
+            row.setBackgroundTintList(null);
             row.setClickable(true);
             BrowserIconView icon = iconButton(icons != null && i < icons.length ? icons[i] : BrowserIconView.MENU, primaryText);
             icon.setClickable(false);
             icon.setTintColor(sheetText);
-            row.addView(icon, new LinearLayout.LayoutParams(dp(44), dp(rowHeight - 4)));
-            LinearLayout labels = new LinearLayout(this);
-            labels.setOrientation(LinearLayout.VERTICAL);
-            labels.setGravity(Gravity.CENTER_VERTICAL);
-            labels.setPadding(dp(7), 0, dp(4), 0);
+            row.addView(icon, new LinearLayout.LayoutParams(dp(42), dp(rowHeight)));
             TextView label = new TextView(this);
             label.setTag(SHEET_TAG_PRIMARY);
             label.setText(primaryText);
             label.setTextColor(sheetText);
-            label.setTextSize(15f);
+            label.setTextSize(14.5f);
             label.setSingleLine(true);
             label.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            labels.addView(label, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT));
             if (detailText.length() > 0) {
+                LinearLayout labels = new LinearLayout(this);
+                labels.setOrientation(LinearLayout.VERTICAL);
+                labels.setGravity(Gravity.CENTER_VERTICAL);
+                labels.setPadding(dp(5), 0, dp(3), 0);
+                labels.addView(label, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
                 TextView detail = new TextView(this);
                 detail.setTag(SHEET_TAG_MUTED);
                 detail.setText(detailText);
                 detail.setTextColor(sheetMuted);
-                detail.setTextSize(12.5f);
+                detail.setTextSize(12f);
                 detail.setSingleLine(true);
                 detail.setEllipsize(android.text.TextUtils.TruncateAt.END);
                 detail.setPadding(0, dp(2), 0, 0);
                 labels.addView(detail, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT));
+                row.addView(labels, new LinearLayout.LayoutParams(0, dp(rowHeight), 1f));
+            } else {
+                label.setGravity(Gravity.CENTER_VERTICAL);
+                label.setPadding(dp(5), 0, dp(3), 0);
+                row.addView(label, new LinearLayout.LayoutParams(0, dp(rowHeight), 1f));
             }
-            row.addView(labels, new LinearLayout.LayoutParams(0, dp(rowHeight), 1f));
             if (toggleRow) {
                 final Switch toggle = new Switch(this);
                 toggle.setChecked(rowKind == SHEET_ROW_TOGGLE_ON);
@@ -1120,11 +1839,10 @@ public final class MainActivity extends Activity implements Runnable {
                         new int[] { android.R.attr.state_checked }, new int[] {}
                 };
                 toggle.setThumbTintList(new ColorStateList(states, new int[] {
-                        BLUE, nightMode ? Color.rgb(189, 193, 198) : Color.rgb(117, 117, 117)
+                        BLUE, nightMode ? 0xffbdc1c6 : 0xff757575
                 }));
                 toggle.setTrackTintList(new ColorStateList(states, new int[] {
-                        Color.argb(118, 26, 115, 232),
-                        nightMode ? Color.rgb(80, 84, 89) : Color.rgb(189, 193, 198)
+                        0x761a73e8, nightMode ? 0xff505459 : 0xffbdc1c6
                 }));
                 row.addView(toggle, new LinearLayout.LayoutParams(dp(54), dp(rowHeight)));
                 row.setContentDescription(primaryText + (toggle.isChecked() ? "，已开启" : "，已关闭"));
@@ -1147,7 +1865,7 @@ public final class MainActivity extends Activity implements Runnable {
                     chevron.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
                     row.addView(chevron, new LinearLayout.LayoutParams(dp(28), dp(rowHeight)));
                 } else {
-                    row.setPadding(dp(8), 0, dp(18), 0);
+                row.setPadding(dp(6), 0, dp(14), 0);
                 }
                 row.setOnClickListener(new View.OnClickListener() {
                     @Override public void onClick(View v) {
@@ -1156,22 +1874,30 @@ public final class MainActivity extends Activity implements Runnable {
                     }
                 });
             }
-            list.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(rowHeight)));
+            LinearLayout.LayoutParams rowParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(rowHeight));
+            list.addView(row, rowParams);
         }
         panel.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
-        int maxHeight = Math.round(getResources().getDisplayMetrics().heightPixels * .86f);
-        int desiredHeight = dp(94 + rowsHeight);
+        int safeTop = Math.max(0, systemInsetTop - rootFrame.getPaddingTop());
+        int safeBottom = Math.max(0, systemInsetBottom - rootFrame.getPaddingBottom());
+        int maxHeight = Math.round(getResources().getDisplayMetrics().heightPixels * .90f) - safeTop - safeBottom;
+        int desiredHeight = dp(100 + rowsHeight);
         int panelHeight = Math.min(maxHeight, desiredHeight);
         FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, panelHeight, Gravity.BOTTOM);
-        panelParams.setMargins(dp(8), 0, dp(8), dp(8));
+        panelParams.setMargins(dp(6), safeTop, dp(6), dp(6) + safeBottom);
         overlay.addView(panel, panelParams);
         rootFrame.addView(overlay, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         activeOverlay = overlay;
         activeOverlayPanel = panel;
         activeOverlaySheet = true;
         activeOverlayBackAction = backAction;
+        activeOverlayDismissAction = dismissAction;
         overlayDismissInProgress = false;
+        // Repaint the fully-built hierarchy so no platform drawable from a previous theme
+        // survives a live night-mode switch.
+        themeSheetTree(panel);
         Motion.showSheet(overlay, panel, reduceMotion());
         close.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { dismissOverlay(); }
@@ -1183,15 +1909,18 @@ public final class MainActivity extends Activity implements Runnable {
         final View removing = activeOverlay;
         final View panel = activeOverlayPanel;
         final boolean sheet = activeOverlaySheet;
+        final Runnable dismissAction = activeOverlayDismissAction;
         activeOverlay = null;
         activeOverlayPanel = null;
         activeOverlayBackAction = null;
+        activeOverlayDismissAction = null;
         activeOverlaySheet = false;
         overlayDismissInProgress = true;
         Motion.hideOverlay(removing, panel, sheet, reduceMotion(), new Runnable() {
             @Override public void run() {
                 if (removing.getParent() instanceof ViewGroup) ((ViewGroup) removing.getParent()).removeView(removing);
                 overlayDismissInProgress = false;
+                if (!activityDestroyed && dismissAction != null) dismissAction.run();
             }
         });
     }
@@ -1203,10 +1932,11 @@ public final class MainActivity extends Activity implements Runnable {
         activeOverlay = null;
         activeOverlayPanel = null;
         activeOverlayBackAction = null;
+        activeOverlayDismissAction = null;
         activeOverlaySheet = false;
         overlayDismissInProgress = false;
-        removing.animate().cancel();
-        if (panel != null) panel.animate().cancel();
+        cancelViewAnimationIfRunning(removing);
+        cancelViewAnimationIfRunning(panel);
         if (removing.getParent() instanceof ViewGroup) ((ViewGroup) removing.getParent()).removeView(removing);
     }
 
@@ -1253,34 +1983,56 @@ public final class MainActivity extends Activity implements Runnable {
 
     /** Installs the cold-start payload already assembled on the background startup thread. */
     private void installPreparedDocumentStartUserScripts(WebView target) {
+        // Store readiness and view readiness can arrive in either order. Keep the prepared
+        // payload until both exist, then consume it once: a later startup callback must not
+        // remove a registration just because the token/payload fields were already cleared.
+        if (target == null || !startupDataReady || startupScriptPayloadsApplied) return;
+        startupScriptPayloadsApplied = true;
         String token = startupScriptToken;
-        String source = startupScriptSource;
+        List<UserScriptStore.DocumentStartPayload> payloads = startupScriptPayloads;
         startupScriptToken = "";
-        startupScriptSource = "";
-        installDocumentStartUserScripts(target, token, source);
+        startupScriptPayloads = Collections.emptyList();
+        installDocumentStartUserScripts(target, token, payloads);
     }
 
     private void installDocumentStartUserScripts(WebView target) {
+        // configureWebView() runs before the first WebView is assigned to the Activity. Reuse
+        // its background-prepared payload instead of copying and registering it a second time
+        // on the UI thread; subsequent tabs keep the normal per-view token/registration path.
+        if (!startupReady && webView == null) {
+            installPreparedDocumentStartUserScripts(target);
+            return;
+        }
         if (target == null || scriptStore == null || !scriptStore.hasEnabledScripts()) {
             removeDocumentStartUserScripts(target);
             return;
         }
         String token = UrlCleaner.randomToken();
-        String source = scriptStore.buildDocumentStartScript(token);
-        installDocumentStartUserScripts(target, token, source);
+        List<UserScriptStore.DocumentStartPayload> payloads = scriptStore.buildDocumentStartPayloads(token);
+        installDocumentStartUserScripts(target, token, payloads);
     }
 
     /** UI-only registration; expensive payload assembly is performed before this call. */
-    private void installDocumentStartUserScripts(WebView target, String token, String source) {
+    private void installDocumentStartUserScripts(WebView target, String token,
+                                                 List<UserScriptStore.DocumentStartPayload> payloads) {
         removeDocumentStartUserScripts(target);
-        if (target == null || token == null || token.length() < 32 || source == null || source.length() == 0 ||
+        if (target == null || token == null || token.length() < 32 || payloads == null || payloads.isEmpty() ||
                 !WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return;
+        ArrayList<ScriptHandler> handlers = new ArrayList<ScriptHandler>(payloads.size());
         try {
-            ScriptHandler handler = WebViewCompat.addDocumentStartJavaScript(target, source, "*");
+            for (UserScriptStore.DocumentStartPayload payload : payloads) {
+                if (payload == null || payload.source.length() == 0 || payload.allowedOriginRules.isEmpty()) continue;
+                handlers.add(WebViewCompat.addDocumentStartJavaScript(target, payload.source,
+                        payload.allowedOriginRules));
+            }
+            if (handlers.isEmpty()) return;
             scriptBridgeTokens.put(target, token);
-            scriptHandlers.put(target, handler);
+            scriptHandlers.put(target, Collections.unmodifiableList(handlers));
             documentStartScriptViews.add(target);
         } catch (RuntimeException error) {
+            for (ScriptHandler handler : handlers) {
+                try { handler.remove(); } catch (RuntimeException ignored) {}
+            }
             scriptBridgeTokens.remove(target);
             scriptHandlers.remove(target);
             documentStartScriptViews.remove(target);
@@ -1289,8 +2041,9 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void removeDocumentStartUserScripts(WebView target) {
         if (target == null) return;
-        ScriptHandler handler = scriptHandlers.remove(target);
-        if (handler != null) try { handler.remove(); } catch (RuntimeException ignored) {}
+        List<ScriptHandler> handlers = scriptHandlers.remove(target);
+        if (handlers != null) for (ScriptHandler handler : handlers)
+            if (handler != null) try { handler.remove(); } catch (RuntimeException ignored) {}
         cancelScriptRequests(target);
         scriptBridgeTokens.remove(target);
         documentStartScriptViews.remove(target);
@@ -1305,18 +2058,20 @@ public final class MainActivity extends Activity implements Runnable {
         Runnable prepare = new Runnable() {
             @Override public void run() {
                 final String[] tokens = new String[live.size()];
-                final String[] sources = new String[live.size()];
+                final ArrayList<List<UserScriptStore.DocumentStartPayload>> payloads =
+                        new ArrayList<List<UserScriptStore.DocumentStartPayload>>(live.size());
+                for (int i = 0; i < live.size(); i++) payloads.add(Collections.<UserScriptStore.DocumentStartPayload>emptyList());
                 if (store != null && store.hasEnabledScripts()) for (int i = 0; i < live.size(); i++) {
                     tokens[i] = UrlCleaner.randomToken();
-                    sources[i] = store.buildDocumentStartScript(tokens[i]);
+                    payloads.set(i, store.buildDocumentStartPayloads(tokens[i]));
                 }
                 uiHandler.post(new Runnable() {
                     @Override public void run() {
                         if (activityDestroyed || generation != scriptRegistrationGeneration) return;
                         for (int i = 0; i < live.size(); i++)
-                            installDocumentStartUserScripts(live.get(i), tokens[i], sources[i]);
+                            installDocumentStartUserScripts(live.get(i), tokens[i], payloads.get(i));
                         if (reload && webView != null && isNetworkPage(webView.getUrl())) {
-                            webView.reload();
+                            reloadWebView(webView);
                             toast("用户脚本权限已更新，当前页面正在重新加载");
                         }
                     }
@@ -1325,23 +2080,31 @@ public final class MainActivity extends Activity implements Runnable {
         };
         if (!executeTask(scriptExecutor, prepare)) {
             for (WebView view : live) installDocumentStartUserScripts(view);
-            if (reload && webView != null && isNetworkPage(webView.getUrl())) webView.reload();
+            if (reload && webView != null && isNetworkPage(webView.getUrl())) reloadWebView(webView);
         }
     }
 
     private void cancelScriptRequests(WebView target) {
         String token = scriptBridgeTokens.get(target);
-        if (token == null || token.length() == 0) return;
-        String prefix = token + "|";
-        for (Map.Entry<String, HttpURLConnection> entry : new ArrayList<Map.Entry<String, HttpURLConnection>>(scriptConnections.entrySet())) {
-            if (!entry.getKey().startsWith(prefix)) continue;
-            HttpURLConnection connection = scriptConnections.remove(entry.getKey());
-            if (connection != null) try { connection.disconnect(); } catch (RuntimeException ignored) {}
-        }
+        if (userScriptNetwork != null) userScriptNetwork.cancel(token);
+    }
+
+    private long scriptDocumentGeneration(WebView target) {
+        Long generation = target == null ? null : scriptDocumentGenerations.get(target);
+        return generation == null ? 0L : generation;
+    }
+
+    private void advanceScriptDocumentGeneration(WebView target) {
+        if (target == null) return;
+        long previous = scriptDocumentGeneration(target);
+        scriptDocumentGenerations.put(target, previous == Long.MAX_VALUE ? 1L : previous + 1L);
     }
 
     private void configureWebView(final WebView target) {
         initialNavigationGuards.put(target, new InitialNavigationGuard());
+        navigationGestureGuards.put(target, new NavigationGestureGuard(
+                ViewConfiguration.get(this).getScaledTouchSlop()));
+        mainFrameNavigationContexts.put(target, new MainFrameNavigationContext());
         WebSettings settings = target.getSettings();
         WebViewPolicy.applySecureDefaults(settings, WebSettings.LOAD_DEFAULT);
         settings.setLoadsImagesAutomatically(true);
@@ -1351,25 +2114,33 @@ public final class MainActivity extends Activity implements Runnable {
         // target=_blank and user-gesture popups are promoted to real browser tabs.
         settings.setSupportMultipleWindows(true);
         settings.setTextZoom(100);
-        String mobileUserAgent = WebViewPolicy.mobileUserAgent(settings.getUserAgentString());
+        String initialUserAgent = settings.getUserAgentString();
+        String mobileUserAgent = WebViewPolicy.mobileUserAgent(initialUserAgent);
         mobileUserAgents.put(target, mobileUserAgent);
-        if (!mobileUserAgent.equals(settings.getUserAgentString())) settings.setUserAgentString(mobileUserAgent);
-        applyDesktopMode(target);
-        applyPerformanceMode(target);
+        applyDesktopMode(target, settings, initialUserAgent);
+        applyPerformanceMode(target, settings);
 
         CookieManager cookieManager = CookieManager.getInstance();
         cookieManager.setAcceptCookie(true);
         cookieManager.setAcceptThirdPartyCookies(target, acceptThirdPartyCookies);
         // Configure the native renderer before any URL can be loaded. No page-wide JavaScript or
         // DOM traversal is involved in dark mode.
-        applyDarkMode(target);
+        applyDarkMode(target, settings);
         installDocumentStartUserScripts(target);
 
         EdgeNavigationController.attach(target, new EdgeNavigationController.Callback() {
+            @Override public void onTouchEvent(MotionEvent event) {
+                observeNavigationTouch(target, event);
+                observeImmersiveTouch(target, event);
+            }
+            @Override public boolean isEnabled() { return edgeNavigationEnabled; }
             @Override public boolean canGoBack() { return target.canGoBack(); }
             @Override public boolean canGoForward() { return target.canGoForward(); }
-            @Override public void goBack() { target.goBack(); }
-            @Override public void goForward() { target.goForward(); }
+            @Override public void goBack() {
+                goBackWebView(target);
+                scheduleRestoredHomeRepair(target);
+            }
+            @Override public void goForward() { goForwardWebView(target); }
         });
         target.setOnLongClickListener(new View.OnLongClickListener() {
             @Override public boolean onLongClick(View ignored) { return handleWebViewLongPress(target); }
@@ -1399,6 +2170,16 @@ public final class MainActivity extends Activity implements Runnable {
         target.setWebViewClient(new WebViewClient() {
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                clearMainFrameRequest(view);
+                if (adPickerSessions.containsKey(view)) {
+                    clearMainFrameNavigation(view);
+                    return true;
+                }
+                // Check using the source document before destination settings replace its host.
+                // Native touch state also protects providers using the legacy callback.
+                if (shouldBlockPageNavigation(view, url, false, false)) return true;
+                rememberAcceptedTouchNavigation(view, url, false, false);
+                rememberMainFrameNavigation(view, url);
                 if (view != webView) return false;
                 if (isNetworkPage(url)) {
                     prepareNetworkDestination(view, url);
@@ -1409,12 +2190,20 @@ public final class MainActivity extends Activity implements Runnable {
 
             @Override
             public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                if (view != webView) return false;
+                if (adPickerSessions.containsKey(view)) {
+                    clearMainFrameNavigation(view);
+                    return true;
+                }
                 if (request == null) return false;
                 // Subframe navigation must never change the active page host or its
                 // WebSettings. Doing so breaks SPA controls while scrolling still works.
                 if (!request.isForMainFrame()) return false;
+                clearMainFrameRequest(view);
                 String url = request.getUrl().toString();
+                if (shouldBlockPageNavigation(view, url, request.hasGesture(), request.isRedirect())) return true;
+                rememberAcceptedTouchNavigation(view, url, request.hasGesture(), request.isRedirect());
+                rememberMainFrameNavigation(view, url);
+                if (view != webView) return false;
                 if (isNetworkPage(url)) {
                     prepareNetworkDestination(view, url);
                     watchInitialNetworkNavigation(view, url);
@@ -1436,113 +2225,243 @@ public final class MainActivity extends Activity implements Runnable {
             @Override
             public void onLoadResource(WebView view, String url) {
                 super.onLoadResource(view, url);
-                if (view == webView && MediaResourceSniffer.isObviousLoadResource(url))
-                    mediaSniffer.observe(url, "", pageHostFor(view), "webview", 0, 0, 0d);
+                // shouldInterceptRequest() already observes media candidates off the UI
+                // thread. onLoadResource is a redundant UI-thread callback for every static
+                // asset; scanning it here makes image/script-heavy pages compete with Chromium
+                // for the frame budget. The explicit media probe still covers DOM/blob players
+                // when the media center is opened.
             }
 
             @Override
             public void onPageStarted(WebView view, String url, android.graphics.Bitmap favicon) {
                 super.onPageStarted(view, url, favicon);
+                // URL changes from pushState/replaceState keep this generation. A real main-frame
+                // navigation advances it before cancelling requests from the outgoing document.
+                advanceScriptDocumentGeneration(view);
+                NavigationGestureGuard gestureGuard = navigationGestureGuards.get(view);
+                String initiatingDocument = protectedNavigationSourceDocument(view);
+                long startedAt = SystemClock.uptimeMillis();
+                // POST may skip override, and some providers start the page before the
+                // request callback. Preserve a verified drag before replacing source state.
+                if (gestureGuard != null && gestureGuard.hasRecentDrag(initiatingDocument, startedAt) &&
+                        navigationProtectionActive(navigationSourceHost(view, initiatingDocument))) {
+                    gestureGuard.onNavigationAccepted(initiatingDocument, url, true, false, startedAt);
+                    rememberMainFrameNavigation(view, url);
+                }
+                MainFrameNavigationContext navigationContext = mainFrameNavigationContexts.get(view);
+                if (navigationContext != null) navigationContext.onPageStarted(url);
+                if (gestureGuard != null) gestureGuard.onPageStarted(url);
+                popupSourceDocuments.remove(view);
+                rememberNavigationSourceDocument(view, url);
+                if (view == webView) showBrowserChrome(false);
+                // A chooser belongs to the document that opened it. If that document
+                // navigates before Android returns a result, never deliver the selected
+                // URI to the replacement page.
+                if (fileChooserCallback != null && fileChooserView == view) finishFileChooser(null);
+                String startedHost = hostOf(url);
+                cacheFavicon(startedHost, favicon);
+                startedPageUrls.put(view, navigationDocumentUrl(url));
                 unresponsiveWebViews.remove(view);
+                adPickerViews.remove(view);
+                adPickerSessions.remove(view);
+                if (isQrScannerUrl(url)) qrScannerViews.add(view); else qrScannerViews.remove(view);
                 cancelScriptRequests(view);
-                credentialCaptureTokens.remove(view);
                 if (InternalNavigationPolicy.shouldClearHomeTrust(isHomeUrl(url), url)) {
                     trustedHomeViews.remove(view);
                     customHomeViews.remove(view);
                 }
                 boolean offline = isOfflineUrl(url);
                 if (offline) prepareOfflineDestination(view, url);
-                else if (isHomeUrl(url)) prepareHomeDestination(view);
+                else if (isInternalBrowserUrl(url)) prepareHomeDestination(view);
                 else {
                     applyPageAccessPolicy(view, url);
-                    applySiteSettings(view, hostOf(url));
+                    applySiteSettings(view, startedHost);
+                    // POST and history/provider navigations can bypass shouldOverrideUrlLoading.
+                    prepareNavigationConnections(url);
+                    installConnectionHintScript(view, url, true);
                 }
                 updateTabForView(view, url, view.getTitle());
                 cosmeticInjected.remove(view);
                 if (url != null) {
-                    String startedHost = hostOf(url);
                     pageHosts.put(view, startedHost);
                     adBlockActiveByView.put(view, Boolean.valueOf(isAdBlockActiveForHost(startedHost)));
                 }
                 if (view != webView) return;
+                // Cancel queued work from the previous document before arranging any early
+                // cosmetic task for this one. The old ordering could enqueue the task and then
+                // immediately clear it in advanceNavigationSequence().
+                advanceNavigationSequence();
                 if (url != null) {
                     currentPageUrl = url;
-                    currentPageHost = hostOf(url);
+                    currentPageHost = startedHost;
                     if (stagedCredential != null && !currentPageHost.equalsIgnoreCase(stagedCredential.host)) {
+                        stagedCredential.clear();
                         stagedCredential = null;
                         stagedCredentialAt = 0L;
                     }
                     mediaSniffer.beginPage(url);
-                    if (isAdBlockActiveForHost(currentPageHost) && adBlock.requiresEarlyCosmetic(currentPageHost)) {
-                        scheduleCosmeticInjection(view, currentPageHost);
-                    }
                 }
+                // Stop the previous document's terminal fade before the new page
+                // starts reporting progress. Regular progress updates must not
+                // cancel this animation on every callback.
+                cancelViewAnimationIfRunning(progressBar);
                 blockedAtPageStart = adBlock.getBlockedCount();
                 if (view == webView && refreshButton != null) {
-                    refreshButton.animate().cancel();
+                    cancelViewAnimationIfRunning(refreshButton);
                     refreshButton.animate().rotationBy(180f).setDuration(reduceMotion() ? 100L : 220L).start();
                 }
-                advanceNavigationSequence();
                 pageCommitted = false;
                 pageFinished = false;
                 preparedInjection = null;
                 schedulePageEnhancements(url, navigationSequence);
+                if (url != null && isAdBlockActiveForHost(currentPageHost) &&
+                        adBlock.requiresEarlyCosmetic(currentPageHost)) {
+                    // Let document-start user scripts claim the navigation worker first; CSS
+                    // construction remains off the UI thread and can follow in the same window.
+                    scheduleCosmeticInjection(view, currentPageHost);
+                }
                 requestChromeUpdate();
             }
 
             @Override
             public void onPageCommitVisible(WebView view, String url) {
                 super.onPageCommitVisible(view, url);
+                retireMainFrameNavigation(view, url);
+                String expectedDocument = startedPageUrls.get(view);
+                if (expectedDocument != null && !expectedDocument.equals(navigationDocumentUrl(url))) return;
+                NavigationGestureGuard gestureGuard = navigationGestureGuards.get(view);
+                if (gestureGuard != null) gestureGuard.onNavigationCommitted(url);
+                InitialNavigationGuard guard = initialNavigationGuards.get(view);
+                if (guard != null && guard.acknowledge(url) && view == webView && startupNavigationAt != 0L)
+                    recordStartupNavigation("首航已提交", url);
                 if (view != webView) return;
                 pageCommitted = true;
-                installLiveMediaCapture(view);
                 injectPreparedStart(navigationSequence);
+                // Cached rules compile independently of this callback. Only their network
+                // refresh waits for the completed document's idle window.
             }
 
             @Override
             public void onPageFinished(WebView view, String url) {
                 super.onPageFinished(view, url);
-                if (isHomeUrl(url)) verifyTrustedHome(view);
-                updateTabForView(view, url, view.getTitle());
-                if (url != null) {
-                    String finishedHost = hostOf(url);
+                retireMainFrameNavigation(view, url);
+                // History can restore the cached home document without onPageStarted. Its
+                // last started URL then still belongs to the page we just left; authenticate
+                // the restored document before that stale-callback guard returns.
+                String settledUrl = view.getUrl() == null ? url : view.getUrl();
+                if (isHomeUrl(settledUrl)) verifyTrustedHome(view);
+                String expectedDocument = startedPageUrls.get(view);
+                if (expectedDocument != null && !expectedDocument.equals(navigationDocumentUrl(url))) {
+                    if (view == webView && homeThemeRepairPending &&
+                            (isHomeUrl(url) || isHomeUrl(view.getUrl()))) {
+                        view.post(new Runnable() {
+                            @Override public void run() {
+                                if (!activityDestroyed && webView == view &&
+                                        isHomeUrl(currentPageUrl) && isHomeUrl(view.getUrl()) && homeThemeRepairPending)
+                                    showHome(true);
+                            }
+                        });
+                    }
+                    return;
+                }
+                NavigationGestureGuard gestureGuard = navigationGestureGuards.get(view);
+                if (gestureGuard != null) gestureGuard.onNavigationCommitted(url);
+                if (isHomeUrl(url) || isHomeUrl(settledUrl)) {
+                    // A back gesture can restore a homepage document generated before the
+                    // latest theme switch. Native chrome already reflects the new mode, so
+                    // replace that stale document before it becomes visible as a mixed page.
+                    if (view == webView && (homeThemeRepairPending || !isHomeRenderCurrent(view))) {
+                        view.post(new Runnable() {
+                            @Override public void run() {
+                                if (!activityDestroyed && webView == view &&
+                                        isHomeUrl(currentPageUrl) && isHomeUrl(view.getUrl()) &&
+                                        (homeThemeRepairPending || !isHomeRenderCurrent(view)))
+                                    showHome(true);
+                            }
+                        });
+                        return;
+                    }
+                }
+                InitialNavigationGuard guard = initialNavigationGuards.get(view);
+                if (guard != null && guard.acknowledge(settledUrl) && view == webView && startupNavigationAt != 0L)
+                    recordStartupNavigation("首航已完成", settledUrl);
+                updateTabForView(view, settledUrl, view.getTitle());
+                if (settledUrl != null) {
+                    String finishedHost = hostOf(settledUrl);
                     pageHosts.put(view, finishedHost);
                     adBlockActiveByView.put(view, Boolean.valueOf(isAdBlockActiveForHost(finishedHost)));
+                    if (isNetworkPage(settledUrl) && isAdBlockActiveForHost(finishedHost)) {
+                        // An explicit site rule may already have been scheduled at page start.
+                        // Keep that ticket for the same document so the CSS is built only once;
+                        // generic subscription selectors still start at page finish.
+                        boolean earlyCosmetic = adBlock.requiresEarlyCosmetic(finishedHost);
+                        if (!earlyCosmetic || cosmeticInjected.get(view) == null) {
+                            if (!earlyCosmetic) cosmeticInjected.remove(view);
+                            scheduleCosmeticInjection(view, finishedHost);
+                        }
+                    }
                 }
                 if (view != webView) return;
-                if (url != null) {
-                    currentPageUrl = url;
-                    currentPageHost = hostOf(url);
+                if (settledUrl != null) {
+                    currentPageUrl = settledUrl;
+                    currentPageHost = hostOf(settledUrl);
                 }
                 pageFinished = true;
                 pageCommitted = true;
-                installLiveMediaCapture(view);
+                // onPageFinished can precede window load. The media scheduler verifies the
+                // actual load end, then an idle/frame boundary, before wrapping fetch/XHR.
+                scheduleLiveMediaCapture(view, settledUrl, navigationSequence);
+                if (view == webView && isNetworkPage(settledUrl)) scheduleDeferredStartupWork();
+                collectConnectionHints(view, settledUrl, navigationSequence);
                 if (refreshButton != null) refreshButton.animate().rotation(0f).setDuration(120L).start();
                 injectPreparedStart(navigationSequence);
                 injectPreparedEnd(navigationSequence);
-                if (dataStore != null && !isHomeUrl(url)) dataStore.recordVisit(view.getTitle(), url);
-                updateCurrentTab(url, view.getTitle());
+                if (dataStore != null && !isInternalBrowserUrl(settledUrl))
+                    dataStore.recordVisit(view.getTitle(), settledUrl);
+                updateCurrentTab(settledUrl, view.getTitle());
                 persistSession();
-                installCredentialExperience(view, url, navigationSequence);
                 requestChromeUpdate();
             }
 
             @Override
             public void doUpdateVisitedHistory(WebView view, String url, boolean isReload) {
                 super.doUpdateVisitedHistory(view, url, isReload);
+                // pushState/replaceState can change the page identity without onPageStarted.
+                // Keep this separate from startedPageUrls, which also guards page callbacks.
+                if (url != null) rememberNavigationSourceDocument(view, url);
                 updateTabForView(view, url, view.getTitle());
                 if (url != null) pageHosts.put(view, hostOf(url));
+                // Cached history restoration may also skip onPageFinished. A URL alone does
+                // not grant command access: the probe checks the document's private token.
+                if (isHomeUrl(view.getUrl())) verifyTrustedHome(view);
                 if (view != webView) return;
+                String previousUrl = currentPageUrl;
                 if (url != null) {
                     currentPageUrl = url;
                     currentPageHost = hostOf(url);
                 }
+                String historyUrl = url == null ? view.getUrl() : url;
+                if ((isHomeUrl(historyUrl) || isHomeUrl(view.getUrl())) &&
+                        (homeThemeRepairPending || !isHomeRenderCurrent(view))) {
+                    // History restoration may use the provider's cached document and skip
+                    // onPageFinished. Repair the stale themed homepage at the history callback.
+                    view.post(new Runnable() {
+                        @Override public void run() {
+                            if (!activityDestroyed && webView == view &&
+                                    isHomeUrl(currentPageUrl) && isHomeUrl(view.getUrl()) &&
+                                    (homeThemeRepairPending || !isHomeRenderCurrent(view))) showHome(true);
+                        }
+                    });
+                    return;
+                }
                 updateCurrentTab(url, view.getTitle());
-                if (pageFinished) installCredentialExperience(view, url, navigationSequence);
                 requestChromeUpdate();
             }
 
             public boolean onRenderProcessGone(final WebView view, android.webkit.RenderProcessGoneDetail detail) {
+                // A renderer callback can arrive after a tab was closed or frozen. Such a
+                // detached view must not tear down the surviving tab set during recovery.
+                if (activityDestroyed || view == null || tabForView(view) == null) return true;
                 if (!rendererRecoveryPending) {
                     rendererRecoveryPending = true;
                     uiHandler.post(new Runnable() {
@@ -1555,11 +2474,14 @@ public final class MainActivity extends Activity implements Runnable {
             @Override
             public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
                 handler.cancel();
-                if (view == webView) {
+                if (view == webView && !activityDestroyed) {
                     toast("证书验证失败，已停止加载");
                     String failed = error == null ? currentPageUrl : error.getUrl();
-                    if (hostOf(failed).equals(currentPageHost)) {
-                        maybeOfferCompatibilityMode(currentPageUrl, "主页面证书或 HTTPS 加载失败");
+                    String current = view.getUrl();
+                    if (failed != null && current != null &&
+                            sameCredentialDocument(failed, current) &&
+                            hostOf(failed).equalsIgnoreCase(currentPageHost)) {
+                        maybeOfferCompatibilityMode(failed, "主页面证书或 HTTPS 加载失败");
                     }
                 }
             }
@@ -1567,16 +2489,22 @@ public final class MainActivity extends Activity implements Runnable {
             @Override
             public void onReceivedError(WebView view, WebResourceRequest request, WebResourceError error) {
                 super.onReceivedError(view, request, error);
+                if (request != null && request.isForMainFrame() && request.getUrl() != null)
+                    retireMainFrameNavigation(view, request.getUrl().toString());
                 if (view == webView && request != null && request.isForMainFrame() &&
                         error != null && compatibilityRelevantError(error.getErrorCode())) {
                     String failed = request.getUrl() == null ? currentPageUrl : request.getUrl().toString();
-                    maybeOfferCompatibilityMode(failed, "主页面加载失败（" + error.getErrorCode() + "）");
+                    String current = view.getUrl();
+                    if (current != null && sameCredentialDocument(failed, current))
+                        maybeOfferCompatibilityMode(failed, "主页面加载失败（" + error.getErrorCode() + "）");
                 }
             }
 
             @Override
             public void onReceivedHttpAuthRequest(WebView view, final android.webkit.HttpAuthHandler handler, String host, String realm) {
                 if (view != webView || handler == null) { if (handler != null) handler.cancel(); return; }
+                final String expectedUrl = view.getUrl();
+                final String expectedHost = host == null ? "" : host.toLowerCase(Locale.US);
                 final EditText username = new EditText(MainActivity.this);
                 username.setHint("用户名");
                 username.setSingleLine(true);
@@ -1593,7 +2521,16 @@ public final class MainActivity extends Activity implements Runnable {
                 AlertDialog dialog = new AlertDialog.Builder(MainActivity.this).setTitle("网站身份验证")
                         .setMessage(host + (realm == null || realm.length() == 0 ? "" : " · " + realm)).setView(fields)
                         .setPositiveButton("登录", new DialogInterface.OnClickListener() {
-                            @Override public void onClick(DialogInterface dialog, int which) { handler.proceed(username.getText().toString(), password.getText().toString()); }
+                            @Override public void onClick(DialogInterface dialog, int which) {
+                                String current = view.getUrl();
+                                if (activityDestroyed || view != webView || !sameCredentialDocument(expectedUrl, current) ||
+                                        !expectedHost.equalsIgnoreCase(hostOf(current))) {
+                                    handler.cancel();
+                                    toast("页面已经变化，已取消身份验证");
+                                    return;
+                                }
+                                handler.proceed(username.getText().toString(), password.getText().toString());
+                            }
                         }).setNegativeButton("取消", deny).setOnCancelListener(deny).create();
                 secureDialog(dialog);
                 dialog.show();
@@ -1607,9 +2544,11 @@ public final class MainActivity extends Activity implements Runnable {
                     // A queued or merely accepted navigation commonly reports exactly 10%.
                     // Crossing that boundary proves the main-frame load made forward progress.
                     InitialNavigationGuard guard = initialNavigationGuards.get(view);
-                    String url = view.getUrl();
-                    if (newProgress > 10 && guard != null && guard.acknowledge(url) && startupNavigationAt != 0L)
-                        recordStartupNavigation("首航已响应", url);
+                    if (newProgress > 10 && guard != null && !guard.isAcknowledged()) {
+                        String url = view.getUrl();
+                        if (guard.acknowledge(url) && startupNavigationAt != 0L)
+                            recordStartupNavigation("首航已响应", url);
+                    }
                     scheduleProgressUpdate(newProgress);
                 }
             }
@@ -1622,26 +2561,22 @@ public final class MainActivity extends Activity implements Runnable {
 
             @Override
             public void onReceivedIcon(WebView view, android.graphics.Bitmap icon) {
-                if (icon == null || favicons == null || scriptExecutor == null || scriptExecutor.isShutdown()) return;
-                final String host = hostOf(view == null ? null : view.getUrl());
-                if (host.length() == 0) return;
-                final android.graphics.Bitmap copy;
-                try { copy = icon.copy(android.graphics.Bitmap.Config.ARGB_8888, false); }
-                catch (RuntimeException error) { return; }
-                executeTask(scriptExecutor, new Runnable() {
-                    @Override public void run() {
-                        try { favicons.put(host, copy); }
-                        finally { copy.recycle(); }
-                    }
-                });
+                cacheFavicon(hostOf(view == null ? null : view.getUrl()), icon);
             }
 
             @Override
             public boolean onJsPrompt(final WebView view, String url, String message,
                                       final String defaultValue, JsPromptResult result) {
-                if (handleCredentialAutofillPrompt(view, message, result)) return true;
-                if (handleCredentialCapturePrompt(view, message, result)) return true;
-                if (HOME_TOKEN.equals(message)) {
+                if (handleQrScannerPrompt(view, message, defaultValue, result)) return true;
+                if (handleAdPickerPrompt(view, message, defaultValue, result)) return true;
+                if (message != null && (message.startsWith("__MEDIAN_CREDENTIAL__") ||
+                        message.startsWith("__MEDIAN_AUTOFILL__"))) {
+                    // Legacy page-controlled password markers are inert. Do not parse them or
+                    // let them reach Chromium's prompt UI.
+                    if (result != null) result.confirm("");
+                    return true;
+                }
+                if (homeToken != null && homeToken.equals(message)) {
                     boolean accepted = result != null && view == webView && isHomeUrl(view.getUrl()) &&
                             trustedHomeViews.contains(view) && !customHomeViews.contains(view) &&
                             defaultValue != null && defaultValue.startsWith("median://");
@@ -1692,13 +2627,27 @@ public final class MainActivity extends Activity implements Runnable {
 
             @Override
             public boolean onCreateWindow(WebView view, boolean isDialog, boolean isUserGesture, Message resultMsg) {
-                SiteSettingsStore.SiteSettings site = siteSettingsStore.forHost(pageHostFor(view));
+                if (adPickerSessions.containsKey(view)) return false;
+                SiteSettingsStore.SiteSettings site = siteSettingsStore == null
+                        ? new SiteSettingsStore.SiteSettings() : siteSettingsStore.forHost(pageHostFor(view));
                 int popups = site.get(SiteSettingsStore.POPUPS);
                 if (popups == SiteSettingsStore.BLOCK || (!isUserGesture && popups != SiteSettingsStore.ALLOW) ||
-                        resultMsg == null || !(resultMsg.obj instanceof WebView.WebViewTransport) || tabs.size() >= MAX_TABS) return false;
+                        resultMsg == null || !(resultMsg.obj instanceof WebView.WebViewTransport)) return false;
+                // A drag is not an intentional request for a new window. Explicit per-site
+                // ALLOW continues to permit automatic popups as the user requested.
+                NavigationGestureGuard gestureGuard = navigationGestureGuards.get(view);
+                String sourceDocument = navigationSourceDocument(view);
+                if (popups != SiteSettingsStore.ALLOW && isUserGesture &&
+                        navigationProtectionActive(navigationSourceHost(view, sourceDocument)) &&
+                        gestureGuard != null && gestureGuard.hasRecentDrag(sourceDocument, SystemClock.uptimeMillis())) return false;
+                if (tabs.size() >= MAX_TABS) {
+                    if (isUserGesture) toast("标签页已达到 " + MAX_TABS + " 个上限");
+                    return false;
+                }
                 BrowserTab tab = new BrowserTab();
                 WebView popup = createConfiguredWebView();
-                tab.liveView = popup;
+                if (sourceDocument.length() > 0) popupSourceDocuments.put(popup, sourceDocument);
+                bindWebViewToTab(tab, popup);
                 tab.lastActiveAt = SystemClock.uptimeMillis();
                 tabs.add(tab);
                 WebView.WebViewTransport transport = (WebView.WebViewTransport) resultMsg.obj;
@@ -1727,9 +2676,14 @@ public final class MainActivity extends Activity implements Runnable {
 
             @Override
             public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
-                if (view != webView) { callback.onReceiveValue(null); return true; }
-                if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
+                if (view != webView) {
+                    try { if (callback != null) callback.onReceiveValue(null); } catch (RuntimeException ignored) {}
+                    return true;
+                }
+                finishFileChooser(null);
                 fileChooserCallback = callback;
+                fileChooserView = view;
+                fileChooserDocumentUrl = navigationDocumentUrl(view.getUrl());
                 Intent intent;
                 try {
                     intent = params.createIntent();
@@ -1742,9 +2696,9 @@ public final class MainActivity extends Activity implements Runnable {
                     startActivityForResult(intent, FILE_CHOOSER_REQUEST);
                     return true;
                 } catch (Exception e) {
-                    fileChooserCallback = null;
+                    finishFileChooser(null);
                     toast("没有可用的文件选择器");
-                    return false;
+                    return true;
                 }
             }
         });
@@ -1752,6 +2706,7 @@ public final class MainActivity extends Activity implements Runnable {
         target.setDownloadListener(new DownloadListener() {
             @Override public void onDownloadStart(String url, String userAgent, String contentDisposition,
                                                   String mimetype, long contentLength) {
+                if (adPickerSessions.containsKey(target)) return;
                 if (looksLikeUserScript(url)) {
                     installScriptFromUrl(url);
                     return;
@@ -1769,7 +2724,7 @@ public final class MainActivity extends Activity implements Runnable {
         final boolean image = type == WebView.HitTestResult.IMAGE_TYPE || type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE;
         boolean link = type == WebView.HitTestResult.SRC_ANCHOR_TYPE || type == WebView.HitTestResult.SRC_IMAGE_ANCHOR_TYPE;
         final String url = hit.getExtra();
-        if ((!image && !link) || url == null || (!url.startsWith("https://") && !url.startsWith("http://"))) return false;
+        if ((!image && !link) || !isNetworkPage(url)) return false;
         if (!image && looksLikeUserScript(url)) {
             showActionSheet("用户脚本链接", hostOf(url),
                     new String[] { "安装并检查脚本", "复制脚本地址", "在新标签页打开" },
@@ -1786,8 +2741,10 @@ public final class MainActivity extends Activity implements Runnable {
                     });
             return true;
         }
-        String[] items = new String[] { "在新标签页打开", "在后台标签页打开", "复制地址", "分享地址", image ? "下载图片" : "下载链接" };
-        int[] icons = new int[] { BrowserIconView.PLUS, BrowserIconView.TABS, BrowserIconView.PLUS, BrowserIconView.SHARE, BrowserIconView.STORAGE };
+        String[] items = new String[] { "在新标签页打开", "在后台标签页打开", "复制地址", "分享地址",
+                image ? "下载图片" : "下载链接", "发送到外部下载器" };
+        int[] icons = new int[] { BrowserIconView.PLUS, BrowserIconView.TABS, BrowserIconView.PLUS,
+                BrowserIconView.SHARE, BrowserIconView.STORAGE, BrowserIconView.STORAGE };
         showActionSheet(image ? "图片与链接" : "链接操作", hostOf(url), items, icons, new SheetHandler() {
             @Override public void onItem(int which) {
                 if (which == 0) openUrlInNewTab(url, true);
@@ -1801,17 +2758,17 @@ public final class MainActivity extends Activity implements Runnable {
                     share.setType("text/plain");
                     share.putExtra(Intent.EXTRA_TEXT, url);
                     try { startActivity(Intent.createChooser(share, "分享链接")); } catch (Exception e) { toast("没有可用的分享应用"); }
-                } else {
+                } else if (which == 4) {
                     String ua = source.getSettings().getUserAgentString();
                     enqueueDownload(source, url, ua, null, image ? "image/*" : "application/octet-stream");
-                }
+                } else sendToExternalDownloader(url);
             }
         });
         return true;
     }
 
     private void openUrlInNewTab(String url, boolean foreground) {
-        if (url == null || (!url.startsWith("https://") && !url.startsWith("http://"))) return;
+        if (!isNetworkPage(url)) return;
         if (tabs.size() >= MAX_TABS) { toast("最多允许 " + MAX_TABS + " 个标签页"); return; }
         BrowserTab tab = new BrowserTab();
         tab.url = url;
@@ -1857,6 +2814,11 @@ public final class MainActivity extends Activity implements Runnable {
             url = NetworkSecurity.parseHttpUrl(url).toString();
         } catch (Exception invalidUrl) {
             toast("只允许下载有效的 HTTP(S) 资源");
+            return false;
+        }
+        Uri directory = DownloadDirectory.selectedTree(this);
+        if (directory != null && !DownloadDirectory.hasWriteGrant(this, directory)) {
+            toast("下载文件夹授权已失效，请在下载设置中重新选择文件夹");
             return false;
         }
         DownloadStore.Item duplicate = services.downloads().findBlockingDuplicate(url, 15000L);
@@ -1967,6 +2929,10 @@ public final class MainActivity extends Activity implements Runnable {
     private boolean handleScriptBridgePrompt(final WebView source, String pageUrl, String message, JsPromptResult result) {
         final String prefix = "__MEDIAN_BRIDGE__";
         if (message == null || !message.startsWith(prefix)) return false;
+        if (message.length() > SCRIPT_BRIDGE_MAX_MESSAGE_CHARS) {
+            result.confirm(bridgeError("request too large"));
+            return true;
+        }
         String response;
         try {
             JSONObject request = new JSONObject(message.substring(prefix.length()));
@@ -1993,6 +2959,33 @@ public final class MainActivity extends Activity implements Runnable {
                 response = bridgeOk(services.scriptValues().delete(scriptId, args.optString("k", "")));
             } else if ("listValues".equals(action)) {
                 response = new JSONObject().put("ok", true).put("v", new JSONArray(services.scriptValues().listJson(scriptId))).toString();
+            } else if ("getTab".equals(action)) {
+                String tabId = scriptTabIds.get(source);
+                String raw = tabId == null ? "{}" : scriptTabValues.get(scriptId + "|" + tabId);
+                Object value = new JSONTokener(raw == null ? "{}" : raw).nextValue();
+                if (!(value instanceof JSONObject)) value = new JSONObject();
+                response = new JSONObject().put("ok", true).put("v", value).toString();
+            } else if ("saveTab".equals(action)) {
+                String tabId = scriptTabIds.get(source);
+                String raw = args.optString("v", "{}");
+                Object value = raw.length() <= 1024 * 1024 ? new JSONTokener(raw).nextValue() : null;
+                boolean allowed = tabId != null && value instanceof JSONObject;
+                if (allowed) allowed = scriptTabValues.put(scriptId + "|" + tabId, raw);
+                response = bridgeOk(allowed);
+            } else if ("getTabs".equals(action)) {
+                JSONObject values = new JSONObject();
+                String tabKeyPrefix = scriptId + "|";
+                for (Map.Entry<String, String> entry : scriptTabValues.entries()) {
+                    if (!entry.getKey().startsWith(tabKeyPrefix)) continue;
+                    try {
+                        Object value = new JSONTokener(entry.getValue()).nextValue();
+                        if (value instanceof JSONObject)
+                            values.put(entry.getKey().substring(tabKeyPrefix.length()), value);
+                    } catch (Exception ignored) {}
+                }
+                String currentTab = scriptTabIds.get(source);
+                if (currentTab != null && !values.has(currentTab)) values.put(currentTab, new JSONObject());
+                response = new JSONObject().put("ok", true).put("v", values).toString();
             } else if ("openTab".equals(action)) {
                 String url = args.optString("u", "");
                 boolean allowed = isHttpUrl(url);
@@ -2007,10 +3000,10 @@ public final class MainActivity extends Activity implements Runnable {
             } else if ("notification".equals(action)) {
                 String text = args.optString("text", "");
                 String notice = args.optString("title", "Median") + (text.length() == 0 ? "" : "：" + text);
-                toast(notice.substring(0, Math.min(240, notice.length())));
+                toast(UiText.ellipsize(notice, 240));
                 response = bridgeOk(true);
             } else if ("cookie".equals(action)) {
-                response = handleScriptCookie(currentUrl, args);
+                response = userScriptNetwork().handleCookie(currentUrl, args);
             } else if ("download".equals(action)) {
                 String url = args.optString("u", "");
                 boolean allowed = isHttpUrl(url) && scriptStore.canConnect(scriptId, url, currentUrl);
@@ -2021,15 +3014,10 @@ public final class MainActivity extends Activity implements Runnable {
                 response = bridgeOk(allowed && enqueueDownloadAdvanced(url, source.getSettings().getUserAgentString(), null,
                         "application/octet-stream", args.optString("n", ""), headers, !pageIsLocal));
             } else if ("xhr".equals(action)) {
-                String url = args.optString("u", "");
-                String callbackId = args.optString("i", "");
-                boolean allowed = callbackId.matches("[A-Za-z0-9_-]{1,96}") && isHttpUrl(url) &&
-                        scriptStore.canConnect(scriptId, url, currentUrl);
-                if (allowed) startScriptRequest(source, token, scriptId, callbackId, args, currentUrl);
-                response = allowed ? bridgeOk(true) : bridgeError("@connect denied");
+                response = userScriptNetwork().request(source, token, scriptId, args, currentUrl,
+                        scriptDocumentGeneration(source));
             } else if ("xhrAbort".equals(action)) {
-                HttpURLConnection connection = scriptConnections.remove(token + "|" + args.optString("i", ""));
-                if (connection != null) connection.disconnect();
+                userScriptNetwork().abort(token, args.optString("i", ""));
                 response = bridgeOk(true);
             } else response = bridgeError("unknown action");
         } catch (Exception e) {
@@ -2039,259 +3027,35 @@ public final class MainActivity extends Activity implements Runnable {
         return true;
     }
 
-    private String handleScriptCookie(String pageUrl, JSONObject args) {
-        try {
-            URL page = NetworkSecurity.parseHttpUrl(pageUrl);
-            String host = NetworkSecurity.normalizedHost(page);
-            String operation = args.optString("op", "list");
-            JSONObject details = args.optJSONObject("d");
-            if (details == null) details = new JSONObject();
-            CookieManager manager = CookieManager.getInstance();
-            if ("list".equals(operation)) {
-                JSONArray cookies = new JSONArray();
-                String filter = details.optString("name", "");
-                String header = manager.getCookie(pageUrl);
-                if (header != null) for (String part : header.split(";\\s*")) {
-                    int equals = part.indexOf('=');
-                    String name = equals < 0 ? part.trim() : part.substring(0, equals).trim();
-                    if (name.length() == 0 || (filter.length() > 0 && !filter.equals(name))) continue;
-                    String value = equals < 0 ? "" : part.substring(equals + 1);
-                    cookies.put(new JSONObject().put("name", name).put("value", value).put("domain", host)
-                            .put("path", "/").put("secure", "https".equalsIgnoreCase(page.getProtocol()))
-                            .put("session", true));
+    /** Allocate privileged networking only when a userscript actually uses it. */
+    private UserScriptNetwork userScriptNetwork() {
+        if (userScriptNetwork == null) {
+            userScriptNetwork = new UserScriptNetwork(uiHandler, new UserScriptNetwork.Host() {
+                @Override public boolean executeNetworkTask(Runnable task) {
+                    if (scriptNetworkExecutor == null || scriptNetworkExecutor.isShutdown())
+                        throw new RejectedExecutionException("脚本网络服务不可用");
+                    return executeTask(scriptNetworkExecutor, task);
                 }
-                return new JSONObject().put("ok", true).put("v", cookies).toString();
-            }
-            String name = details.optString("name", "").trim();
-            String value = details.optString("value", "");
-            String path = details.optString("path", "/");
-            String domain = details.optString("domain", "").trim().toLowerCase(Locale.US);
-            if (!name.matches("[!#$%&'*+.^_`|~0-9A-Za-z-]{1,256}") || !safeCookiePart(value, false) ||
-                    !safeCookiePart(path, true)) return bridgeError("invalid cookie");
-            if (domain.startsWith(".")) domain = domain.substring(1);
-            if (domain.length() > 0 && !(host.equals(domain) || host.endsWith("." + domain)))
-                return bridgeError("cookie domain denied");
-            StringBuilder cookie = new StringBuilder(name).append('=');
-            if (!"delete".equals(operation)) cookie.append(value);
-            cookie.append("; Path=").append(path);
-            if (domain.length() > 0) cookie.append("; Domain=").append(domain);
-            if ("delete".equals(operation)) cookie.append("; Max-Age=0");
-            else {
-                if (details.optBoolean("secure", false)) cookie.append("; Secure");
-                if (details.has("expirationDate")) {
-                    long maxAge = Math.max(0L, (long) details.optDouble("expirationDate", 0) - System.currentTimeMillis() / 1000L);
-                    cookie.append("; Max-Age=").append(maxAge);
+                @Override public boolean canConnect(String scriptId, String url, String pageUrl) {
+                    return scriptStore.canConnect(scriptId, url, pageUrl);
                 }
-                String sameSite = details.optString("sameSite", "");
-                if ("strict".equalsIgnoreCase(sameSite)) cookie.append("; SameSite=Strict");
-                else if ("lax".equalsIgnoreCase(sameSite)) cookie.append("; SameSite=Lax");
-                else if ("none".equalsIgnoreCase(sameSite) && details.optBoolean("secure", false)) cookie.append("; SameSite=None");
-            }
-            if (!"set".equals(operation) && !"delete".equals(operation)) return bridgeError("unknown cookie action");
-            manager.setCookie(pageUrl, cookie.toString());
-            scheduleCookieFlush();
-            return bridgeOk(true);
-        } catch (Exception error) {
-            return bridgeError("cookie failed");
+                @Override public boolean isCurrentRequestDocument(WebView source, String token,
+                        String scriptId, long documentGeneration) {
+                    if (activityDestroyed || source == null) return false;
+                    String expected = scriptBridgeTokens.get(source);
+                    String current = source.getUrl();
+                    return expected != null && token.equals(expected) &&
+                            documentGeneration == scriptDocumentGeneration(source) &&
+                            scriptStore.matchesUrl(scriptId, current);
+                }
+                @Override public void scheduleCookieFlush() { MainActivity.this.scheduleCookieFlush(); }
+            });
         }
-    }
-
-    private static boolean safeCookiePart(String value, boolean path) {
-        if (value == null || value.length() > 4096 || value.indexOf('\r') >= 0 || value.indexOf('\n') >= 0 || value.indexOf(';') >= 0) return false;
-        return !path || value.startsWith("/");
-    }
-
-    private void startScriptRequest(final WebView source, final String token, final String scriptId,
-                                    final String callbackId, final JSONObject args, final String pageUrl) {
-        if (scriptNetworkExecutor == null || scriptNetworkExecutor.isShutdown()) return;
-        executeTask(scriptNetworkExecutor, new Runnable() {
-            @Override public void run() {
-                HttpURLConnection connection = null;
-                String key = token + "|" + callbackId;
-                try {
-                    URL current = NetworkSecurity.parseHttpUrl(args.optString("u", ""));
-                    URL initial = current;
-                    URL page = NetworkSecurity.parseHttpUrl(pageUrl);
-                    int requestedTimeout = args.optInt("to", 0);
-                    int timeout = requestedTimeout <= 0 ? 20000 : requestedTimeout;
-                    String method = args.optString("m", "GET").toUpperCase(Locale.US);
-                    if (!method.matches("GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS")) throw new IllegalArgumentException("unsupported method");
-                    byte[] requestBody = args.optBoolean("b64", false) ?
-                            android.util.Base64.decode(args.optString("d", ""), android.util.Base64.DEFAULT) :
-                            args.optString("d", "").getBytes("UTF-8");
-                    JSONObject headerObject = args.optJSONObject("h");
-                    boolean anonymous = args.optBoolean("anon", false);
-                    int status = 0;
-                    for (int redirects = 0; redirects <= NetworkSecurity.MAX_REDIRECTS; redirects++) {
-                        if (!scriptStore.canConnect(scriptId, current.toString(), pageUrl)) throw new IllegalArgumentException("@connect denied after redirect");
-                        boolean pageIsLocal = NetworkSecurity.isLocalOrPrivateHost(NetworkSecurity.normalizedHost(page));
-                        boolean targetIsLocal = NetworkSecurity.isLocalOrPrivateHost(NetworkSecurity.normalizedHost(current));
-                        if (targetIsLocal && !pageIsLocal) throw new IllegalArgumentException("local network target denied");
-
-                        connection = (HttpURLConnection) current.openConnection();
-                        scriptConnections.put(key, connection);
-                        connection.setInstanceFollowRedirects(false);
-                        connection.setConnectTimeout(timeout);
-                        connection.setReadTimeout(timeout);
-                        connection.setUseCaches(false);
-                        connection.setRequestProperty("Accept-Encoding", "identity");
-                        connection.setRequestMethod(method);
-                        boolean sameInitialOrigin = NetworkSecurity.sameOrigin(initial, current);
-                        if (headerObject != null) {
-                            Iterator<String> names = headerObject.keys();
-                            while (names.hasNext()) {
-                                String name = names.next();
-                                String value = headerObject.optString(name, "");
-                                if (!NetworkSecurity.validHeader(name, value) || NetworkSecurity.isForbiddenRequestHeader(name)) continue;
-                                if (!sameInitialOrigin && NetworkSecurity.isCredentialHeader(name)) continue;
-                                connection.setRequestProperty(name, value);
-                            }
-                        }
-                        if (!anonymous) {
-                            String cookie = CookieManager.getInstance().getCookie(current.toString());
-                            if (cookie != null && cookie.length() > 0) connection.setRequestProperty("Cookie", cookie);
-                        }
-                        if (requestBody.length > 0 && !"GET".equals(method) && !"HEAD".equals(method)) {
-                            connection.setDoOutput(true);
-                            OutputStream requestOutput = connection.getOutputStream();
-                            try { requestOutput.write(requestBody); } finally { requestOutput.close(); }
-                        }
-
-                        status = connection.getResponseCode();
-                        if (!anonymous) storeResponseCookies(current, connection);
-                        if (!NetworkSecurity.isRedirect(status)) break;
-                        if (redirects == NetworkSecurity.MAX_REDIRECTS) throw new IllegalArgumentException("too many redirects");
-                        URL next = NetworkSecurity.resolveRedirect(current, connection.getHeaderField("Location"), false);
-                        connection.disconnect();
-                        connection = null;
-                        if ((status == 301 || status == 302 || status == 303) && !"GET".equals(method) && !"HEAD".equals(method)) {
-                            method = "GET";
-                            requestBody = new byte[0];
-                        }
-                        current = next;
-                    }
-                    if (connection == null) throw new IllegalStateException("request failed");
-                    InputStream input = status >= 400 ? connection.getErrorStream() : connection.getInputStream();
-                    ByteArrayOutputStream output = new ByteArrayOutputStream(32768);
-                    byte[] buffer = new byte[16384];
-                    int read, total = 0;
-                    long declared = connection.getContentLengthLong();
-                    long lastProgress = 0;
-                    if (input != null) try {
-                        while ((read = input.read(buffer)) != -1) {
-                            total += read;
-                            output.write(buffer, 0, read);
-                            if (total - lastProgress >= 262144) {
-                                lastProgress = total;
-                                JSONObject progress = new JSONObject().put("loaded", total).put("total", Math.max(0, declared)).put("lengthComputable", declared > 0);
-                                dispatchScriptEvent(source, token, scriptId, callbackId, "progress", progress);
-                            }
-                        }
-                    } finally { input.close(); }
-                    byte[] bytes = output.toByteArray();
-                    String responseType = args.optString("rt", "text");
-                    String contentType = connection.getContentType() == null ? "" : connection.getContentType();
-                    String text = decodeResponseText(bytes, contentType);
-                    boolean binary = "arraybuffer".equalsIgnoreCase(responseType) || "blob".equalsIgnoreCase(responseType);
-                    JSONObject payload = new JSONObject();
-                    payload.put("status", status);
-                    payload.put("statusText", connection.getResponseMessage() == null ? "" : connection.getResponseMessage());
-                    payload.put("finalUrl", connection.getURL().toString());
-                    payload.put("responseHeaders", responseHeaders(connection));
-                    payload.put("contentType", contentType);
-                    payload.put("responseText", binary ? "" : text);
-                    payload.put("response", binary ? android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP) : text);
-                    dispatchScriptEvent(source, token, scriptId, callbackId, "load", payload);
-                } catch (java.net.SocketTimeoutException timeoutError) {
-                    dispatchScriptEvent(source, token, scriptId, callbackId, "timeout", errorPayload(timeoutError));
-                } catch (Exception error) {
-                    String event = scriptConnections.containsKey(key) ? "error" : "abort";
-                    dispatchScriptEvent(source, token, scriptId, callbackId, event, errorPayload(error));
-                } finally {
-                    scriptConnections.remove(key);
-                    if (connection != null) connection.disconnect();
-                }
-            }
-        });
-    }
-
-    private JSONObject errorPayload(Exception error) {
-        JSONObject payload = new JSONObject();
-        try { payload.put("error", safeMessage(error)); } catch (Exception ignored) {}
-        return payload;
-    }
-
-    private void dispatchScriptEvent(final WebView source, final String token, final String scriptId,
-                                     final String callbackId, final String event, final JSONObject payload) {
-        uiHandler.post(new Runnable() {
-            @Override public void run() {
-                String expected = source == null ? null : scriptBridgeTokens.get(source);
-                String current = source == null ? null : source.getUrl();
-                if (source == null || expected == null || !token.equals(expected) || !scriptStore.matchesUrl(scriptId, current)) return;
-                String objectName = UserScriptStore.dispatchObjectName(token, scriptId);
-                String js = "(function(){var d=window[" + JSONObject.quote(objectName) + "];if(d&&typeof d.dispatch==='function')d.dispatch(" +
-                        JSONObject.quote(token) + "," + JSONObject.quote(callbackId) + "," + JSONObject.quote(event) + "," +
-                        (payload == null ? "{}" : payload.toString()) + ");})();";
-                try { source.evaluateJavascript(js, null); } catch (RuntimeException ignored) {}
-            }
-        });
-    }
-
-    private void storeResponseCookies(URL url, HttpURLConnection connection) {
-        Map<String, List<String>> fields = connection.getHeaderFields();
-        if (fields == null) return;
-        CookieManager manager = CookieManager.getInstance();
-        boolean changed = false;
-        for (Map.Entry<String, List<String>> field : fields.entrySet()) {
-            String name = field.getKey();
-            if (name == null || field.getValue() == null ||
-                    !("set-cookie".equalsIgnoreCase(name) || "set-cookie2".equalsIgnoreCase(name))) continue;
-            for (String value : field.getValue()) {
-                if (value != null && value.length() > 0) {
-                    manager.setCookie(url.toString(), value);
-                    changed = true;
-                }
-            }
-        }
-        if (changed) scheduleCookieFlush();
+        return userScriptNetwork;
     }
 
     private void scheduleCookieFlush() {
-        if (!cookieFlushPending.compareAndSet(false, true)) return;
-        uiHandler.postDelayed(new Runnable() {
-            @Override public void run() {
-                cookieFlushPending.set(false);
-                try { CookieManager.getInstance().flush(); } catch (RuntimeException ignored) {}
-            }
-        }, 1000L);
-    }
-
-    private static String decodeResponseText(byte[] bytes, String contentType) {
-        Charset charset = StandardCharsets.UTF_8;
-        if (contentType != null) {
-            String[] parts = contentType.split(";");
-            for (String part : parts) {
-                String trimmed = part.trim();
-                if (!trimmed.toLowerCase(Locale.US).startsWith("charset=")) continue;
-                String name = trimmed.substring(8).trim().replace("\"", "");
-                try { charset = Charset.forName(name); } catch (Exception ignored) {}
-                break;
-            }
-        }
-        return new String(bytes, charset);
-    }
-
-    private static String responseHeaders(HttpURLConnection connection) {
-        StringBuilder out = new StringBuilder();
-        Map<String, List<String>> fields = connection.getHeaderFields();
-        if (fields == null) return "";
-        for (Map.Entry<String, List<String>> field : fields.entrySet()) {
-            if (field.getKey() == null || field.getValue() == null) continue;
-            String lower = field.getKey().toLowerCase(Locale.US);
-            if (lower.equals("set-cookie") || lower.equals("set-cookie2") || lower.equals("proxy-authenticate")) continue;
-            for (String value : field.getValue()) out.append(field.getKey()).append(": ").append(value).append("\r\n");
-        }
-        return out.toString();
+        cookieFlushScheduler.schedule();
     }
 
     private static Map<String, String> jsonStringMap(JSONObject object) {
@@ -2317,8 +3081,8 @@ public final class MainActivity extends Activity implements Runnable {
 
     private static boolean isHttpUrl(String value) {
         try {
-            NetworkSecurity.parseHttpUrl(value);
-            return true;
+            URL parsed = NetworkSecurity.parseHttpUrl(value);
+            return !"median.invalid".equalsIgnoreCase(parsed.getHost());
         } catch (Exception ignored) { return false; }
     }
 
@@ -2328,13 +3092,11 @@ public final class MainActivity extends Activity implements Runnable {
         WebResourceResponse homeAsset = interceptHomeAsset(source, uri);
         if (homeAsset != null) return homeAsset;
         String pageHost = pageHostFor(source);
-        observeMediaIfLikely(source, uri, "", pageHost);
-        if (MODE_PERFORMANCE.equals(performanceMode) && performanceNetworkDirect) return null;
         if (cachedAdBlockActive(source, pageHost) &&
                 (uri == null ? adBlock.shouldBlock(requestUrl, pageHost) : adBlock.shouldBlock(uri, pageHost))) {
-            scheduleCosmeticInjection(source, pageHost);
             return blockedResponse();
         }
+        observeMediaIfLikely(source, uri, "", pageHost);
         return null;
     }
 
@@ -2342,32 +3104,90 @@ public final class MainActivity extends Activity implements Runnable {
         WebResourceResponse homeAsset = interceptHomeAsset(source, requestUri);
         if (homeAsset != null) return homeAsset;
         String pageHost = pageHostFor(source);
-        observeMediaIfLikely(source, requestUri, "", pageHost);
-        if (MODE_PERFORMANCE.equals(performanceMode) && performanceNetworkDirect) return null;
         if (cachedAdBlockActive(source, pageHost) && adBlock.shouldBlock(requestUri, pageHost)) {
-            scheduleCosmeticInjection(source, pageHost);
             return blockedResponse();
         }
+        observeMediaIfLikely(source, requestUri, "", pageHost);
         return null;
     }
 
     private WebResourceResponse interceptRequest(WebView source, WebResourceRequest request) {
         Uri requestUri = request.getUrl();
+        boolean mainFrame = request.isForMainFrame();
         WebResourceResponse homeAsset = interceptHomeAsset(source, requestUri);
         if (homeAsset != null) return homeAsset;
-        if (customHomeViews.contains(source) && !request.isForMainFrame() && requestUri != null &&
+        if (customHomeViews.contains(source) && !mainFrame && requestUri != null &&
                 ("http".equalsIgnoreCase(requestUri.getScheme()) || "https".equalsIgnoreCase(requestUri.getScheme())) &&
                 !"median.invalid".equalsIgnoreCase(requestUri.getHost())) return blockedResponse();
         String pageHost = pageHostFor(source);
-        boolean adBlockActive = cachedAdBlockActive(source, pageHost);
-        Map<String, String> requestHeaders = request.getRequestHeaders();
-        String accept = shouldReadAcceptHeader(requestUri, request.isForMainFrame()) ? requestHeader(requestHeaders, "Accept") : "";
-        String mediaHint = mediaRequestHint(requestHeaders, accept);
-        observeMediaIfLikely(source, requestUri, mediaHint, pageHost);
-        if (MODE_PERFORMANCE.equals(performanceMode) && performanceNetworkDirect) return null;
-        if (adBlockActive && adBlock.shouldBlock(requestUri, pageHost, accept, request.isForMainFrame())) {
-            scheduleCosmeticInjection(source, pageHost);
-            return blockedResponse();
+        // The context only applies to the main-frame request that starts a navigation. Avoid
+        // taking its synchronized lock for every image/script/font/subframe callback; busy pages
+        // can dispatch hundreds of those while the navigation ticket remains untouched.
+        MainFrameNavigationContext navigationContext = mainFrame ? mainFrameNavigationContexts.get(source) : null;
+        MainFrameNavigationContext.Snapshot initiating = mainFrame &&
+                navigationContext != null && requestUri != null
+                ? navigationContext.take(requestUri.toString(), true) : null;
+        NavigationGestureGuard gestureGuard = mainFrame ? navigationGestureGuards.get(source) : null;
+        // Request callbacks run off the UI thread. Read only cached source state here;
+        // WebView.getUrl() is forbidden and destination settings may already be applied.
+        String sourceDocument = "";
+        long requestAt = mainFrame ? SystemClock.uptimeMillis() : 0L;
+        if (mainFrame) {
+            sourceDocument = popupSourceDocuments.get(source);
+            if (sourceDocument == null || sourceDocument.length() == 0)
+                sourceDocument = navigationSourceDocuments.get(source);
+            if (sourceDocument == null) sourceDocument = "";
+            if (gestureGuard != null)
+                sourceDocument = gestureGuard.navigationSourceDocument(sourceDocument, requestAt);
+        }
+        String sourceHost = mainFrame ? hostOf(sourceDocument) : "";
+        String ruleHost = initiating != null ? initiating.sourceHost :
+                mainFrame && sourceHost.length() > 0 ? sourceHost : pageHost;
+        boolean adBlockActive = initiating != null ? initiating.protectionEnabled && adBlockEnabled :
+                mainFrame && sourceHost.length() > 0 ? navigationProtectionActive(sourceHost) :
+                        cachedAdBlockActive(source, pageHost);
+        // Request.getRequestHeaders() crosses the WebView provider boundary. Read it for rules
+        // that need resource type and for a narrow set of extensionless media endpoints. The
+        // performance preset never changes blocking or navigation protection.
+        boolean readAccept = shouldReadAcceptHeader(requestUri, mainFrame);
+        // Only extensionless media header probes need URL classification before blocking.
+        // Reuse that result after blocking; ordinary static assets are scanned just once and
+        // blocked assets never pay for optional media discovery.
+        boolean mediaUrlClassified = source == webView && !mainFrame && requestUri != null && readAccept;
+        boolean inspectMedia = mediaUrlClassified && MediaResourceSniffer.isLikelyMediaRequest(
+                requestUri.getEncodedPath(), requestUri.getEncodedQuery(), "");
+        boolean mediaHeaderNeeded = mediaUrlClassified && MediaResourceSniffer.shouldProbeMediaHeaders(
+                requestUri.getEncodedPath(), requestUri.getEncodedQuery(), inspectMedia);
+        boolean needHeaders = mainFrame ||
+                (adBlockActive && adBlock.requiresRequestHeaders() && readAccept) ||
+                mediaHeaderNeeded;
+        Map<String, String> requestHeaders = needHeaders ? request.getRequestHeaders() : null;
+        String accept = readAccept ? requestHeader(requestHeaders, "Accept") : "";
+        if (adBlockActive && adBlock.shouldBlock(requestUri, ruleHost, accept, mainFrame)) {
+            boolean preserveDocument = mainFrame && gestureGuard != null && requestUri != null &&
+                    gestureGuard.shouldBlockNavigation(sourceDocument, requestUri.toString(), request.hasGesture(),
+                            request.isRedirect(), requestAt);
+            if (preserveDocument)
+                gestureGuard.onNavigationBlocked(sourceDocument, requestUri.toString(), requestAt);
+            return preserveDocument ? blockedNavigationResponse() : blockedResponse();
+        }
+        if (mainFrame && adBlockActive && gestureGuard != null && requestUri != null) {
+            String targetUrl = requestUri.toString();
+            if (gestureGuard.shouldBlockNavigation(sourceDocument, targetUrl, request.hasGesture(),
+                    request.isRedirect(), requestAt) &&
+                    !adBlock.isExplicitlyAllowed(requestUri, ruleHost, "text/html", true)) {
+                gestureGuard.onNavigationBlocked(sourceDocument, targetUrl, requestAt);
+                return blockedNavigationResponse();
+            }
+            gestureGuard.onNavigationAccepted(sourceDocument, targetUrl, request.hasGesture(),
+                    request.isRedirect(), requestAt);
+        }
+        if (source == webView && requestUri != null) {
+            if (!mediaUrlClassified) inspectMedia = MediaResourceSniffer.isLikelyMediaRequest(
+                    requestUri.getEncodedPath(), requestUri.getEncodedQuery(), "");
+            String mediaHint = mediaRequestHint(requestHeaders, accept);
+            if (inspectMedia || MediaResourceSniffer.isMediaMimeHint(mediaHint))
+                observeMediaCandidate(source, requestUri, mediaHint, pageHost);
         }
         return null;
     }
@@ -2395,7 +3215,8 @@ public final class MainActivity extends Activity implements Runnable {
         String destination = requestHeader(headers, "Sec-Fetch-Dest");
         if ("video".equalsIgnoreCase(destination)) return "video/*";
         if ("audio".equalsIgnoreCase(destination)) return "audio/*";
-        if (requestHeader(headers, "Range").toLowerCase(Locale.US).startsWith("bytes=") &&
+        String range = requestHeader(headers, "Range");
+        if (range.regionMatches(true, 0, "bytes=", 0, 6) &&
                 (accept == null || accept.length() == 0 || "*/*".equals(accept.trim())))
             return "application/x-median-range";
         return accept == null ? "" : accept;
@@ -2404,26 +3225,137 @@ public final class MainActivity extends Activity implements Runnable {
     private static boolean shouldReadAcceptHeader(Uri uri, boolean mainFrame) {
         if (mainFrame) return true;
         if (uri == null) return false;
-        String path = uri.getPath();
+        // Keep this request-interception filter allocation-free for the common static assets.
+        // Encoded paths are sufficient for suffix classification and avoid Uri's decode step.
+        String path = uri.getEncodedPath();
         if (path == null) return true;
-        String lower = path.toLowerCase(Locale.US);
-        return !(lower.endsWith(".png") || lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".gif") ||
-                lower.endsWith(".webp") || lower.endsWith(".svg") || lower.endsWith(".css") || lower.endsWith(".js") ||
-                lower.endsWith(".woff") || lower.endsWith(".woff2") || lower.endsWith(".ttf") || lower.endsWith(".ico") ||
-                lower.endsWith(".mp4") || lower.endsWith(".webm") || lower.endsWith(".m3u8") || lower.endsWith(".mp3") ||
-                lower.endsWith(".m4a") || lower.endsWith(".wav"));
+        return !(endsWithIgnoreCase(path, ".png") || endsWithIgnoreCase(path, ".jpg") ||
+                endsWithIgnoreCase(path, ".jpeg") || endsWithIgnoreCase(path, ".gif") ||
+                endsWithIgnoreCase(path, ".webp") || endsWithIgnoreCase(path, ".svg") ||
+                endsWithIgnoreCase(path, ".avif") || endsWithIgnoreCase(path, ".css") ||
+                endsWithIgnoreCase(path, ".js") || endsWithIgnoreCase(path, ".mjs") ||
+                endsWithIgnoreCase(path, ".woff") || endsWithIgnoreCase(path, ".woff2") ||
+                endsWithIgnoreCase(path, ".ttf") || endsWithIgnoreCase(path, ".otf") ||
+                endsWithIgnoreCase(path, ".ico") || endsWithIgnoreCase(path, ".json") ||
+                endsWithIgnoreCase(path, ".xml") || endsWithIgnoreCase(path, ".rss") ||
+                endsWithIgnoreCase(path, ".atom") || endsWithIgnoreCase(path, ".html") ||
+                endsWithIgnoreCase(path, ".htm") || endsWithIgnoreCase(path, ".mp4") ||
+                endsWithIgnoreCase(path, ".webm") || endsWithIgnoreCase(path, ".m3u8") ||
+                endsWithIgnoreCase(path, ".mpd") || endsWithIgnoreCase(path, ".mp3") ||
+                endsWithIgnoreCase(path, ".m4a") || endsWithIgnoreCase(path, ".aac") ||
+                endsWithIgnoreCase(path, ".ogg") || endsWithIgnoreCase(path, ".opus") ||
+                endsWithIgnoreCase(path, ".wav") || endsWithIgnoreCase(path, ".m4s") ||
+                endsWithIgnoreCase(path, ".ts"));
+    }
+
+    private static boolean endsWithIgnoreCase(String value, String suffix) {
+        int start = value.length() - suffix.length();
+        return start >= 0 && value.regionMatches(true, start, suffix, 0, suffix.length());
     }
 
     private void observeMediaIfLikely(WebView source, Uri uri, String accept, String pageHost) {
         if (source != webView || uri == null) return;
-        if (!MediaResourceSniffer.shouldInspectRequest(uri.getEncodedPath(), uri.getEncodedQuery(), accept)) return;
+        if (!MediaResourceSniffer.isLikelyMediaRequest(uri.getEncodedPath(), uri.getEncodedQuery(), accept)) return;
+        observeMediaCandidate(source, uri, accept, pageHost);
+    }
+
+    /** Records a candidate after its URL has already passed the cheap path/query filter. */
+    private void observeMediaCandidate(WebView source, Uri uri, String accept, String pageHost) {
+        if (source != webView || uri == null) return;
         mediaSniffer.observe(uri.toString(), accept, pageHost, "request", 0, 0, 0d);
     }
 
-    private void installLiveMediaCapture(WebView target) {
-        if (target == null || target != webView || isHomeUrl(target.getUrl())) return;
-        try { target.evaluateJavascript(MediaProbeScript.install(), null); }
+    private boolean isCurrentLiveMediaDocument(WebView target, String documentUrl, long sequence) {
+        if (!isCurrentPageCallback(target, sequence) || !isNetworkPage(documentUrl)) return false;
+        String current = target.getUrl();
+        String started = startedPageUrls.get(target);
+        return isNetworkPage(current) && documentUrl.equals(navigationDocumentUrl(current)) &&
+                started != null && documentUrl.equals(navigationDocumentUrl(started));
+    }
+
+    /** Small load-state query; no resource/DOM scans or persistent observers before load. */
+    private static String liveMediaLoadGateScript(String documentUrl, long sequence, boolean install) {
+        String key = JSONObject.quote(sequence + ":" + documentUrl);
+        return "(function(){try{var k=" + key + ",u=" + JSONObject.quote(documentUrl) + ";" +
+                "function current(){return String(location.href).split('#')[0]===u;}" +
+                "function loaded(){if(document.readyState!=='complete')return false;var p=window.performance,n,e;" +
+                "if(!p)return false;try{if(typeof p.getEntriesByType==='function')n=p.getEntriesByType('navigation');}catch(_){}" +
+                // A modern entry with loadEventEnd=0 is still loading; never replace it with
+                // the legacy value. Old providers without navigation entries use Timing 1.
+                "if(n&&n.length)e=n[0].loadEventEnd;else e=p.timing&&p.timing.loadEventEnd;" +
+                "return typeof e==='number'&&isFinite(e)&&e>0;}" +
+                "if(!current()||!loaded())return 0;var g=window.__medianMediaLoadGate;" +
+                "if(!g||g.k!==k||g.d!==document){" + (install ? "return 0;" :
+                "g={k:k,d:document,ready:false};window.__medianMediaLoadGate=g;" +
+                // Deferred JS only signals readiness. Native code rechecks the active view,
+                // navigation and Activity before submitting the synchronous install payload.
+                "var mark=function(){if(window.__medianMediaLoadGate===g&&g.d===document&&current()&&loaded())g.ready=true;};" +
+                "if(typeof window.requestIdleCallback==='function')window.requestIdleCallback(mark,{timeout:1000});" +
+                "else if(typeof window.requestAnimationFrame==='function')window.requestAnimationFrame(function(){window.requestAnimationFrame(mark);});" +
+                "return 0;") + "}if(!g.ready)return 0;" +
+                (install ? MediaProbeScript.install() : "") + "return 1;}catch(e){return 0;}})();";
+    }
+
+    private void installLiveMediaCapture(WebView target, String documentUrl, long sequence) {
+        if (!isCurrentLiveMediaDocument(target, documentUrl, sequence)) return;
+        try { target.evaluateJavascript(liveMediaLoadGateScript(documentUrl, sequence, true), null); }
         catch (RuntimeException ignored) {}
+    }
+
+    /** Waits for real load completion and idle/double-rAF, with a finite polling budget. */
+    private void scheduleLiveMediaCapture(final WebView target, final String documentUrl,
+                                          final long expectedSequence) {
+        final String expectedDocument = navigationDocumentUrl(documentUrl);
+        if (!isCurrentLiveMediaDocument(target, expectedDocument, expectedSequence) ||
+                liveMediaCaptureSequence == expectedSequence) return;
+        liveMediaCaptureSequence = expectedSequence;
+        uiHandler.postDelayed(new Runnable() {
+            private int checks;
+            @Override public void run() {
+                if (!isCurrentLiveMediaDocument(target, expectedDocument, expectedSequence)) return;
+                checks++;
+                final Runnable retry = this;
+                try {
+                    target.evaluateJavascript(liveMediaLoadGateScript(expectedDocument, expectedSequence, false),
+                            new ValueCallback<String>() {
+                        @Override public void onReceiveValue(String value) {
+                            if (!isCurrentLiveMediaDocument(target, expectedDocument, expectedSequence)) return;
+                            if ("1".equals(value)) installLiveMediaCapture(target, expectedDocument, expectedSequence);
+                            else if ("0".equals(value) && checks < 24) {
+                                uiHandler.postDelayed(retry, checks < 4 ? 500L : 2000L);
+                            }
+                        }
+                    });
+                } catch (RuntimeException ignored) {}
+            }
+        }, 250L);
+    }
+
+    /** Copies WebView-owned icon pixels before handing the bounded write to the worker queue. */
+    private void cacheFavicon(final String host, android.graphics.Bitmap icon) {
+        if (icon == null || host == null || host.length() == 0 || favicons == null ||
+                scriptNetworkExecutor == null || scriptNetworkExecutor.isShutdown()) return;
+        final android.graphics.Bitmap copy;
+        try { copy = icon.copy(android.graphics.Bitmap.Config.ARGB_8888, false); }
+        catch (RuntimeException error) { return; }
+        if (!executeTask(scriptNetworkExecutor, new Runnable() {
+            @Override public void run() {
+                boolean stored = false;
+                try {
+                    // File metadata checks can block on cold storage; keep them off the UI
+                    // callback that receives the page favicon.
+                    if (!activityDestroyed && !favicons.has(host)) stored = favicons.put(host, copy);
+                } finally { copy.recycle(); }
+                if (stored && !activityDestroyed) uiHandler.post(new Runnable() {
+                    @Override public void run() {
+                        if (!activityDestroyed && webView != null && isHomeUrl(webView.getUrl()))
+                            refreshHomeFavicon(webView, host);
+                    }
+                });
+            }
+        })) {
+            copy.recycle();
+        }
     }
 
     private WebResourceResponse interceptHomeAsset(WebView source, Uri uri) {
@@ -2457,26 +3389,224 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void scheduleCosmeticInjection(final WebView source, final String pageHost) {
         if (source == null || pageHost == null || pageHost.length() == 0) return;
-        // A page can block hundreds of resources. Claim the one injection slot before
-        // assembling selectors so only the first callback performs that work.
-        if (cosmeticInjected.putIfAbsent(source, Boolean.TRUE) != null) return;
-        final String css = adBlock.cosmeticCssForHost(pageHost);
-        if (css.length() == 0) return;
-        uiHandler.post(new Runnable() {
+        // YouTube is intentionally excluded from cosmetic filtering because generic selectors
+        // can interfere with its player. Avoid even scheduling an empty cleanup script there.
+        if (!adBlock.cosmeticFilteringAllowed(pageHost)) return;
+        final String documentUrl = startedPageUrls.get(source);
+        if (documentUrl == null || !isNetworkPage(documentUrl)) return;
+        // Generic subscription selectors are useful after the document has painted, but a large
+        // CSS payload can compete with the first interactive frame. Explicit user selectors keep
+        // their document-start path; generic selectors yield briefly to first paint.
+        final long uiDelay = adBlock.requiresEarlyCosmetic(pageHost) ? 0L : 120L;
+        final Object ticket = new Object();
+        if (cosmeticInjected.putIfAbsent(source, ticket) != null) return;
+        if (!executeTask(navigationExecutor, new Runnable() {
             @Override public void run() {
-                if (!pageHost.equalsIgnoreCase(pageHostFor(source))) {
-                    cosmeticInjected.remove(source);
+                if (cosmeticInjected.get(source) != ticket || activityDestroyed ||
+                        !documentUrl.equals(startedPageUrls.get(source)) ||
+                        !pageHost.equalsIgnoreCase(pageHostFor(source))) {
+                    cosmeticInjected.remove(source, ticket);
                     return;
                 }
-                String script = "(function f(){var p=document.head||document.documentElement;if(!p){setTimeout(f,30);return;}var s=document.getElementById('__median_adblock');if(!s&&" + (css.length() > 0 ? "true" : "false") + "){s=document.createElement('style');s.id='__median_adblock';s.textContent=" +
-                        JSONObject.quote(css) + ";p.appendChild(s);}})();";
-                try { source.evaluateJavascript(script, null); } catch (RuntimeException ignored) {}
+                final String css = adBlock.cosmeticCssForHost(pageHost);
+                // Quote and assemble the payload off the UI thread. JSONObject.quote scans the
+                // whole CSS string and was visible as a main-thread hitch on large subscriptions.
+                final String script = "(function(){var u=" + JSONObject.quote(documentUrl) + ",c=" + JSONObject.quote(css) +
+                        ",n=0;function f(){if(location.href.split('#')[0]!==u)return;var p=document.head||document.documentElement;" +
+                        "if(!p){if(++n<10)setTimeout(f,30);return;}var s=document.getElementById('__median_adblock');" +
+                        "if(!c){if(s)s.remove();return;}if(!s){s=document.createElement('style');s.id='__median_adblock';p.appendChild(s);}if(s.textContent!==c)s.textContent=c;}f();})();";
+                Runnable apply = new Runnable() {
+                    @Override public void run() {
+                        if (cosmeticInjected.get(source) != ticket) return;
+                        if (activityDestroyed || tabForView(source) == null ||
+                                !documentUrl.equals(startedPageUrls.get(source)) ||
+                                !documentUrl.equals(navigationDocumentUrl(source.getUrl())) ||
+                                !pageHost.equalsIgnoreCase(pageHostFor(source)) || !isAdBlockActiveForHost(pageHost)) {
+                            cosmeticInjected.remove(source, ticket);
+                            return;
+                        }
+                        try { source.evaluateJavascript(script, null); }
+                        catch (RuntimeException ignored) { cosmeticInjected.remove(source, ticket); }
+                        // Keep the ticket settled for this document so blocked subresources do not
+                        // enqueue another CSS build.
+                    }
+                };
+                if (uiDelay == 0L) uiHandler.post(apply); else uiHandler.postDelayed(apply, uiDelay);
             }
-        });
+        })) cosmeticInjected.remove(source, ticket);
+    }
+
+    private void refreshCosmeticFilters() {
+        if (activityDestroyed) return;
+        for (BrowserTab tab : tabs) {
+            WebView source = tab.liveView;
+            if (source == null || !isNetworkPage(source.getUrl())) continue;
+            String host = hostOf(source.getUrl());
+            if (!isAdBlockActiveForHost(host)) continue;
+            cosmeticInjected.remove(source);
+            scheduleCosmeticInjection(source, host);
+        }
     }
 
     private WebResourceResponse blockedResponse() {
         return new WebResourceResponse("text/plain", "UTF-8", new ByteArrayInputStream(EMPTY_RESPONSE));
+    }
+
+    private WebResourceResponse blockedNavigationResponse() {
+        // A 204 cancels main-frame navigation without committing an empty replacement
+        // document. This also covers POST requests that skip the override callback.
+        return new WebResourceResponse("text/plain", "UTF-8", 204, "No Content",
+                Collections.<String, String>emptyMap(), new ByteArrayInputStream(EMPTY_RESPONSE));
+    }
+
+    private void observeNavigationTouch(WebView source, MotionEvent event) {
+        NavigationGestureGuard guard = navigationGestureGuards.get(source);
+        if (guard == null || event == null) return;
+        String document = navigationSourceDocument(source);
+        long now = SystemClock.uptimeMillis();
+        int action = event.getActionMasked();
+        int pointers = event.getPointerCount();
+        if (action == MotionEvent.ACTION_DOWN) {
+            guard.onDown(document, now, event.getX(), event.getY(), pointers);
+        } else if (action == MotionEvent.ACTION_MOVE) {
+            guard.onMove(document, now, event.getX(), event.getY(), pointers);
+        } else if (action == MotionEvent.ACTION_POINTER_DOWN || action == MotionEvent.ACTION_POINTER_UP) {
+            guard.reset();
+        } else if (action == MotionEvent.ACTION_UP) {
+            guard.onUp(document, now, pointers);
+        } else if (action == MotionEvent.ACTION_CANCEL) {
+            guard.onCancel(document, now);
+        }
+    }
+
+    private String navigationSourceDocument(WebView source) {
+        if (source == null) return "";
+        String opener = popupSourceDocuments.get(source);
+        if (opener != null && opener.length() > 0) return opener;
+        String remembered = navigationSourceDocuments.get(source);
+        if (remembered != null && remembered.length() > 0) return remembered;
+        String current = source.getUrl();
+        return current == null ? "" : navigationDocumentUrl(current);
+    }
+
+    private void rememberNavigationSourceDocument(WebView source, String url) {
+        String document = navigationDocumentUrl(url);
+        String previous = navigationSourceDocuments.put(source, document);
+        if (document.equals(previous)) return;
+        NavigationGestureGuard guard = navigationGestureGuards.get(source);
+        if (guard != null) guard.migrateDocument(previous, document);
+    }
+
+    private String protectedNavigationSourceDocument(WebView source) {
+        String document = navigationSourceDocument(source);
+        NavigationGestureGuard guard = navigationGestureGuards.get(source);
+        return guard == null ? document : guard.navigationSourceDocument(document, SystemClock.uptimeMillis());
+    }
+
+    private void rememberAcceptedTouchNavigation(WebView source, String targetUrl,
+                                                  boolean hasGesture, boolean serverRedirect) {
+        NavigationGestureGuard guard = navigationGestureGuards.get(source);
+        if (guard == null) return;
+        String document = protectedNavigationSourceDocument(source);
+        if (navigationProtectionActive(navigationSourceHost(source, document)))
+            guard.onNavigationAccepted(document, targetUrl, hasGesture, serverRedirect, SystemClock.uptimeMillis());
+    }
+
+    private String navigationSourceHost(WebView source, String document) {
+        String host = hostOf(document);
+        if (host.length() > 0) return host;
+        return pageHostFor(source);
+    }
+
+    private boolean navigationProtectionActive(String sourceHost) {
+        return sourceHost != null && sourceHost.length() > 0 && isAdBlockActiveForHost(sourceHost);
+    }
+
+    private void rememberMainFrameNavigation(WebView source, String targetUrl) {
+        String sourceHost = navigationSourceHost(source, protectedNavigationSourceDocument(source));
+        rememberMainFrameNavigation(source, targetUrl, sourceHost, navigationProtectionActive(sourceHost));
+    }
+
+    private void rememberMainFrameNavigation(WebView source, String targetUrl, String sourceHost,
+                                              boolean protectionEnabled) {
+        MainFrameNavigationContext context = mainFrameNavigationContexts.get(source);
+        if (context != null) context.arm(targetUrl, sourceHost, protectionEnabled);
+    }
+
+    private void clearMainFrameRequest(WebView source) {
+        MainFrameNavigationContext context = mainFrameNavigationContexts.get(source);
+        if (context != null) context.clear();
+    }
+
+    private void clearMainFrameNavigation(WebView source) {
+        clearMainFrameRequest(source);
+        NavigationGestureGuard guard = navigationGestureGuards.get(source);
+        if (guard != null) guard.reset();
+    }
+
+    private void retireMainFrameNavigation(WebView source, String url) {
+        MainFrameNavigationContext context = mainFrameNavigationContexts.get(source);
+        if (context != null) context.clearForUrl(url);
+    }
+
+    private void reloadWebView(WebView target) {
+        clearMainFrameNavigation(target);
+        prepareHistoryConnectionHints(target, 0);
+        target.reload();
+    }
+
+    private void goBackWebView(WebView target) {
+        clearMainFrameNavigation(target);
+        prepareHistoryConnectionHints(target, -1);
+        target.goBack();
+    }
+
+    private void goForwardWebView(WebView target) {
+        clearMainFrameNavigation(target);
+        prepareHistoryConnectionHints(target, 1);
+        target.goForward();
+    }
+
+    private void prepareHistoryConnectionHints(WebView target, int offset) {
+        if (target == null) return;
+        String url = null;
+        if (offset == 0) url = target.getUrl();
+        else {
+            android.webkit.WebBackForwardList history = target.copyBackForwardList();
+            int index = history.getCurrentIndex() + offset;
+            if (index >= 0 && index < history.getSize()) url = history.getItemAtIndex(index).getUrl();
+        }
+        if (isNetworkPage(url)) {
+            prepareNavigationConnections(url);
+            installConnectionHintScript(target, url);
+        } else removeConnectionHintScript(target);
+    }
+
+    private boolean shouldBlockPageNavigation(WebView source, String targetUrl, boolean hasGesture,
+                                               boolean serverRedirect) {
+        if (source == null || !isNetworkPage(targetUrl)) return false;
+        String sourceDocument = protectedNavigationSourceDocument(source);
+        String sourceHost = navigationSourceHost(source, sourceDocument);
+        if (!navigationProtectionActive(sourceHost)) return false;
+        Uri target;
+        try { target = Uri.parse(targetUrl); } catch (RuntimeException ignored) { return false; }
+        NavigationGestureGuard guard = navigationGestureGuards.get(source);
+        long navigationAt = SystemClock.uptimeMillis();
+        // Main-frame document rules are evaluated against the page that initiated the request.
+        if (adBlock.shouldBlock(target, sourceHost, "text/html", true)) {
+            if (guard != null && guard.shouldBlockNavigation(sourceDocument, targetUrl, hasGesture,
+                    serverRedirect, navigationAt))
+                guard.onNavigationBlocked(sourceDocument, targetUrl, navigationAt);
+            return true;
+        }
+        if (guard == null ||
+                !guard.shouldBlockNavigation(sourceDocument, targetUrl, hasGesture, serverRedirect,
+                        navigationAt)) return false;
+        // A navigation heuristic must also respect scoped @@ document allow rules.
+        boolean navigationAllowed = adBlock.isExplicitlyAllowed(target, sourceHost, "text/html", true);
+        if (!navigationAllowed)
+            guard.onNavigationBlocked(sourceDocument, targetUrl, navigationAt);
+        return !navigationAllowed;
     }
 
     private boolean handleNavigation(WebView source, String url) {
@@ -2516,24 +3646,30 @@ public final class MainActivity extends Activity implements Runnable {
             }
             return true;
         }
+        if (isReservedInternalHost(url)) {
+            retireMainFrameNavigation(source, url);
+            // Only pages rendered by Median itself may occupy the private internal origin.
+            return !isHomeUrl(url) && !isQrScannerUrl(url);
+        }
         if (looksLikeUserScript(url)) {
+            retireMainFrameNavigation(source, url);
             installScriptFromUrl(url);
             return true;
         }
-        if (url.startsWith("http://") || url.startsWith("https://")) {
+        if (isNetworkPage(url)) {
             String cleaned = shouldCleanTracking(hostOf(url)) ? UrlCleaner.cleanTracking(url) : url;
             if (!url.equals(cleaned)) {
-                loadNetworkUrl(webView, cleaned);
+                loadNetworkUrlFromPage(source, cleaned);
                 toast("已移除跟踪参数");
                 return true;
             }
         }
-        if (url.startsWith("http://") && shouldUpgradeHttp(url)) {
-            loadNetworkUrl(webView, "https://" + url.substring(7));
+        if (shouldUpgradeHttp(url)) {
+            loadNetworkUrlFromPage(source, "https://" + url.substring(7));
             return true;
         }
-        if (url.startsWith("http://") || url.startsWith("https://") || "about:blank".equals(url) || isOfflineUrl(url)) return false;
-        if (url.startsWith("data:") || url.startsWith("about:")) { toast("已阻止网页跳转到不透明内部地址"); return true; }
+        if (isNetworkPage(url) || "about:blank".equalsIgnoreCase(url) || isOfflineUrl(url)) return false;
+        if (url.regionMatches(true, 0, "data:", 0, 5) || url.regionMatches(true, 0, "about:", 0, 6)) { toast("已阻止网页跳转到不透明内部地址"); return true; }
         confirmExternalNavigation(url);
         return true;
     }
@@ -2549,7 +3685,7 @@ public final class MainActivity extends Activity implements Runnable {
 
     private String homeOpenMode() {
         return HomeOpenPolicy.normalize(prefs.getString("home_open_mode", ""),
-                prefs.getBoolean("restore_tabs", true));
+                prefs.getBoolean("restore_tabs", false));
     }
 
     private String normalizeConfiguredHomeUrl(String raw) {
@@ -2562,7 +3698,7 @@ public final class MainActivity extends Activity implements Runnable {
         try { value = NetworkSecurity.parseHttpUrl(value).toString(); }
         catch (Exception invalid) { return ""; }
         if ("median.invalid".equalsIgnoreCase(Uri.parse(value).getHost())) return "";
-        if (value.startsWith("http://") && shouldUpgradeHttp(value)) value = "https://" + value.substring(7);
+        if (shouldUpgradeHttp(value)) value = "https://" + value.substring(7);
         try { return NetworkSecurity.parseHttpUrl(value).toString(); }
         catch (Exception invalid) { return ""; }
     }
@@ -2603,9 +3739,20 @@ public final class MainActivity extends Activity implements Runnable {
     /** Restores the trusted local homepage baseline after restrictive site or MHTML settings. */
     private void prepareHomeDestination(WebView target) {
         if (target == null) return;
+        removeConnectionHintScript(target);
+        clearMainFrameNavigation(target);
         applyPageAccessPolicy(target, HOME_URL);
         appliedSiteSettings.remove(target);
         WebSettings settings = target.getSettings();
+        target.setBackgroundColor(nightMode ? DARK_WEB : WHITE);
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
+            try { WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, false); }
+            catch (RuntimeException ignored) {}
+        }
+        if (Build.VERSION.SDK_INT >= 29) {
+            try { settings.setForceDark(WebSettings.FORCE_DARK_OFF); }
+            catch (RuntimeException ignored) {}
+        }
         settings.setJavaScriptEnabled(true);
         settings.setLoadsImagesAutomatically(true);
         settings.setBlockNetworkImage(false);
@@ -2616,6 +3763,8 @@ public final class MainActivity extends Activity implements Runnable {
     /** MHTML can read only its own provider content and cannot execute archived JavaScript. */
     private void prepareOfflineDestination(WebView target, String url) {
         if (target == null || !isOfflineUrl(url)) return;
+        removeConnectionHintScript(target);
+        clearMainFrameNavigation(target);
         applyPageAccessPolicy(target, url);
         // A cached settings key must never suppress re-applying JavaScript/image policy when the
         // user returns to the same online host.
@@ -2629,29 +3778,84 @@ public final class MainActivity extends Activity implements Runnable {
     /** Clears any offline-page state before WebView accepts an HTTP(S) main-frame request. */
     private void prepareNetworkDestination(WebView target, String url) {
         if (target == null || !isNetworkPage(url)) return;
+        prepareNetworkDestination(target, url, hostOf(url));
+    }
+
+    private void prepareNetworkDestination(WebView target, String url, String host) {
         trustedHomeViews.remove(target);
         customHomeViews.remove(target);
         applyPageAccessPolicy(target, url);
-        applySiteSettings(target, hostOf(url));
+        applySiteSettings(target, host);
+        installConnectionHintScript(target, url);
+    }
+
+    private void removeConnectionHintScript(WebView target) {
+        connectionHints.removeConnectionHintScript(target);
+    }
+
+    private void installConnectionHintScript(WebView target, String url) {
+        connectionHints.installConnectionHintScript(target, url);
+    }
+
+    private void installConnectionHintScript(WebView target, String url, boolean applyToCurrentDocument) {
+        connectionHints.installConnectionHintScript(target, url, applyToCurrentDocument);
+    }
+
+    private void collectConnectionHints(WebView source, String url, long sequence) {
+        connectionHints.collectConnectionHints(source, url, sequence);
+    }
+
+    private void clearConnectionHints() {
+        connectionHints.clearConnectionHints();
+    }
+
+    private void prepareNavigationConnections(String url) {
+        connectionHints.prepareNavigationConnections(url);
     }
 
     /** Prepares the destination settings before issuing an HTTP(S) navigation. */
     private void loadNetworkUrl(WebView target, String url) {
-        if (target == null || !isNetworkPage(url)) return;
+        clearMainFrameNavigation(target);
         String host = hostOf(url);
-        prepareNetworkDestination(target, url);
+        loadNetworkUrl(target, url, host, navigationProtectionActive(host));
+    }
+
+    private void loadNetworkUrlFromPage(WebView source, String url) {
+        String sourceHost = navigationSourceHost(source, protectedNavigationSourceDocument(source));
+        rememberAcceptedTouchNavigation(source, url, false, false);
+        loadNetworkUrl(source, url, sourceHost, navigationProtectionActive(sourceHost));
+    }
+
+    private void loadNetworkUrl(WebView target, String url, String sourceHost, boolean protectionEnabled) {
+        if (target == null || url == null) return;
+        String host = hostOf(url);
+        if (host.length() == 0 || !(url.regionMatches(true, 0, "https://", 0, 8) ||
+                url.regionMatches(true, 0, "http://", 0, 7))) return;
+
+        // Let Chromium prepare its own reusable connection while the destination's settings and
+        // navigation bookkeeping are applied. This is an origin hint for an accepted navigation.
+        prepareNavigationConnections(url);
+
+        // Mark that user has navigated when loading a network URL
+        if (target == webView && !isHomeUrl(url)) {
+            userHasNavigated = true;
+        }
+
+        rememberMainFrameNavigation(target, url, sourceHost, protectionEnabled);
+        prepareNetworkDestination(target, url, host);
         watchInitialNetworkNavigation(target, url);
         if (target == webView) {
             currentPageUrl = url;
             currentPageHost = host;
         }
+        startedPageUrls.remove(target);
         target.loadUrl(url);
     }
 
     private void watchInitialNetworkNavigation(final WebView target, String url) {
         if (target == null || target != webView || !startupReady) return;
-        try { NetworkSecurity.parseHttpUrl(url); }
-        catch (Exception invalid) { return; }
+        // Every caller has already accepted an HTTP(S) main-frame destination. Re-parsing it into
+        // java.net.URL here only allocates on the first-navigation path and cannot make loadUrl safer.
         InitialNavigationGuard guard = initialNavigationGuards.get(target);
         if (guard == null) {
             InitialNavigationGuard created = new InitialNavigationGuard();
@@ -2661,6 +3865,9 @@ public final class MainActivity extends Activity implements Runnable {
         long generation = guard.arm(url);
         if (generation != 0L) {
             if (startupNavigationAt == 0L) startupNavigationAt = SystemClock.elapsedRealtime();
+            // A cold Chromium provider can spend a short interval before it dispatches
+            // onPageStarted. Recovery remains bounded, while startedPageUrls prevents a second
+            // socket once the provider has accepted the request.
             scheduleInitialNavigationRetry(target, generation, INITIAL_NAVIGATION_ACK_MS);
         }
     }
@@ -2672,6 +3879,30 @@ public final class MainActivity extends Activity implements Runnable {
                 if (activityDestroyed || target != webView) return;
                 InitialNavigationGuard guard = initialNavigationGuards.get(target);
                 if (guard == null || guard.pendingGeneration() != generation || !activityResumed) return;
+                // onPageStarted means the provider accepted the document, but it can remain at
+                // the initial 10% progress for a slow origin. Reloading an already-started page
+                // here creates a second connection and is the main source of cold-start stalls.
+                if (startedPageUrls.get(target) != null) return;
+                String providerUrl = target.getUrl();
+                if (target.getProgress() > 10 && providerUrl != null &&
+                        providerUrl.equals(currentPageUrl) && isNetworkPage(providerUrl)) {
+                    // Some WebView versions update getUrl() before dispatching onPageStarted.
+                    // Treat that state as an acknowledgement instead of issuing a duplicate
+                    // socket request during the cold provider window.
+                    if (guard.acknowledge(providerUrl))
+                        recordStartupNavigation("首航已接受", providerUrl);
+                    return;
+                }
+                // Several System WebView builds publish the destination URL before their first
+                // progress callback. That is already an accepted navigation; reloading it here
+                // creates a second socket and can make a cold page appear to take several
+                // seconds. Retire the watchdog and let the provider finish its queued request.
+                if (providerUrl != null && providerUrl.equals(currentPageUrl) &&
+                        isNetworkPage(providerUrl)) {
+                    if (guard.acknowledge(providerUrl))
+                        recordStartupNavigation("首航已接受", providerUrl);
+                    return;
+                }
                 if (!target.isAttachedToWindow()) {
                     scheduleInitialNavigationRetry(target, generation, 220L);
                     return;
@@ -2679,10 +3910,12 @@ public final class MainActivity extends Activity implements Runnable {
                 String retryUrl = guard.claimRetry(generation);
                 if (retryUrl.length() == 0) return;
                 recordStartupNavigation("首航重载", retryUrl);
-                prepareNetworkDestination(target, retryUrl);
+                String retryHost = hostOf(retryUrl);
+                clearMainFrameNavigation(target);
+                prepareNetworkDestination(target, retryUrl, retryHost);
                 currentPageUrl = retryUrl;
-                currentPageHost = hostOf(retryUrl);
-                if (retryUrl.equals(target.getUrl())) target.reload();
+                currentPageHost = retryHost;
+                if (retryUrl.equals(target.getUrl())) reloadWebView(target);
                 else target.loadUrl(retryUrl);
             }
         }, Math.max(0L, delayMs));
@@ -2697,7 +3930,8 @@ public final class MainActivity extends Activity implements Runnable {
         String report = result + "\n就绪：" + Math.max(0L, startupReadyAt - startupStartedAt) +
                 " ms · 首次导航：" + Math.max(0L, startupNavigationAt - startupStartedAt) +
                 " ms · 当前：" + Math.max(0L, now - startupStartedAt) + " ms\n目标站点：" +
-                hostOf(url) + "\nSystem WebView：" + webViewVersion;
+                hostOf(url) + "\nSystem WebView：" + webViewVersion + "\n引擎准备：" + webViewStartupDiagnostic +
+                "\n连接准备：" + WebViewNavigationWarmupCompat.getDiagnosticReport();
         prefs.edit().putString(PREF_STARTUP_DIAGNOSTIC, report).apply();
     }
 
@@ -2707,6 +3941,7 @@ public final class MainActivity extends Activity implements Runnable {
             pendingStartupInput = input;
             return;
         }
+        startupSessionPending = false;
         String text = input.trim();
         if (text.length() == 0) return;
         boolean explicitHttp = OmniboxInput.isExplicitHttpUrl(text);
@@ -2714,12 +3949,13 @@ public final class MainActivity extends Activity implements Runnable {
             try { text = NetworkSecurity.parseHttpUrl(text).toString(); }
             catch (Exception invalidUrl) { toast("网页地址无效"); return; }
         }
-        if (text.startsWith("http://") && shouldUpgradeHttp(text)) text = "https://" + text.substring(7);
+        if (shouldUpgradeHttp(text)) text = "https://" + text.substring(7);
         if (explicitHttp || "about:blank".equals(text)) {
             if (explicitHttp) {
                 if (shouldCleanTracking(hostOf(text))) text = UrlCleaner.cleanTracking(text);
                 loadNetworkUrl(webView, text);
             } else {
+                clearMainFrameNavigation(webView);
                 trustedHomeViews.remove(webView);
                 customHomeViews.remove(webView);
                 applyPageAccessPolicy(webView, text);
@@ -2749,6 +3985,11 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showHome() {
+        showHome(false);
+    }
+
+    /** Renders the local home page, optionally resetting stale themed history. */
+    private void showHome(boolean resetHistory) {
         if (webView == null) return;
         prepareHomeDestination(webView);
         currentPageUrl = HOME_URL;
@@ -2764,15 +4005,33 @@ public final class MainActivity extends Activity implements Runnable {
                 isHomeUrl(webView.getUrl()) && trustedHomeViews.contains(webView);
         if (!alreadyRendered) {
             if (!renderKey.equals(cachedHomeKey)) {
-                cachedHomeHtml = HomePage.html(searchEngine, bookmarks, nightMode, HOME_TOKEN, config,
+                cachedHomeHtml = HomePage.html(searchEngine, bookmarks, nightMode, homeToken(), config,
                         searchEngines.customEngines(), shortcuts);
                 cachedHomeKey = renderKey;
             }
             renderedHomeKeys.put(webView, renderKey);
+
+            if (resetHistory) {
+                // A theme switch rebuilds the local document. WebView otherwise keeps the
+                // previous themed home entry in its back stack, so an edge-back immediately
+                // after the switch resurrects the old black/white document behind the new
+                // native chrome. Only that explicit transition resets history; ordinary home
+                // refreshes keep the user's navigation stack intact.
+                try {
+                    webView.stopLoading();
+                    webView.clearHistory();
+                } catch (RuntimeException ignored) {
+                }
+            }
+            // A null history URL becomes about:blank. On back, the visible home still has
+            // its search form but fails the native home-origin check, so commands are lost.
             webView.loadDataWithBaseURL(HOME_URL, cachedHomeHtml, "text/html", "UTF-8", HOME_URL);
         }
+        // Optional icon downloads are best-effort and never part of the render critical path.
+        if (startupReady) scheduleHomeFaviconPrefetch(webView, shortcuts, renderKey);
         currentPageHost = "";
         if (webView != null) pageHosts.put(webView, "");
+        homeThemeRepairPending = false;
         updateCurrentTab(HOME_URL, "主页");
         requestChromeUpdate();
     }
@@ -2792,6 +4051,46 @@ public final class MainActivity extends Activity implements Runnable {
             }
         });
         return result;
+    }
+
+    /** Favicon downloads are deliberately lazy and bounded so opening the home page never waits. */
+    private void scheduleHomeFaviconPrefetch(final WebView target, List<HomePage.Shortcut> shortcuts,
+                                             final String renderKey) {
+        if (target == null || shortcuts == null || favicons == null || scriptNetworkExecutor == null ||
+                scriptNetworkExecutor.isShutdown() || activityDestroyed) return;
+        int scheduled = 0;
+        for (HomePage.Shortcut item : shortcuts) {
+            if (scheduled >= 12) break;
+            if (item == null || item.folder) continue;
+            final String host = HomePage.faviconHostForUrl(item.url);
+            if (host.length() == 0 || favicons.has(host) || !faviconFetchQueued.add(host)) continue;
+            scheduled++;
+            if (!executeTask(scriptNetworkExecutor, new Runnable() {
+                @Override public void run() {
+                    boolean stored = false;
+                    try { stored = favicons.fetchAndStore(host); }
+                    finally { faviconFetchQueued.remove(host); }
+                    if (!stored || activityDestroyed) return;
+                    uiHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (activityDestroyed || target != webView || !isHomeUrl(target.getUrl()) ||
+                                    !trustedHomeViews.contains(target) ||
+                                    !renderKey.equals(renderedHomeKeys.get(target))) return;
+                            refreshHomeFavicon(target, host);
+                        }
+                    });
+                }
+            })) faviconFetchQueued.remove(host);
+        }
+    }
+
+    private void refreshHomeFavicon(WebView target, String host) {
+        if (target == null || host == null || host.length() == 0) return;
+        String script = "(function(h){var a=document.querySelectorAll('img[data-favicon-host]'),i,x,f;" +
+                "for(i=0;i<a.length;i++){x=a[i];if(x.getAttribute('data-favicon-host')===h){" +
+                "x.hidden=false;x.src='/favicon?host='+encodeURIComponent(h)+'&v=1';" +
+                "f=x.nextElementSibling;if(f)f.hidden=true;}}})(" + JSONObject.quote(host) + ");";
+        try { target.evaluateJavascript(script, null); } catch (RuntimeException ignored) {}
     }
 
     private String homeRenderKey(HomePageConfig value, List<HomePage.Shortcut> shortcuts) {
@@ -2821,6 +4120,29 @@ public final class MainActivity extends Activity implements Runnable {
                     .append(item.title).append('\u001f').append(item.url);
         }
         return key.toString();
+    }
+
+    private boolean isHomeRenderCurrent(WebView view) {
+        if (view == null) return false;
+        String rendered = renderedHomeKeys.get(view);
+        if (rendered == null) return false;
+        List<BrowserDataStore.Bookmark> bookmarks = dataStore == null
+                ? Collections.<BrowserDataStore.Bookmark>emptyList() : dataStore.bookmarks();
+        return rendered.equals(homeRenderKey(homePageConfig(), homeShortcuts(bookmarks)));
+    }
+
+    private void scheduleRestoredHomeRepair(final WebView target) {
+        if (target == null || target != webView || activityDestroyed) return;
+        Runnable repair = new Runnable() {
+            @Override public void run() {
+                if (activityDestroyed || webView != target || !isHomeUrl(target.getUrl())) return;
+                verifyTrustedHome(target);
+                if (!homeThemeRepairPending && isHomeRenderCurrent(target)) return;
+                showHome(true);
+            }
+        };
+        target.postDelayed(repair, 180L);
+        target.postDelayed(repair, 520L);
     }
 
     private HomePageConfig homePageConfig() {
@@ -2867,12 +4189,19 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void verifyTrustedHome(final WebView view) {
-        if (view == null) return;
+        if (view == null || activityDestroyed || tabForView(view) == null) return;
         String probe = "(function(){var m=document.querySelector('meta[name=median-home-token]');return !!m&&m.content===" +
-                JSONObject.quote(HOME_TOKEN) + ";})();";
+                JSONObject.quote(homeToken()) + ";})();";
         view.evaluateJavascript(probe, new ValueCallback<String>() {
             @Override public void onReceiveValue(String value) {
                 try {
+                    // The renderer may finish the probe after this tab was switched, frozen,
+                    // or closed. Ignore that result instead of resurrecting a stale trusted view.
+                    if (activityDestroyed || tabForView(view) == null) {
+                        trustedHomeViews.remove(view);
+                        customHomeViews.remove(view);
+                        return;
+                    }
                     if ("true".equals(value) && isHomeUrl(view.getUrl())) {
                         trustedHomeViews.add(view);
                         if (homePageConfig().customHtmlEnabled) customHomeViews.add(view);
@@ -2890,13 +4219,13 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void schedulePageEnhancements(final String url, final long sequence) {
-        if (url == null || isHomeUrl(url) || url.startsWith("about:") || url.startsWith("data:")) return;
-        boolean directNetwork = MODE_PERFORMANCE.equals(performanceMode) && performanceNetworkDirect;
+        if (!isNetworkPage(url)) return;
         final WebView target = webView;
         final boolean ensureScripts = scriptStore != null && scriptStore.hasEnabledScripts();
         final String bridgeToken = target == null || scriptBridgeTokens.get(target) == null ? "" :
                 scriptBridgeTokens.get(target);
-        if ((!isAdBlockActive(url) || directNetwork) && !ensureScripts) return;
+        // Cosmetic CSS has its own document-scoped path; this worker only prepares userscripts.
+        if (!ensureScripts) return;
         navigationExecutor.execute(new Runnable() {
             @Override public void run() {
                 if (sequence != navigationSequence) return;
@@ -2984,78 +4313,366 @@ public final class MainActivity extends Activity implements Runnable {
         return null;
     }
 
+    private void startAdPicker() {
+        if (webView == null || !isNetworkPage(currentPageUrl) || currentHost().length() == 0) {
+            toast("请先打开要标记广告的网页");
+            return;
+        }
+        if (!validAdPickerHost(currentHost())) {
+            toast("当前地址无法创建仅限本站的广告规则");
+            return;
+        }
+        if (!isAdBlockActiveForHost(currentHost())) {
+            toast("请先开启当前网站的广告拦截");
+            return;
+        }
+        dismissOverlayForNavigation();
+        final WebView source = webView;
+        final AdPickerSession session = new AdPickerSession(source.getUrl());
+        adPickerSessions.put(source, session);
+        adPickerViews.add(source);
+        try {
+            source.evaluateJavascript(AdPickerScript.build(adPickToken()), new ValueCallback<String>() {
+                @Override public void onReceiveValue(String result) {
+                    if (adPickerSessions.get(source) != session) return;
+                    if (!"true".equals(result)) {
+                        finishAdPickerSession(source, session);
+                        if (!"false".equals(result)) toast("当前页面无法进入广告标记模式");
+                    }
+                }
+            });
+            source.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
+        } catch (RuntimeException error) {
+            finishAdPickerSession(source, session);
+            toast("当前页面无法进入广告标记模式");
+        }
+    }
+
+    private boolean isAdPickerSessionCurrent(WebView source, AdPickerSession session) {
+        return !activityDestroyed && source != null && source == webView && session != null &&
+                adPickerSessions.get(source) == session &&
+                session.documentUrl.equals(navigationDocumentUrl(source.getUrl()));
+    }
+
+    private void finishAdPickerSession(WebView source, AdPickerSession session) {
+        if (source == null || session == null || !adPickerSessions.remove(source, session)) return;
+        adPickerViews.remove(source);
+        try { source.evaluateJavascript("if(window.__medianAdPicker)window.__medianAdPicker.cancel();delete window.__medianAdSelection;", null); }
+        catch (RuntimeException ignored) {}
+    }
+
+    private boolean handleAdPickerPrompt(final WebView source, String message, String value,
+                                         JsPromptResult result) {
+        if (!adPickToken().equals(message)) return false;
+        final AdPickerSession session = source == null ? null : adPickerSessions.get(source);
+        boolean accepted = result != null && isAdPickerSessionCurrent(source, session) &&
+                adPickerViews.remove(source) && isNetworkPage(source.getUrl());
+        if (result != null) result.confirm("");
+        if (!accepted) { finishAdPickerSession(source, session); return true; }
+        try {
+            JSONObject picked = new JSONObject(value == null ? "{}" : value);
+            if (picked.optBoolean("cancel", false)) { finishAdPickerSession(source, session); return true; }
+            final String selector = picked.optString("selector", "").trim();
+            final String label = picked.optString("text", "").trim();
+            final String host = hostOf(source.getUrl());
+            if (!validAdPickerHost(host)) {
+                toast("无法为这个元素生成稳定规则");
+                finishAdPickerSession(source, session);
+                return true;
+            }
+            if (picked.optBoolean("manual", false)) {
+                showManualAdPickerDialog(source, host, session);
+                return true;
+            }
+            if (selector.length() == 0 || selector.length() > 512 ||
+                    selector.indexOf('\n') >= 0 || selector.indexOf('\r') >= 0) {
+                toast("无法为这个元素生成稳定规则");
+                finishAdPickerSession(source, session);
+                return true;
+            }
+            validateAdPickerSelector(source, host, selector, label, true, session);
+        } catch (Exception error) {
+            finishAdPickerSession(source, session);
+            toast("无法读取广告标记结果");
+        }
+        return true;
+    }
+
+    private void showManualAdPickerDialog(final WebView source, final String host, final AdPickerSession session) {
+        if (!isAdPickerSessionCurrent(source, session)) { finishAdPickerSession(source, session); return; }
+        final boolean[] advancing = { false };
+        final EditText input = new EditText(this);
+        input.setSingleLine(true);
+        input.setTextSize(15f);
+        input.setHint("例如：.ad-banner 或 #sponsor");
+        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        input.setPadding(dp(14), dp(10), dp(14), dp(10));
+        input.setTextColor(nightMode ? DARK_TEXT : TEXT);
+        input.setHintTextColor(nightMode ? DARK_MUTED : MUTED);
+        input.setBackground(roundRect(nightMode ? DARK_SURFACE : SURFACE, 10));
+        final AlertDialog dialog = new AlertDialog.Builder(this,
+                nightMode ? R.style.MedianAlertDialogDark : R.style.MedianAlertDialogLight)
+                .setTitle("手动输入 CSS 选择器")
+                .setMessage("适用于选择器无法自动生成的页面。先检查匹配数量，再保存为本站规则。")
+                .setView(input)
+                .setPositiveButton("检查并继续", null)
+                .setNegativeButton("取消", null)
+                .create();
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface ignored) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) {
+                        String selector = input.getText().toString().trim();
+                        if (selector.length() == 0 || selector.length() > 512 ||
+                                selector.indexOf('\n') >= 0 || selector.indexOf('\r') >= 0) {
+                            input.setError("请输入 1-512 个字符的一行 CSS 选择器");
+                            return;
+                        }
+                        advancing[0] = true;
+                        dialog.dismiss();
+                        validateAdPickerSelector(source, host, selector, "手动选择器", false, session);
+                    }
+                });
+            }
+        });
+        dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface ignored) {
+                if (!advancing[0]) finishAdPickerSession(source, session);
+            }
+        });
+        dialog.show();
+    }
+
+    private void validateAdPickerSelector(final WebView source, final String host,
+                                          final String selector, final String label,
+                                          final boolean requirePickedIdentity, final AdPickerSession session) {
+        if (!isAdPickerSessionCurrent(source, session)) { finishAdPickerSession(source, session); return; }
+        try {
+            source.evaluateJavascript(AdPickerScript.validate(selector, requirePickedIdentity), new ValueCallback<String>() {
+                @Override public void onReceiveValue(String rawCount) {
+                    if (!isAdPickerSessionCurrent(source, session)) { finishAdPickerSession(source, session); return; }
+                    int count = parseJavascriptInt(rawCount);
+                    if (count < 1) {
+                        finishAdPickerSession(source, session);
+                        toast(count < 0 ? "CSS 选择器无效，请重新输入" :
+                                (requirePickedIdentity ? "页面元素已经变化，请重新选择" : "没有匹配元素或匹配超过 200 个，请输入更具体的规则"));
+                        return;
+                    }
+                    // A broad manual selector is useful, but cap it so an accidental `div` or
+                    // `*` cannot turn one tap into a page-wide blank screen.
+                    if (count > 200) {
+                        finishAdPickerSession(source, session);
+                        toast("选择器匹配了 " + count + " 个元素，请输入更具体的规则");
+                        return;
+                    }
+                    confirmAdPickerRule(source, host, selector, label, count, requirePickedIdentity, session);
+                }
+            });
+        } catch (RuntimeException error) {
+            finishAdPickerSession(source, session);
+            toast("当前页面无法检查这个选择器");
+        }
+    }
+
+    private static int parseJavascriptInt(String raw) {
+        if (raw == null) return -1;
+        try { return Integer.parseInt(raw.trim()); }
+        catch (NumberFormatException ignored) { return -1; }
+    }
+
+    private boolean validAdPickerHost(String host) {
+        if (host == null || host.length() == 0 || host.length() > 253 ||
+                "median.invalid".equalsIgnoreCase(host)) return false;
+        for (int i = 0; i < host.length(); i++) {
+            char c = host.charAt(i);
+            if (!(Character.isLetterOrDigit(c) || c == '.' || c == '-' || c == '_' || c == ':')) return false;
+        }
+        return true;
+    }
+
+    private void confirmAdPickerRule(final WebView source, final String host, final String selector,
+                                     String label, int matchCount, final boolean requirePickedIdentity,
+                                     final AdPickerSession session) {
+        String preview = label.length() == 0 ? "已选中的页面元素" : label;
+        preview = UiText.ellipsize(preview, 80);
+        final boolean[] saving = { false };
+        AlertDialog confirmation = new AlertDialog.Builder(this,
+                nightMode ? R.style.MedianAlertDialogDark : R.style.MedianAlertDialogLight)
+                .setTitle("将此元素标记为广告？")
+                .setMessage(preview + "\n\n规则：" + host + "##" + selector +
+                        "\n\n当前匹配 " + matchCount + " 个元素。规则只作用于当前网站，可随时在过滤器中心编辑。")
+                .setPositiveButton("标记并隐藏", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) {
+                        if (!isAdPickerSessionCurrent(source, session)) {
+                            toast("页面已经变化，请重新选择广告元素");
+                            finishAdPickerSession(source, session);
+                            return;
+                        }
+                        saving[0] = true;
+                        try {
+                            source.evaluateJavascript(AdPickerScript.hide(selector, requirePickedIdentity), new ValueCallback<String>() {
+                                @Override public void onReceiveValue(String rawCount) {
+                                    boolean current = isAdPickerSessionCurrent(source, session);
+                                    finishAdPickerSession(source, session);
+                                    if (!current) return;
+                                    int hidden = parseJavascriptInt(rawCount);
+                                    if (hidden < 1 || hidden > 200) {
+                                        toast("页面元素已经变化，请重新选择广告元素");
+                                        return;
+                                    }
+                                    if (!appendCustomFilterRule(host + "##" + selector)) {
+                                        toast("当前已隐藏，但规则未保存，请清理过多的自定义规则后重试");
+                                        return;
+                                    }
+                                    rebuildAdBlockRulesAsync(false);
+                                    toast("已隐藏 " + hidden + " 个元素，本站规则已保存");
+                                }
+                            });
+                        } catch (RuntimeException error) {
+                            finishAdPickerSession(source, session);
+                            toast("当前页面无法执行隐藏，请重新选择");
+                        }
+                    }
+                })
+                .setNegativeButton("取消", null)
+                .create();
+        confirmation.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface ignored) {
+                if (!saving[0]) finishAdPickerSession(source, session);
+            }
+        });
+        confirmation.show();
+    }
+
+    private boolean appendCustomFilterRule(String rule) {
+        String raw = prefs.getString("custom_filter_rules", "");
+        String[] lines = raw.split("\\r?\\n");
+        for (String line : lines) {
+            if (rule.equals(line.trim())) {
+                return true;
+            }
+        }
+        String next = raw.trim().length() == 0 ? rule : raw.replaceFirst("\\s+$", "") + "\n" + rule;
+        if (next.getBytes(StandardCharsets.UTF_8).length > 256 * 1024) {
+            toast("自定义规则已达到 256 KB 上限");
+            return false;
+        }
+        prefs.edit().putString("custom_filter_rules", next).apply();
+        return true;
+    }
+
     private void showProtectionPanel() {
+        showProtectionPanel(null);
+    }
+
+    private void showProtectionPanel(final Runnable backAction) {
         if (!requireStartupReady()) return;
         final String host = currentHost();
         final String matchedException = matchingSiteException(host);
         final boolean sitePaused = host.length() > 0 && matchedException != null;
-        final boolean directNetwork = MODE_PERFORMANCE.equals(performanceMode) && performanceNetworkDirect;
+        final boolean blockingActive = adBlockEnabled;
         int pageBlocked = Math.max(0, adBlock.getBlockedCount() - blockedAtPageStart);
-        String subtitle = host.length() == 0 ? "当前为主页" : host + " · 本页拦截 " + pageBlocked + " 项";
+        String subtitle = host.length() == 0 ? "当前为主页" : host + (blockingActive ? " · 本页拦截 " + pageBlocked + " 项" : " · 广告拦截当前未开启");
         String[] items = new String[] {
-                "全局广告拦截：" + (adBlockEnabled ? (directNetwork ? "已暂停 · 性能优先" : "已开启") : "已关闭"),
-                host.length() == 0 ? "当前页面没有站点设置" : (sitePaused ? "恢复此网站拦截" : "暂停此网站拦截"),
-                "过滤器中心 · 已启用 " + services.filters().enabledCount() + " 个订阅",
+                "全局广告拦截：" + (adBlockEnabled ? "已开启" : "已关闭"),
+                host.length() == 0 ? "当前页面没有站点设置" : (!blockingActive ? "此网站拦截：全局拦截未开启" : (sitePaused ? "恢复此网站拦截" : "暂停此网站拦截")),
+                host.length() == 0 ? "当前页面无法标记广告\n请先打开普通网页" :
+                        "标记页面广告\n点选元素并生成当前网站隐藏规则",
+                "过滤器中心 · 已加载 " + services.filters().enabledCount() + " 个订阅" + (blockingActive ? "" : "（未参与拦截）"),
                 "用户脚本 · 已启用 " + enabledScriptCount() + " 个",
                 "浏览适用于当前网站的脚本",
                 "自定义拦截规则"
         };
-        int[] icons = new int[] { BrowserIconView.SHIELD, BrowserIconView.SHIELD, BrowserIconView.STORAGE, BrowserIconView.SCRIPT, BrowserIconView.SEARCH, BrowserIconView.STORAGE };
-        showActionSheet("保护与脚本", subtitle, items, icons, new SheetHandler() {
+        int[] icons = new int[] { BrowserIconView.SHIELD, BrowserIconView.SHIELD,
+                BrowserIconView.CLEAN, BrowserIconView.STORAGE, BrowserIconView.SCRIPT,
+                BrowserIconView.SEARCH, BrowserIconView.STORAGE };
+        int[] kinds = new int[] {
+                adBlockEnabled ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                host.length() == 0 || !blockingActive ? SHEET_ROW_ACTION :
+                        (sitePaused ? SHEET_ROW_TOGGLE_OFF : SHEET_ROW_TOGGLE_ON),
+                SHEET_ROW_ACTION, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
+                SHEET_ROW_ACTION, SHEET_ROW_NAVIGATE
+        };
+        showActionSheet("保护与脚本", subtitle, items, icons, kinds, null, backAction, new SheetHandler() {
             @Override public void onItem(int which) {
                 if (which == 0) {
                     adBlockEnabled = !adBlockEnabled;
                     prefs.edit().putBoolean("adblock", adBlockEnabled).apply();
                     adBlockActiveByView.clear();
-                    webView.reload();
-                } else if (which == 1 && host.length() > 0) {
+                    dismissOverlayForNavigation();
+                    if (webView != null && isNetworkPage(currentPageUrl)) reloadWebView(webView);
+                    showProtectionPanel(backAction);
+                } else if (which == 1 && host.length() > 0 && blockingActive) {
                     HashSet<String> updated = new HashSet<String>(siteExceptions);
                     if (matchedException != null) updated.remove(matchedException); else updated.add(host);
                     siteExceptions = updated;
                     prefs.edit().putStringSet("site_exceptions", new HashSet<String>(updated)).apply();
                     adBlockActiveByView.clear();
-                    webView.reload();
+                    dismissOverlayForNavigation();
+                    if (webView != null && isNetworkPage(currentPageUrl)) reloadWebView(webView);
+                    showProtectionPanel(backAction);
+                } else if (which == 1) {
+                    toast(host.length() == 0 ? "打开网页后才能设置站点例外" : "请先开启全局广告拦截");
+                    showProtectionPanel(backAction);
                 } else if (which == 2) {
-                    showFilterCenter();
+                    if (host.length() == 0) {
+                        toast("请先打开普通网页再标记广告");
+                        showProtectionPanel(backAction);
+                    } else startAdPicker();
                 } else if (which == 3) {
-                    showScriptCenter();
+                    showFilterCenter(new Runnable() {
+                        @Override public void run() { showProtectionPanel(backAction); }
+                    });
                 } else if (which == 4) {
+                    showScriptCenter(new Runnable() {
+                        @Override public void run() { showProtectionPanel(backAction); }
+                    });
+                } else if (which == 5) {
                     String target = host.length() == 0 ? "https://greasyfork.org/zh-CN/scripts" : "https://greasyfork.org/zh-CN/scripts/by-site/" + host;
                     loadNetworkUrl(webView, target);
-                } else if (which == 5) {
-                    showCustomFilterRules();
+                } else if (which == 6) {
+                    showCustomFilterRules(new Runnable() {
+                        @Override public void run() { showProtectionPanel(backAction); }
+                    });
                 }
             }
         });
     }
 
-    private void rebuildAdBlockRules() {
-        List<String> sources = services.filters().readEnabledRuleSources();
-        adBlock.updateRules(prefs.getString("custom_filter_rules", ""), sources);
+    private void rebuildAdBlockRulesAsync(final boolean notifyUser) {
+        if (!activityDestroyed) adBlockRuleLoader.request(!startupReady, notifyUser);
     }
 
-    private void rebuildAdBlockRulesAsync(final boolean notifyUser) {
-        if (scriptExecutor == null || scriptExecutor.isShutdown()) {
-            rebuildAdBlockRules();
-            return;
+    /** Rule loader dispatches only current-generation results on the UI thread. */
+    private void onAdBlockRulesLoaded(final boolean notifyUser) {
+        if (!startupCustomRulesReady) {
+            startupCustomRulesReady = true;
+            startupReadiness.set(StartupReadiness.FILTERS, true);
+            maybeStartFastStartup();
+            maybeCompleteStartup();
         }
-        executeTask(scriptExecutor, new Runnable() {
-            @Override public void run() {
-                try { Process.setThreadPriority(scriptThreadPriority()); } catch (RuntimeException ignored) {}
-                rebuildAdBlockRules();
-                final AdBlockEngine.Stats stats = adBlock.getStats();
-                if (notifyUser) uiHandler.post(new Runnable() {
-                    @Override public void run() {
-                        toast("过滤器已编译：" + stats.networkRules + " 条网络规则、" + stats.cosmeticRules + " 条外观规则");
-                        if (webView != null) webView.reload();
-                    }
-                });
-            }
-        });
+        refreshCosmeticFilters();
+        if (notifyUser) {
+            AdBlockEngine.Stats stats = adBlock.getStats();
+            toast("过滤器已编译：" + stats.networkRules + " 条网络规则、" + stats.cosmeticRules + " 条外观规则");
+            if (webView != null) reloadWebView(webView);
+        }
+    }
+
+    private void onAdBlockRulesLoadFailed() {
+        // Keep the last published rules and release the startup gate on an explicit failure.
+        startupCustomRulesReady = true;
+        startupReadiness.set(StartupReadiness.FILTERS, true);
+        toast("本地过滤规则未能加载，已保留现有保护，请稍后重试");
+        maybeStartFastStartup();
+        maybeCompleteStartup();
     }
 
     private void updateFilterSubscriptions(final boolean automatic) {
-        if (filterUpdateInProgress) return;
+        if (filterUpdateInProgress) {
+            if (!automatic) toast("过滤订阅正在更新，无需重复操作");
+            return;
+        }
         filterUpdateInProgress = true;
         if (!automatic) toast("正在更新过滤订阅…");
         services.filters().updateEnabled(automatic, new FilterSubscriptionStore.Callback() {
@@ -3065,7 +4682,7 @@ public final class MainActivity extends Activity implements Runnable {
                 if (!automatic) {
                     String result = "订阅更新完成：" + updated + " 个更新，" + unchanged + " 个未变化";
                     if (failed > 0) result += "，" + failed + " 个失败" + (message.length() == 0 ? "" : "（" + message + "）");
-                    if (updated > 0) result += "；新外观规则在下次刷新完整生效";
+                    if (updated > 0) result += "；外观规则已更新";
                     toast(result);
                 }
             }
@@ -3073,6 +4690,11 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showFilterCenter() {
+        showFilterCenter(filterCenterBackAction);
+    }
+
+    private void showFilterCenter(final Runnable backAction) {
+        filterCenterBackAction = backAction;
         final List<FilterSubscriptionStore.Subscription> subscriptions = services.filters().getAll();
         final AdBlockEngine.Stats stats = adBlock.getStats();
         String[] items = new String[subscriptions.size() + 4];
@@ -3088,9 +4710,13 @@ public final class MainActivity extends Activity implements Runnable {
         }
         items[items.length - 1] = "过滤诊断 · " + stats.networkRules + " 条网络 / " + stats.cosmeticRules + " 条外观规则";
         for (int i = 0; i < icons.length; i++) icons[i] = i == 1 ? BrowserIconView.PLUS : (i == items.length - 1 ? BrowserIconView.INFO : BrowserIconView.SHIELD);
-        showActionSheet("过滤器中心", "EasyList 兼容子集 · HTTPS 更新 · ETag 缓存 · 原子替换", items, icons, new SheetHandler() {
+        showActionSheet("过滤器中心", "HTTPS 订阅与本地规则",
+                items, icons, null, null, backAction, new SheetHandler() {
             @Override public void onItem(int which) {
-                if (which == 0) updateFilterSubscriptions(false);
+                if (which == 0) {
+                    updateFilterSubscriptions(false);
+                    showFilterCenter();
+                }
                 else if (which == 1) showAddFilterSubscription();
                 else if (which == 2) showCustomFilterRules();
                 else if (which == subscriptions.size() + 3) showFilterDiagnostics();
@@ -3110,20 +4736,43 @@ public final class MainActivity extends Activity implements Runnable {
         int[] icons = custom
                 ? new int[] { BrowserIconView.SHIELD, BrowserIconView.RELOAD, BrowserIconView.CLOSE }
                 : new int[] { BrowserIconView.SHIELD, BrowserIconView.RELOAD };
+        int[] kinds = custom
+                ? new int[] { item.enabled ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                        SHEET_ROW_ACTION, SHEET_ROW_ACTION }
+                : new int[] { item.enabled ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                        SHEET_ROW_ACTION };
         String subtitle = item.url + (item.error.length() == 0 ? "" : "\n上次错误：" + item.error);
-        showActionSheet(item.name, subtitle, actions, icons, new SheetHandler() {
+        showActionSheet(item.name, subtitle, actions, icons, kinds, null,
+                new Runnable() { @Override public void run() { showFilterCenter(); } }, new SheetHandler() {
             @Override public void onItem(int which) {
                 if (which == 0) {
+                    dismissOverlayForNavigation();
                     services.filters().setEnabled(item.id, !item.enabled);
                     rebuildAdBlockRulesAsync(true);
+                    showFilterCenter();
                 } else if (which == 1) {
                     updateFilterSubscriptions(false);
+                    showFilterCenter();
                 } else {
-                    services.filters().remove(item.id);
-                    rebuildAdBlockRulesAsync(true);
+                    confirmDeleteFilterSubscription(item);
                 }
             }
         });
+    }
+
+    private void confirmDeleteFilterSubscription(final FilterSubscriptionStore.Subscription item) {
+        final SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { showFilterSubscriptionActions(item); }
+        });
+        new AlertDialog.Builder(this).setTitle("删除过滤订阅？")
+                .setMessage(item.name + "\n" + item.url)
+                .setPositiveButton("删除", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) {
+                        services.filters().remove(item.id);
+                        rebuildAdBlockRulesAsync(true);
+                        showFilterCenter();
+                    }
+                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
     }
 
     private void showAddFilterSubscription() {
@@ -3139,32 +4788,57 @@ public final class MainActivity extends Activity implements Runnable {
         content.setPadding(dp(18), 0, dp(18), 0);
         content.addView(name);
         content.addView(url);
-        new AlertDialog.Builder(this).setTitle("添加过滤订阅")
-                .setMessage("仅接受 HTTPS 文本规则列表。单个订阅上限 12 MB，更新会验证内容后原子替换。")
-                .setView(content).setPositiveButton("添加并更新", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
+        final AlertDialog dialog = new AlertDialog.Builder(this).setTitle("添加过滤订阅")
+                .setMessage("仅接受 HTTPS 文本规则，单个订阅上限 12 MB。")
+                .setView(content).setPositiveButton("添加并更新", null)
+                .setNegativeButton("取消", null).create();
+        dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface ignored) { showFilterCenter(); }
+        });
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface ignored) {
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) { dialog.dismiss(); showFilterCenter(); }
+                });
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) {
                         try {
                             services.filters().add(name.getText().toString(), url.getText().toString().trim());
+                            dialog.dismiss();
+                            showFilterCenter();
                             updateFilterSubscriptions(false);
-                        } catch (Exception e) { toast("添加失败：" + safeMessage(e)); }
+                        } catch (Exception e) { url.setError(safeMessage(e)); }
                     }
-                }).setNegativeButton("取消", null).show();
+                });
+            }
+        });
+        dialog.show();
     }
 
     private void showFilterDiagnostics() {
         AdBlockEngine.Stats stats = adBlock.getStats();
+        SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { showFilterCenter(); }
+        });
         new AlertDialog.Builder(this).setTitle("过滤诊断")
                 .setMessage("已编译网络规则：" + stats.networkRules +
                         "\n已编译外观规则：" + stats.cosmeticRules +
                         "\n读取源文件行数：" + stats.sourceLines +
+                        "\n容量状态：" + (stats.capacityLimited ? "部分规则因安全上限未载入" : "全部位于安全上限内") +
                         "\n本次运行检查请求：" + stats.inspectedRequests +
                         "\n已拦截请求：" + stats.blockedRequests +
                         "\n例外放行请求：" + stats.allowedRequests +
-                        "\n\n支持 hosts、||域名^、@@、通配符、domain=、third-party、常见资源类型和 ## / #@#。出于安全与 WebView 兼容性，不执行过滤列表中的任意脚本片段。")
-                .setPositiveButton("确定", null).show();
+                        "\n\n支持 hosts、ABP 网络规则和 ## / #@# 外观规则；不执行列表中的脚本。")
+                .setPositiveButton("确定", back).setOnCancelListener(back).show();
     }
 
     private void showCustomFilterRules() {
+        showCustomFilterRules(new Runnable() {
+            @Override public void run() { showFilterCenter(); }
+        });
+    }
+
+    private void showCustomFilterRules(final Runnable returnAction) {
         final EditText input = new EditText(this);
         input.setText(prefs.getString("custom_filter_rules", ""));
         input.setHint("每行一条，例如：\n||ads.example.com^\n@@||trusted.example.com^");
@@ -3173,79 +4847,437 @@ public final class MainActivity extends Activity implements Runnable {
         input.setMaxLines(14);
         input.setHorizontallyScrolling(false);
         input.setPadding(dp(14), dp(10), dp(14), dp(10));
-        new AlertDialog.Builder(this).setTitle("自定义拦截规则")
-                .setMessage("支持 hosts、||域名^、@@例外、通配符、domain=、third-party、资源类型以及 ## / #@# 外观规则。自定义文本上限 256 KB。")
-                .setView(input).setPositiveButton("保存", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
+        final AlertDialog dialog = new AlertDialog.Builder(this).setTitle("自定义拦截规则")
+                .setMessage("支持 hosts、ABP 网络与外观规则，上限 256 KB。")
+                .setView(input).setPositiveButton("保存", null)
+                .setNegativeButton("取消", null).create();
+        dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface ignored) { continueSettingsPanel(returnAction); }
+        });
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface ignored) {
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) { dialog.dismiss(); continueSettingsPanel(returnAction); }
+                });
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) {
                         String raw = input.getText().toString();
-                        if (raw.length() > 256 * 1024) { toast("规则不能超过 256 KB"); return; }
+                        if (raw.getBytes(StandardCharsets.UTF_8).length > 256 * 1024) {
+                            input.setError("规则不能超过 256 KB");
+                            return;
+                        }
                         prefs.edit().putString("custom_filter_rules", raw).apply();
+                        dialog.dismiss();
                         rebuildAdBlockRulesAsync(true);
+                        continueSettingsPanel(returnAction);
                     }
-                }).setNegativeButton("取消", null).show();
+                });
+            }
+        });
+        dialog.show();
+    }
+
+    /** A compact icon dashboard for the browser menu and settings root. */
+    private void showDashboardSheet(String title, String subtitle, String[] items, int[] icons,
+                                   int[] rowKinds, int columns, int[] sectionStarts,
+                                   String[] sectionTitles, final Runnable backAction,
+                                   final Runnable footerAction, String footerText, int footerIcon,
+                                   final SheetHandler handler) {
+        dismissOverlayForNavigation();
+        final int sheetSurface = nightMode ? DARK_SHEET : WHITE;
+        final int sheetText = nightMode ? DARK_TEXT : TEXT;
+        final int sheetMuted = nightMode ? DARK_MUTED : MUTED;
+        final int tileSurface = nightMode ? DARK_CARD : SURFACE;
+        final FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(Color.argb(104, 0, 0, 0));
+        overlay.setClickable(true);
+        overlay.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) { dismissOverlay(); }
+        });
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setTag(SHEET_TAG_SURFACE);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setBackground(roundRect(sheetSurface, 20));
+        panel.setPadding(dp(10), dp(7), dp(10), dp(10));
+        panel.setClickable(true);
+        panel.setElevation(dp(12));
+
+        View handle = new View(this);
+        handle.setTag(SHEET_TAG_HANDLE);
+        handle.setBackground(sheetHandleDrawable());
+        LinearLayout.LayoutParams handleParams = new LinearLayout.LayoutParams(dp(48), dp(30));
+        handleParams.gravity = Gravity.CENTER_HORIZONTAL;
+        panel.addView(handle, handleParams);
+        handle.setContentDescription("下拉关闭");
+        installSheetDrag(handle, panel);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        if (backAction != null) {
+            BrowserIconView back = iconButton(BrowserIconView.BACK, "返回上一级");
+            back.setTintColor(sheetText);
+            header.addView(back, new LinearLayout.LayoutParams(dp(44), dp(48)));
+            back.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View view) { navigateOverlayBack(); }
+            });
+        }
+        LinearLayout titles = new LinearLayout(this);
+        titles.setOrientation(LinearLayout.VERTICAL);
+        TextView heading = new TextView(this);
+        heading.setTag(SHEET_TAG_PRIMARY);
+        heading.setText(title);
+        heading.setTextColor(sheetText);
+        heading.setTextSize(18f);
+        heading.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        titles.addView(heading);
+        if (subtitle != null && subtitle.length() > 0) {
+            TextView sub = new TextView(this);
+            sub.setTag(SHEET_TAG_MUTED);
+            sub.setText(subtitle);
+            sub.setTextColor(sheetMuted);
+            sub.setTextSize(12f);
+            sub.setSingleLine(true);
+            sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            sub.setPadding(0, dp(2), 0, 0);
+            titles.addView(sub);
+        }
+        header.addView(titles, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        BrowserIconView close = iconButton(BrowserIconView.CLOSE, "关闭");
+        close.setTintColor(sheetText);
+        header.addView(close, new LinearLayout.LayoutParams(dp(44), dp(48)));
+        panel.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT));
+        installSheetDrag(header, panel);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setTag(SHEET_TAG_PLAIN_SURFACE);
+        scroll.setFillViewport(false);
+        scroll.setVerticalScrollBarEnabled(true);
+        scroll.setScrollbarFadingEnabled(false);
+        scroll.setBackgroundColor(sheetSurface);
+        LinearLayout content = new LinearLayout(this);
+        content.setTag(SHEET_TAG_PLAIN_SURFACE);
+        content.setOrientation(LinearLayout.VERTICAL);
+        content.setPadding(dp(1), dp(5), dp(1), dp(2));
+        content.setBackgroundColor(sheetSurface);
+        scroll.addView(content);
+
+        final float extraFontScale = Math.max(0f, getResources().getConfiguration().fontScale - 1f);
+        final int tileHeightDp = Math.round((columns == 2 ? 82 : 98) + extraFontScale * 44);
+        final int sectionHeightDp = Math.round(27 + extraFontScale * 16);
+        int contentHeightDp = 0;
+        LinearLayout row = null;
+        int itemsInRow = 0;
+        int sectionIndex = 0;
+        for (int i = 0; i < items.length; i++) {
+            boolean startsSection = sectionStarts != null && sectionIndex < sectionStarts.length &&
+                    i == sectionStarts[sectionIndex];
+            if (startsSection) {
+                if (row != null && itemsInRow > 0) {
+                    while (itemsInRow < columns) {
+                        row.addView(new View(this), new LinearLayout.LayoutParams(0, dp(tileHeightDp), 1f));
+                        itemsInRow++;
+                    }
+                    content.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                            dp(tileHeightDp)));
+                    contentHeightDp += tileHeightDp;
+                    row = null;
+                    itemsInRow = 0;
+                }
+                String section = sectionTitles != null && sectionIndex < sectionTitles.length
+                        ? sectionTitles[sectionIndex] : "";
+                sectionIndex++;
+                TextView label = new TextView(this);
+                label.setTag(SHEET_TAG_ACCENT);
+                label.setText(section);
+                label.setTextColor(nightMode ? DARK_ACCENT : BLUE);
+                label.setTextSize(12f);
+                label.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                label.setGravity(Gravity.CENTER_VERTICAL);
+                label.setPadding(dp(5), dp(5), dp(5), dp(2));
+                content.addView(label, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(sectionHeightDp)));
+                contentHeightDp += sectionHeightDp;
+            }
+
+            if (row == null) {
+                row = new LinearLayout(this);
+                row.setOrientation(LinearLayout.HORIZONTAL);
+                row.setGravity(Gravity.CENTER_VERTICAL);
+            }
+            final int index = i;
+            String item = items[i] == null ? "" : items[i];
+            int detailBreak = item.indexOf('\n');
+            String primary = detailBreak < 0 ? item : item.substring(0, detailBreak);
+            String detail = detailBreak < 0 ? "" : item.substring(detailBreak + 1).trim();
+            int kind = rowKinds != null && i < rowKinds.length ? rowKinds[i] : SHEET_ROW_NAVIGATE;
+            boolean toggle = kind == SHEET_ROW_TOGGLE_ON || kind == SHEET_ROW_TOGGLE_OFF;
+            boolean checked = kind == SHEET_ROW_TOGGLE_ON;
+
+            LinearLayout tile = new LinearLayout(this);
+            tile.setOrientation(columns == 2 ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
+            tile.setGravity(columns == 2 ? Gravity.CENTER_VERTICAL : Gravity.CENTER);
+            tile.setPadding(columns == 2 ? dp(10) : dp(5), dp(7), columns == 2 ? dp(8) : dp(5), dp(7));
+            int tileColor = toggle && checked ? (nightMode ? 0xff203654 : 0xffe8f0fe) : tileSurface;
+            tile.setBackground(roundRect(tileColor, 15));
+            tile.setForeground(new android.graphics.drawable.RippleDrawable(
+                    ColorStateList.valueOf(nightMode ? 0x356b9bea : 0x2e1a73e8),
+                    null, roundRect(Color.WHITE, 15)));
+            tile.setClickable(true);
+            tile.setFocusable(true);
+            tile.setMinimumWidth(dp(48));
+            tile.setMinimumHeight(dp(48));
+            boolean detailShowsState = detail.contains("已开启") || detail.contains("已关闭");
+            tile.setContentDescription(primary + (detail.length() == 0 ? "" : "，" + detail) +
+                    (toggle && !detailShowsState ? (checked ? "，已开启" : "，已关闭") : ""));
+
+            BrowserIconView icon = iconButton(icons != null && i < icons.length
+                    ? icons[i] : BrowserIconView.MENU, primary);
+            icon.setClickable(false);
+            icon.setFocusable(false);
+            if (toggle && checked) icon.setTag(SHEET_TAG_ACCENT);
+            icon.setTintColor(toggle && checked ? (nightMode ? DARK_ACCENT : BLUE) : sheetText);
+            LinearLayout.LayoutParams iconParams = columns == 2
+                    ? new LinearLayout.LayoutParams(dp(32), dp(32))
+                    : new LinearLayout.LayoutParams(dp(29), dp(29));
+            if (columns == 3) iconParams.gravity = Gravity.CENTER_HORIZONTAL;
+            if (columns != 2 || !toggle) tile.addView(icon, iconParams);
+
+            LinearLayout labels = new LinearLayout(this);
+            labels.setOrientation(LinearLayout.VERTICAL);
+            labels.setGravity(columns == 2 ? Gravity.CENTER_VERTICAL : Gravity.CENTER_HORIZONTAL);
+            labels.setPadding(columns == 2 && !toggle ? dp(9) : 0, 0, 0, 0);
+            LinearLayout.LayoutParams labelsParams = columns == 2
+                    ? new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    : new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.WRAP_CONTENT);
+            if (columns == 3) labelsParams.topMargin = dp(5);
+
+            TextView label = new TextView(this);
+            label.setTag(SHEET_TAG_PRIMARY);
+            label.setText(primary);
+            label.setTextColor(sheetText);
+            label.setTextSize(columns == 2 ? 13.5f : 12.5f);
+            label.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+            label.setGravity(columns == 2 ? Gravity.START : Gravity.CENTER);
+            label.setMaxLines(2);
+            label.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            labels.addView(label, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT));
+            if (detail.length() > 0) {
+                TextView detailLabel = new TextView(this);
+                detailLabel.setTag(SHEET_TAG_MUTED);
+                detailLabel.setText(detail);
+                detailLabel.setTextColor(sheetMuted);
+                detailLabel.setTextSize(columns == 2 ? 11.5f : 10.5f);
+                detailLabel.setGravity(columns == 2 ? Gravity.START : Gravity.CENTER);
+                detailLabel.setSingleLine(true);
+                detailLabel.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                detailLabel.setPadding(0, dp(2), 0, 0);
+                labels.addView(detailLabel, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+            } else if (toggle) {
+                TextView state = new TextView(this);
+                state.setTag(SHEET_TAG_MUTED);
+                state.setText(checked ? "已开启" : "已关闭");
+                state.setTextColor(sheetMuted);
+                state.setTextSize(10.5f);
+                state.setGravity(columns == 2 ? Gravity.START : Gravity.CENTER);
+                state.setPadding(0, dp(2), 0, 0);
+                labels.addView(state, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT));
+            }
+            tile.addView(labels, labelsParams);
+            if (toggle && columns == 2) {
+                Switch stateSwitch = new Switch(this);
+                stateSwitch.setChecked(checked);
+                stateSwitch.setShowText(false);
+                stateSwitch.setClickable(false);
+                stateSwitch.setFocusable(false);
+                stateSwitch.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
+                stateSwitch.setMinimumWidth(0);
+                int[][] states = new int[][] {
+                        new int[] { android.R.attr.state_checked }, new int[] {}
+                };
+                stateSwitch.setThumbTintList(new ColorStateList(states, new int[] {
+                        nightMode ? DARK_ACCENT : BLUE,
+                        nightMode ? 0xffbdc1c6 : 0xff757575
+                }));
+                stateSwitch.setTrackTintList(new ColorStateList(states, new int[] {
+                        nightMode ? 0x796b9bea : 0x761a73e8,
+                        nightMode ? 0xff505459 : 0xffbdc1c6
+                }));
+                tile.addView(stateSwitch, new LinearLayout.LayoutParams(dp(54), dp(48)));
+            }
+            tile.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View view) {
+                    dismissOverlayForNavigation();
+                    handler.onItem(index);
+                }
+            });
+
+            LinearLayout.LayoutParams tileParams = new LinearLayout.LayoutParams(0, dp(tileHeightDp - 6), 1f);
+            int horizontalGap = dp(columns == 2 ? 5 : 4);
+            tileParams.setMargins(horizontalGap, dp(3), horizontalGap, dp(3));
+            row.addView(tile, tileParams);
+            itemsInRow++;
+            if (itemsInRow == columns || i == items.length - 1) {
+                while (itemsInRow < columns) {
+                    row.addView(new View(this), new LinearLayout.LayoutParams(0, dp(tileHeightDp), 1f));
+                    itemsInRow++;
+                }
+                content.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                        dp(tileHeightDp)));
+                contentHeightDp += tileHeightDp;
+                row = null;
+                itemsInRow = 0;
+            }
+        }
+        panel.addView(scroll, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        if (footerAction != null) {
+            LinearLayout footer = new LinearLayout(this);
+            footer.setOrientation(LinearLayout.HORIZONTAL);
+            footer.setGravity(Gravity.CENTER_VERTICAL);
+            footer.setPadding(dp(12), 0, dp(12), 0);
+            footer.setBackground(roundRect(nightMode ? 0xff203654 : 0xffe8f0fe, 14));
+            footer.setForeground(new android.graphics.drawable.RippleDrawable(
+                    ColorStateList.valueOf(nightMode ? 0x356b9bea : 0x2e1a73e8),
+                    null, roundRect(Color.WHITE, 14)));
+            footer.setClickable(true);
+            footer.setFocusable(true);
+            footer.setMinimumHeight(dp(50));
+            footer.setContentDescription(footerText);
+            BrowserIconView footerImage = iconButton(footerIcon, footerText);
+            footerImage.setTag(SHEET_TAG_ACCENT);
+            footerImage.setClickable(false);
+            footerImage.setFocusable(false);
+            footerImage.setTintColor(nightMode ? DARK_ACCENT : BLUE);
+            footer.addView(footerImage, new LinearLayout.LayoutParams(dp(30), dp(30)));
+            TextView footerLabel = new TextView(this);
+            footerLabel.setTag(SHEET_TAG_PRIMARY);
+            footerLabel.setText(footerText);
+            footerLabel.setTextColor(sheetText);
+            footerLabel.setTextSize(14f);
+            footerLabel.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+            footerLabel.setPadding(dp(10), 0, 0, 0);
+            footer.addView(footerLabel, new LinearLayout.LayoutParams(0,
+                    ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+            TextView chevron = new TextView(this);
+            chevron.setTag(SHEET_TAG_MUTED);
+            chevron.setText("›");
+            chevron.setTextColor(sheetMuted);
+            chevron.setTextSize(27f);
+            footer.addView(chevron);
+            LinearLayout.LayoutParams footerParams = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(50));
+            footerParams.setMargins(dp(4), dp(7), dp(4), 0);
+            panel.addView(footer, footerParams);
+            footer.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View view) {
+                    dismissOverlayForNavigation();
+                    footerAction.run();
+                }
+            });
+        }
+
+        int safeTop = Math.max(0, systemInsetTop - rootFrame.getPaddingTop());
+        int safeBottom = Math.max(0, systemInsetBottom - rootFrame.getPaddingBottom());
+        int maxHeight = Math.round(getResources().getDisplayMetrics().heightPixels * .90f) - safeTop - safeBottom;
+        int desiredHeight = dp(120 + contentHeightDp + (footerAction == null ? 0 : 57));
+        int panelHeight = Math.min(maxHeight, desiredHeight);
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, panelHeight, Gravity.BOTTOM);
+        panelParams.setMargins(dp(6), safeTop, dp(6), dp(6) + safeBottom);
+        overlay.addView(panel, panelParams);
+        rootFrame.addView(overlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        activeOverlay = overlay;
+        activeOverlayPanel = panel;
+        activeOverlaySheet = true;
+        activeOverlayBackAction = backAction;
+        activeOverlayDismissAction = null;
+        overlayDismissInProgress = false;
+        themeSheetTree(panel);
+        Motion.showSheet(overlay, panel, reduceMotion());
+        close.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) { dismissOverlay(); }
+        });
     }
 
     private void showMainMenu() {
         if (!requireStartupReady()) return;
+        startupSessionPending = false;
         String subtitle = currentHost().length() == 0 ? modeLabel() : currentHost() + " · " + modeLabel();
         boolean bookmarked = dataStore != null && dataStore.isBookmarked(currentPageUrl);
         String[] items = new String[] {
                 "新建标签页",
                 "标签页工具",
+                "书签与历史",
                 "下载中心",
-                "新建独立隐私窗口",
                 bookmarked ? "管理当前收藏" : "收藏当前页面",
-                "当前网站设置",
-                "桌面网站\n为当前页面切换桌面布局",
-                "网页深色模式\n为当前页面切换深色显示",
+                "保护与脚本",
+                "桌面网站",
+                "深色模式",
+                "广告拦截",
                 "页面工具",
-                "书签、历史与迁移",
-                "隐私、脚本与密码",
-                "浏览器设置"
+                "扫描二维码",
+                "新建隐私窗口"
         };
         int[] icons = new int[] {
-                BrowserIconView.PLUS, BrowserIconView.TABS, BrowserIconView.DOWNLOAD, BrowserIconView.SHIELD,
-                BrowserIconView.BOOKMARK, BrowserIconView.SHIELD, BrowserIconView.DESKTOP,
-                BrowserIconView.APPEARANCE, BrowserIconView.MENU, BrowserIconView.HISTORY,
-                BrowserIconView.SHIELD, BrowserIconView.SETTINGS
+                BrowserIconView.PLUS, BrowserIconView.TABS, BrowserIconView.HISTORY,
+                BrowserIconView.DOWNLOAD, BrowserIconView.BOOKMARK, BrowserIconView.SHIELD,
+                BrowserIconView.DESKTOP, BrowserIconView.APPEARANCE, BrowserIconView.SHIELD,
+                BrowserIconView.MENU, BrowserIconView.QR, BrowserIconView.SHIELD
         };
         int[] kinds = new int[] {
-                SHEET_ROW_ACTION, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_ACTION,
+                SHEET_ROW_ACTION, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
                 SHEET_ROW_ACTION, SHEET_ROW_NAVIGATE,
                 desktopMode ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
                 nightMode ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
-                SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE
+                adBlockEnabled ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                SHEET_ROW_NAVIGATE, SHEET_ROW_ACTION, SHEET_ROW_ACTION
         };
-        String[] sections = new String[items.length];
-        sections[0] = "浏览";
-        sections[4] = "当前页面";
-        sections[9] = "资料与工具";
-        sections[11] = "浏览器";
-        showActionSheet("Median", subtitle, items, icons, kinds, sections, null, new SheetHandler() {
+        showDashboardSheet("Median", subtitle, items, icons, kinds, 3,
+                new int[] { 0, 6, 9 }, new String[] { "常用", "快捷开关", "工具" },
+                null, new Runnable() {
+                    @Override public void run() { showBrowserSettings(); }
+                }, "浏览器设置", BrowserIconView.SETTINGS, new SheetHandler() {
             @Override public void onItem(int which) {
                 switch (which) {
                     case 0: newTab(); break;
                     case 1: showTabTools(); break;
-                    case 2: showDownloadCenter(); break;
-                    case 3: openPrivateWindow(); break;
+                    case 2: showBrowserLibrary(); break;
+                    case 3: showDownloadCenter(); break;
                     case 4: toggleCurrentBookmark(); break;
-                    case 5: showSiteSettings(); break;
+                    case 5:
+                        showProtectionPanel(new Runnable() {
+                            @Override public void run() { showMainMenu(); }
+                        });
+                        break;
                     case 6:
                         desktopMode = !desktopMode;
                         prefs.edit().putBoolean("desktop", desktopMode).apply();
                         applyDesktopMode();
-                        webView.reload();
+                        reloadWebView(webView);
+                        showMainMenu();
                         break;
                     case 7:
-                        nightMode = !nightMode;
-                        prefs.edit().putBoolean("night_mode", nightMode).apply();
-                        applyDarkMode();
-                        if (isHomeUrl(currentPageUrl)) showHome();
+                        toggleNightMode();
+                        showMainMenu();
                         break;
-                    case 8: showPageTools(); break;
-                    case 9: showBrowserLibrary(); break;
-                    case 10: showPrivacyTools(); break;
-                    case 11: showBrowserSettings(); break;
+                    case 8:
+                        adBlockEnabled = !adBlockEnabled;
+                        prefs.edit().putBoolean("adblock", adBlockEnabled).apply();
+                        adBlockActiveByView.clear();
+                        if (webView != null && isNetworkPage(currentPageUrl)) reloadWebView(webView);
+                        toast(adBlockEnabled ? "广告拦截已开启" : "广告拦截已关闭");
+                        showMainMenu();
+                        break;
+                    case 9: showPageTools(); break;
+                    case 10: startQrScan(); break;
+                    case 11: openPrivateWindow(); break;
                     default: break;
                 }
             }
@@ -3255,7 +5287,7 @@ public final class MainActivity extends Activity implements Runnable {
     private void showPrivacyTools() {
         String[] items = new String[] {
                 "广告与隐私过滤器\n订阅、例外与规则诊断",
-                "用户脚本\n安装、更新与风险隔离",
+                "用户脚本\n安装、更新、启停与脚本命令",
                 "密码管理器\n本地加密保存与填充"
         };
         int[] icons = new int[] { BrowserIconView.SHIELD, BrowserIconView.SCRIPT, BrowserIconView.KEY };
@@ -3264,9 +5296,15 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void run() { showMainMenu(); }
                 }, new SheetHandler() {
                     @Override public void onItem(int which) {
-                        if (which == 0) showFilterCenter();
-                        else if (which == 1) showScriptCenter();
-                        else showPasswordMenu();
+                        if (which == 0) showFilterCenter(new Runnable() {
+                            @Override public void run() { showPrivacyTools(); }
+                        });
+                        else if (which == 1) showScriptCenter(new Runnable() {
+                            @Override public void run() { showPrivacyTools(); }
+                        });
+                        else showPasswordMenu(new Runnable() {
+                            @Override public void run() { showPrivacyTools(); }
+                        });
                     }
                 });
     }
@@ -3282,7 +5320,7 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void toggleCurrentBookmark() {
         String url = currentPageUrl;
-        if (url == null || isHomeUrl(url) || (!url.startsWith("https://") && !url.startsWith("http://"))) {
+        if (!isNetworkPage(url)) {
             toast("当前页面不能收藏");
             return;
         }
@@ -3297,15 +5335,14 @@ public final class MainActivity extends Activity implements Runnable {
     private void showBrowserLibrary() {
         String[] items = new String[] {
                 "收藏与文件夹（" + dataStore.bookmarks().size() + "）\n自定义网站、重命名与多级文件夹",
-                "最近历史记录",
-                "搜索历史记录",
+                "历史记录（" + dataStore.historyCount() + "）\n日期分组、搜索与单条管理",
                 "离线页面（" + services.offlinePages().getAll().size() + "）",
                 "导出书签备份",
                 "导入书签备份",
                 "导出加密完整备份",
                 "导入加密完整备份"
         };
-        int[] icons = new int[] { BrowserIconView.PLUS, BrowserIconView.TABS, BrowserIconView.SEARCH,
+        int[] icons = new int[] { BrowserIconView.PLUS, BrowserIconView.HISTORY,
                 BrowserIconView.STORAGE, BrowserIconView.SHARE, BrowserIconView.STORAGE,
                 BrowserIconView.KEY, BrowserIconView.KEY };
         showActionSheet("书签与历史", "本地保存 · 不上传云端", items, icons, new SheetHandler() {
@@ -3314,11 +5351,10 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void run() { showBrowserLibrary(); }
                 });
                 else if (which == 1) showHistoryList("");
-                else if (which == 2) showHistorySearch();
-                else if (which == 3) showOfflinePages();
-                else if (which == 4) beginBackupExport();
-                else if (which == 5) beginBackupImport();
-                else if (which == 6) beginFullBackupExport();
+                else if (which == 2) showOfflinePages();
+                else if (which == 3) beginBackupExport();
+                else if (which == 4) beginBackupImport();
+                else if (which == 5) beginFullBackupExport();
                 else beginFullBackupImport();
             }
         });
@@ -3412,6 +5448,8 @@ public final class MainActivity extends Activity implements Runnable {
                     }
                 }).setNegativeButton("取消", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface dialog, int which) { showBookmarkActions(item, returnFolder); }
+                }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override public void onCancel(DialogInterface dialog) { showBookmarkActions(item, returnFolder); }
                 }).show();
     }
 
@@ -3436,6 +5474,9 @@ public final class MainActivity extends Activity implements Runnable {
                 .setNegativeButton("取消", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) { showBookmarkFolder(initialFolder); }
                 }).create();
+        dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface ignored) { showBookmarkFolder(initialFolder); }
+        });
         dialog.setOnShowListener(new DialogInterface.OnShowListener() {
             @Override public void onShow(DialogInterface ignored) {
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
@@ -3502,6 +5543,9 @@ public final class MainActivity extends Activity implements Runnable {
                 .setNegativeButton("取消", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface d, int which) { showBookmarkFolder(parentId); }
                 }).create();
+        dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface ignored) { showBookmarkFolder(parentId); }
+        });
         dialog.setOnShowListener(new DialogInterface.OnShowListener() {
             @Override public void onShow(DialogInterface ignored) {
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
@@ -3561,6 +5605,10 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void onClick(DialogInterface dialog, int which) {
                         if (returnToActions) showBookmarkFolderActions(folder); else showBookmarkFolder(folder.id);
                     }
+                }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override public void onCancel(DialogInterface dialog) {
+                        if (returnToActions) showBookmarkFolderActions(folder); else showBookmarkFolder(folder.id);
+                    }
                 }).show();
     }
 
@@ -3571,36 +5619,290 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showHistoryList(final String query) {
-        final List<BrowserDataStore.HistoryItem> all = dataStore.recentHistory(160, query);
-        if (all.size() == 0) {
-            new AlertDialog.Builder(this).setTitle("历史记录").setMessage(query.length() == 0 ? "还没有浏览历史。" : "没有匹配的历史记录。")
-                    .setPositiveButton("知道了", null).show();
-            return;
+        if (dataStore == null) return;
+        dismissOverlayForNavigation();
+        final int pageBackground = nightMode ? DARK_BACKGROUND : WHITE;
+        final int cardBackground = nightMode ? DARK_CARD : WHITE;
+        final int pageText = nightMode ? DARK_TEXT : TEXT;
+        final int pageMuted = nightMode ? DARK_MUTED : MUTED;
+        final FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(pageBackground);
+        overlay.setClickable(true);
+        overlay.setFocusableInTouchMode(true);
+
+        LinearLayout page = new LinearLayout(this);
+        page.setOrientation(LinearLayout.VERTICAL);
+        page.setPadding(dp(14), dp(8), dp(14), dp(12));
+        overlay.addView(page, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        BrowserIconView back = iconButton(BrowserIconView.BACK, "返回书签与历史");
+        back.setTintColor(pageText);
+        header.addView(back, new LinearLayout.LayoutParams(dp(46), dp(48)));
+        final TextView title = new TextView(this);
+        title.setTextSize(22f);
+        title.setTextColor(pageText);
+        title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+        header.addView(title, new LinearLayout.LayoutParams(0, dp(54), 1f));
+        BrowserIconView clear = iconButton(BrowserIconView.DELETE, "清空历史记录");
+        BrowserIconView close = iconButton(BrowserIconView.CLOSE, "返回网页");
+        clear.setTintColor(pageText);
+        close.setTintColor(pageText);
+        header.addView(clear, new LinearLayout.LayoutParams(dp(46), dp(48)));
+        header.addView(close, new LinearLayout.LayoutParams(dp(46), dp(48)));
+        page.addView(header, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(58)));
+
+        LinearLayout searchPill = new LinearLayout(this);
+        searchPill.setOrientation(LinearLayout.HORIZONTAL);
+        searchPill.setGravity(Gravity.CENTER_VERTICAL);
+        searchPill.setPadding(dp(12), 0, dp(4), 0);
+        searchPill.setBackground(roundRect(nightMode ? 0xff303337 : SURFACE, 20));
+        final EditText search = new EditText(this);
+        search.setSingleLine(true);
+        search.setText(query == null ? "" : query);
+        search.setHint("搜索标题或网址");
+        search.setHintTextColor(pageMuted);
+        search.setTextColor(pageText);
+        search.setTextSize(14.5f);
+        search.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
+        search.setBackgroundColor(Color.TRANSPARENT);
+        search.setPadding(0, 0, dp(6), 0);
+        searchPill.addView(search, new LinearLayout.LayoutParams(0, dp(46), 1f));
+        BrowserIconView runSearch = iconButton(BrowserIconView.SEARCH, "搜索历史记录");
+        runSearch.setTintColor(pageText);
+        searchPill.addView(runSearch, new LinearLayout.LayoutParams(dp(44), dp(44)));
+        LinearLayout.LayoutParams searchParams = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(46));
+        searchParams.setMargins(dp(2), 0, dp(2), dp(10));
+        page.addView(searchPill, searchParams);
+
+        final ArrayList<Object> rows = new ArrayList<Object>();
+        final BaseAdapter[] adapterHolder = new BaseAdapter[1];
+        final String[] activeQuery = new String[] { query == null ? "" : query.trim() };
+        final FrameLayout body = new FrameLayout(this);
+        final TextView empty = new TextView(this);
+        empty.setTextColor(pageMuted);
+        empty.setTextSize(14f);
+        empty.setGravity(Gravity.CENTER);
+        empty.setPadding(dp(24), dp(24), dp(24), dp(24));
+
+        final class HistoryRow {
+            final LinearLayout root;
+            final TextView primary;
+            final TextView secondary;
+            final BrowserIconView more;
+
+            HistoryRow() {
+                root = new LinearLayout(MainActivity.this);
+                root.setOrientation(LinearLayout.HORIZONTAL);
+                root.setGravity(Gravity.CENTER_VERTICAL);
+                root.setPadding(dp(16), dp(7), dp(7), dp(7));
+                root.setElevation(dp(1));
+                root.setClickable(true);
+                LinearLayout labels = new LinearLayout(MainActivity.this);
+                labels.setOrientation(LinearLayout.VERTICAL);
+                labels.setGravity(Gravity.CENTER_VERTICAL);
+                primary = new TextView(MainActivity.this);
+                primary.setTextColor(pageText);
+                primary.setTextSize(15.5f);
+                primary.setSingleLine(true);
+                primary.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                secondary = new TextView(MainActivity.this);
+                secondary.setTextColor(pageMuted);
+                secondary.setTextSize(12.5f);
+                secondary.setSingleLine(true);
+                secondary.setEllipsize(android.text.TextUtils.TruncateAt.END);
+                labels.addView(primary, new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, dp(27)));
+                labels.addView(secondary, new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, dp(23)));
+                root.addView(labels, new LinearLayout.LayoutParams(0, dp(58), 1f));
+                more = iconButton(BrowserIconView.MENU, "历史记录操作");
+                more.setTintColor(pageText);
+                more.setFocusable(false);
+                root.addView(more, new LinearLayout.LayoutParams(dp(46), dp(46)));
+            }
+
+            void bind(final BrowserDataStore.HistoryItem item) {
+                root.setBackground(roundRect(cardBackground, 18));
+                primary.setText(item.title);
+                CharSequence relative = android.text.format.DateUtils.getRelativeTimeSpanString(
+                        item.visitedAt, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS);
+                String visits = item.visits > 1 ? " · " + item.visits + " 次访问" : "";
+                secondary.setText(hostOf(item.url) + " · " + relative + visits);
+                root.setContentDescription(item.title + "，" + hostOf(item.url));
+                root.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        dismissOverlayForNavigation();
+                        loadInput(item.url);
+                    }
+                });
+                more.setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View view) {
+                        showHistoryItemActions(item, activeQuery[0]);
+                    }
+                });
+            }
         }
-        String[] names = new String[all.size()];
-        long now = System.currentTimeMillis();
-        for (int i = 0; i < all.size(); i++) {
-            BrowserDataStore.HistoryItem item = all.get(i);
-            CharSequence relative = android.text.format.DateUtils.getRelativeTimeSpanString(item.visitedAt, now, android.text.format.DateUtils.MINUTE_IN_MILLIS);
-            names[i] = item.title + "\n" + hostOf(item.url) + " · " + relative;
-        }
-        new AlertDialog.Builder(this).setTitle(query.length() == 0 ? "最近历史记录" : "历史搜索：" + query)
-                .setItems(names, new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) { loadInput(all.get(which).url); }
-                }).setNeutralButton("清空历史", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) { confirmClearHistory(); }
-                }).setNegativeButton("关闭", null).show();
+
+        final BaseAdapter adapter = new BaseAdapter() {
+            @Override public int getCount() { return rows.size(); }
+            @Override public Object getItem(int position) { return rows.get(position); }
+            @Override public long getItemId(int position) { return position; }
+            @Override public int getViewTypeCount() { return 2; }
+            @Override public int getItemViewType(int position) { return rows.get(position) instanceof String ? 0 : 1; }
+            @Override public boolean isEnabled(int position) { return !(rows.get(position) instanceof String); }
+            @Override public View getView(int position, View convertView, ViewGroup parent) {
+                Object value = rows.get(position);
+                if (value instanceof String) {
+                    TextView section = convertView instanceof TextView ? (TextView) convertView : new TextView(MainActivity.this);
+                    section.setText((String) value);
+                    section.setTextColor(BLUE);
+                    section.setTextSize(12f);
+                    section.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+                    section.setGravity(Gravity.BOTTOM | Gravity.START);
+                    section.setPadding(dp(8), 0, dp(8), dp(7));
+                    return section;
+                }
+                HistoryRow row;
+                if (convertView == null || !(convertView.getTag() instanceof HistoryRow)) {
+                    row = new HistoryRow();
+                    row.root.setTag(row);
+                    convertView = row.root;
+                } else row = (HistoryRow) convertView.getTag();
+                row.bind((BrowserDataStore.HistoryItem) value);
+                return convertView;
+            }
+        };
+        adapterHolder[0] = adapter;
+        ListView list = new ListView(this);
+        list.setAdapter(adapter);
+        list.setBackgroundColor(Color.TRANSPARENT);
+        list.setDivider(new android.graphics.drawable.ColorDrawable(Color.TRANSPARENT));
+        list.setDividerHeight(dp(9));
+        list.setPadding(0, 0, 0, dp(20));
+        list.setClipToPadding(false);
+        list.setVerticalScrollBarEnabled(false);
+        body.addView(list, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        body.addView(empty, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        page.addView(body, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+
+        final Runnable rebuild = new Runnable() {
+            @Override public void run() {
+                rows.clear();
+                List<BrowserDataStore.HistoryItem> items = dataStore.recentHistory(200, activeQuery[0]);
+                java.util.Calendar today = java.util.Calendar.getInstance();
+                today.set(java.util.Calendar.HOUR_OF_DAY, 0);
+                today.set(java.util.Calendar.MINUTE, 0);
+                today.set(java.util.Calendar.SECOND, 0);
+                today.set(java.util.Calendar.MILLISECOND, 0);
+                long todayStart = today.getTimeInMillis();
+                today.add(java.util.Calendar.DAY_OF_YEAR, -1);
+                long yesterdayStart = today.getTimeInMillis();
+                String lastSection = "";
+                for (BrowserDataStore.HistoryItem item : items) {
+                    String section;
+                    if (item.visitedAt >= todayStart) section = "今天";
+                    else if (item.visitedAt >= yesterdayStart) section = "昨天";
+                    else section = android.text.format.DateFormat.getMediumDateFormat(MainActivity.this)
+                            .format(new java.util.Date(item.visitedAt));
+                    if (!section.equals(lastSection)) {
+                        rows.add(section);
+                        lastSection = section;
+                    }
+                    rows.add(item);
+                }
+                boolean noResults = items.size() == 0;
+                empty.setText(activeQuery[0].length() == 0 ?
+                        "还没有浏览历史\n访问过的网页会按日期显示在这里" : "没有匹配的历史记录");
+                empty.setVisibility(noResults ? View.VISIBLE : View.GONE);
+                title.setText(activeQuery[0].length() == 0 ?
+                        "历史记录  " + dataStore.historyCount() : "搜索结果  " + items.size());
+                if (adapterHolder[0] != null) adapterHolder[0].notifyDataSetChanged();
+            }
+        };
+        rebuild.run();
+
+        View.OnClickListener searchAction = new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                activeQuery[0] = search.getText().toString().trim();
+                rebuild.run();
+                hideKeyboard();
+                search.clearFocus();
+            }
+        };
+        runSearch.setOnClickListener(searchAction);
+        search.setOnEditorActionListener(new TextView.OnEditorActionListener() {
+            @Override public boolean onEditorAction(TextView view, int actionId, KeyEvent event) {
+                if (actionId == EditorInfo.IME_ACTION_SEARCH ||
+                        (event != null && event.getKeyCode() == KeyEvent.KEYCODE_ENTER)) {
+                    activeQuery[0] = search.getText().toString().trim();
+                    rebuild.run();
+                    hideKeyboard();
+                    search.clearFocus();
+                    return true;
+                }
+                return false;
+            }
+        });
+        back.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) { navigateOverlayBack(); }
+        });
+        close.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) { dismissOverlay(); }
+        });
+        clear.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                if (dataStore.historyCount() == 0) { toast("历史记录已经为空"); return; }
+                confirmClearHistory(new Runnable() {
+                    @Override public void run() { showHistoryList(""); }
+                });
+            }
+        });
+
+        rootFrame.addView(overlay, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        activeOverlay = overlay;
+        activeOverlayPanel = page;
+        activeOverlaySheet = false;
+        activeOverlayBackAction = new Runnable() {
+            @Override public void run() { showBrowserLibrary(); }
+        };
+        activeOverlayDismissAction = null;
+        Motion.showPage(overlay, page, reduceMotion());
     }
 
-    private void showHistorySearch() {
-        final EditText input = new EditText(this);
-        input.setHint("标题或网址");
-        input.setSingleLine(true);
-        input.setPadding(dp(18), dp(8), dp(18), dp(8));
-        new AlertDialog.Builder(this).setTitle("搜索历史记录").setView(input)
-                .setPositiveButton("搜索", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) { showHistoryList(input.getText().toString().trim()); }
-                }).setNegativeButton("取消", null).show();
+    private void showHistoryItemActions(final BrowserDataStore.HistoryItem item, final String query) {
+        String relative = android.text.format.DateUtils.getRelativeTimeSpanString(item.visitedAt,
+                System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS).toString();
+        showActionSheet(item.title, hostOf(item.url) + " · " + relative,
+                new String[] { "打开网页", "在新标签页打开", "复制网址", "删除这条记录" },
+                new int[] { BrowserIconView.SEARCH, BrowserIconView.PLUS,
+                        BrowserIconView.SHARE, BrowserIconView.DELETE },
+                new int[] { SHEET_ROW_ACTION, SHEET_ROW_ACTION, SHEET_ROW_ACTION, SHEET_ROW_ACTION },
+                null, new Runnable() {
+                    @Override public void run() { showHistoryList(query); }
+                }, new SheetHandler() {
+                    @Override public void onItem(int which) {
+                        if (which == 0) loadInput(item.url);
+                        else if (which == 1) openUrlInNewTab(item.url, true);
+                        else if (which == 2) {
+                            ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                            if (manager != null) manager.setPrimaryClip(ClipData.newPlainText("历史记录网址", item.url));
+                            toast("网址已复制");
+                            showHistoryList(query);
+                        } else {
+                            dataStore.removeHistory(item.url);
+                            toast("这条历史记录已删除");
+                            showHistoryList(query);
+                        }
+                    }
+                });
     }
 
     private void confirmClearHistory() {
@@ -3614,6 +5916,7 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void onClick(DialogInterface dialog, int which) {
                         dataStore.clearHistory();
                         webView.clearHistory();
+                        clearConnectionHints();
                         toast("历史记录已清空");
                         continueSettingsPanel(returnAction);
                     }
@@ -3634,7 +5937,11 @@ public final class MainActivity extends Activity implements Runnable {
         try {
             Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
             intent.addCategory(Intent.CATEGORY_OPENABLE);
-            intent.setType("application/json");
+            intent.setType("*/*");
+            intent.putExtra(Intent.EXTRA_MIME_TYPES, new String[] {
+                    "application/json", "text/html", "application/xhtml+xml",
+                    "application/x-netscape-bookmark", "text/plain"
+            });
             startActivityForResult(intent, BACKUP_IMPORT_REQUEST);
         } catch (Exception e) { toast("没有可用的文件选择器"); }
     }
@@ -3662,7 +5969,7 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void showSiteSettings() {
         final String host = currentHost();
-        if (host.length() == 0) { toast("主页没有网站设置"); return; }
+        if (host.length() == 0) { toast("当前页面没有网站设置"); return; }
         final SiteSettingsStore.SiteSettings settings = siteSettingsStore.forHost(host);
         String[] items = new String[] {
                 "兼容模式\n放宽兼容限制并暂停本站过滤",
@@ -3682,7 +5989,17 @@ public final class MainActivity extends Activity implements Runnable {
         showActionSheet("网站设置", host + " · 仅影响当前网站", items, icons,
                 kinds, null, null, new SheetHandler() {
             @Override public void onItem(int which) {
-                if (which == 0) toggleCompatibilityMode(host, settings);
+                if (!host.equalsIgnoreCase(currentHost())) {
+                    dismissOverlayForNavigation();
+                    toast("页面已经变化，请重新打开网站设置");
+                    return;
+                }
+                if (which == 0) {
+                    toggleCompatibilityMode(host, settings);
+                    postAfterUiTransition(new Runnable() {
+                        @Override public void run() { showSiteSettings(); }
+                    });
+                }
                 else if (which == 1) showSiteContentSettings(host);
                 else if (which == 2) showSitePermissionSettings(host);
                 else if (which == 3) showSiteDisplaySettings(host);
@@ -3690,7 +6007,7 @@ public final class MainActivity extends Activity implements Runnable {
                     siteSettingsStore.clear(host);
                     adBlockActiveByView.clear();
                     applySiteSettings(webView, host);
-                    webView.reload();
+                    reloadWebView(webView);
                     toast("已重置此网站设置");
                 } else confirmClearCurrentSiteData();
             }
@@ -3716,6 +6033,11 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void run() { showSiteSettings(); }
                 }, new SheetHandler() {
                     @Override public void onItem(int which) {
+                        if (!host.equalsIgnoreCase(currentHost())) {
+                            dismissOverlayForNavigation();
+                            toast("页面已经变化，请重新打开网站设置");
+                            return;
+                        }
                         int key = which == 0 ? SiteSettingsStore.JAVASCRIPT :
                                 which == 1 ? SiteSettingsStore.IMAGES :
                                 which == 2 ? SiteSettingsStore.THIRD_PARTY_COOKIES :
@@ -3742,6 +6064,11 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void run() { showSiteSettings(); }
                 }, new SheetHandler() {
                     @Override public void onItem(int which) {
+                        if (!host.equalsIgnoreCase(currentHost())) {
+                            dismissOverlayForNavigation();
+                            toast("页面已经变化，请重新打开网站设置");
+                            return;
+                        }
                         int key = which == 0 ? SiteSettingsStore.LOCATION :
                                 which == 1 ? SiteSettingsStore.CAMERA : SiteSettingsStore.MICROPHONE;
                         settings.set(key, nextTriState(settings.get(key)));
@@ -3765,6 +6092,11 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void run() { showSiteSettings(); }
                 }, new SheetHandler() {
                     @Override public void onItem(int which) {
+                        if (!host.equalsIgnoreCase(currentHost())) {
+                            dismissOverlayForNavigation();
+                            toast("页面已经变化，请重新打开网站设置");
+                            return;
+                        }
                         if (which < 2) {
                             int key = which == 0 ? SiteSettingsStore.DESKTOP : SiteSettingsStore.DARK;
                             settings.set(key, nextTriState(settings.get(key)));
@@ -3799,10 +6131,14 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void saveSiteSettingsAndReturn(String host, SiteSettingsStore.SiteSettings settings,
                                            Runnable returnAction) {
+        if (!host.equalsIgnoreCase(currentHost())) {
+            toast("页面已经变化，请重新打开网站设置");
+            return;
+        }
         siteSettingsStore.save(host, settings);
         adBlockActiveByView.clear();
         applySiteSettings(webView, host);
-        webView.reload();
+        reloadWebView(webView);
         postAfterUiTransition(returnAction);
     }
 
@@ -3814,7 +6150,7 @@ public final class MainActivity extends Activity implements Runnable {
             siteSettingsStore.save(host, settings);
             adBlockActiveByView.clear();
             applySiteSettings(webView, host);
-            webView.reload();
+            reloadWebView(webView);
             toast("兼容模式已关闭");
             return;
         }
@@ -3828,7 +6164,7 @@ public final class MainActivity extends Activity implements Runnable {
         siteSettingsStore.save(host, settings);
         adBlockActiveByView.clear();
         if (webView != null) applySiteSettings(webView, host);
-        if (reload && webView != null) webView.reload();
+        if (reload && webView != null) reloadWebView(webView);
         toast("已为此网站启用兼容模式");
     }
 
@@ -3860,7 +6196,7 @@ public final class MainActivity extends Activity implements Runnable {
                     }
                 })
                 .setNegativeButton("取消", null);
-        if (failedUrl.startsWith("https://")) {
+        if (failedUrl.regionMatches(true, 0, "https://", 0, 8)) {
             builder.setNeutralButton("HTTP 重试（不安全）", new DialogInterface.OnClickListener() {
                 @Override public void onClick(DialogInterface dialog, int which) {
                     enableCompatibilityForHost(host, false);
@@ -3876,10 +6212,6 @@ public final class MainActivity extends Activity implements Runnable {
         dialog.show();
     }
 
-    private void showTextZoomDialog(final String host, final SiteSettingsStore.SiteSettings settings) {
-        showTextZoomDialog(host, settings, null);
-    }
-
     private void showTextZoomDialog(final String host, final SiteSettingsStore.SiteSettings settings,
                                     final Runnable returnAction) {
         SettingsDialogReturn back = new SettingsDialogReturn(returnAction);
@@ -3889,10 +6221,15 @@ public final class MainActivity extends Activity implements Runnable {
         for (int i = 0; i < values.length; i++) { labels[i] = values[i] + "%"; if (values[i] == settings.textZoom()) checked = i; }
         new AlertDialog.Builder(this).setTitle("文字缩放").setSingleChoiceItems(labels, checked, new DialogInterface.OnClickListener() {
             @Override public void onClick(DialogInterface dialog, int which) {
+                if (!host.equalsIgnoreCase(currentHost())) {
+                    dialog.dismiss();
+                    toast("页面已经变化，请重新打开网站设置");
+                    return;
+                }
                 settings.textZoom(values[which]);
                 siteSettingsStore.save(host, settings);
                 applySiteSettings(webView, host);
-                webView.reload();
+                reloadWebView(webView);
                 dialog.dismiss();
                 continueSettingsPanel(returnAction);
             }
@@ -3903,6 +6240,9 @@ public final class MainActivity extends Activity implements Runnable {
         final String url = currentPageUrl;
         final String host = currentHost();
         if (url == null || host.length() == 0) return;
+        SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { showSiteSettings(); }
+        });
         new AlertDialog.Builder(this).setTitle("清除此网站数据？").setMessage("将尝试删除 " + host + " 的 Cookie 和本地存储，网站可能会退出登录。")
                 .setPositiveButton("清除", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface dialog, int which) {
@@ -3928,31 +6268,167 @@ public final class MainActivity extends Activity implements Runnable {
                             }
                             cookies.flush();
                         }
-                        Uri uri = currentUri();
+                        Uri uri = null;
+                        try { uri = Uri.parse(url); } catch (RuntimeException ignored) {}
                         if (uri != null) {
                             String origin = uri.getScheme() + "://" + uri.getAuthority();
                             android.webkit.WebStorage.getInstance().deleteOrigin(origin);
                             android.webkit.GeolocationPermissions.getInstance().clear(origin);
                         }
-                        webView.reload();
+                        if (webView != null && host.equalsIgnoreCase(currentHost())) reloadWebView(webView);
                         toast("此网站数据已清除");
                     }
-                }).setNegativeButton("取消", null).show();
+                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
+    }
+
+    private void startQrScan() {
+        if (!requireStartupReady()) return;
+        dismissOverlayForNavigation();
+        showQrScannerPage();
+    }
+
+    private void showQrScannerPage() {
+        if (webView == null) return;
+        WebView source = webView;
+        prepareHomeDestination(source);
+        currentPageUrl = QR_URL;
+        currentPageHost = "";
+        pageHosts.put(source, "");
+        qrScannerViews.add(source);
+        trustedHomeViews.remove(source);
+        customHomeViews.remove(source);
+        renderedHomeKeys.remove(source);
+        source.loadDataWithBaseURL(QR_URL, QrScannerPage.html(qrToken(), nightMode),
+                "text/html", "UTF-8", QR_URL);
+        updateCurrentTab(QR_URL, "扫描二维码");
+        requestChromeUpdate();
+    }
+
+    private boolean handleQrScannerPrompt(final WebView source, String message, String value,
+                                          JsPromptResult result) {
+        if (!qrToken().equals(message)) return false;
+        boolean accepted = result != null && source != null && source == webView &&
+                isQrScannerUrl(source.getUrl()) && qrScannerViews.contains(source);
+        if (result != null) result.confirm("");
+        if (!accepted) return true;
+        try {
+            JSONObject payload = new JSONObject(value == null ? "{}" : value);
+            if (payload.optBoolean("cancel", false)) {
+                qrScannerViews.remove(source);
+                source.post(new Runnable() {
+                    @Override public void run() { returnFromQrScanner(); }
+                });
+            } else if (payload.optBoolean("external", false)) {
+                qrScannerViews.remove(source);
+                source.post(new Runnable() {
+                    @Override public void run() {
+                        if (!launchExternalQrScanner()) {
+                            toast("没有可返回扫码结果的系统应用，已切回内置扫码");
+                            showQrScannerPage();
+                        }
+                    }
+                });
+            } else {
+                final String scanned = payload.optString("value", "").trim();
+                if (scanned.length() == 0 || scanned.length() > 16 * 1024) {
+                    toast("二维码内容为空或异常过长");
+                    source.post(new Runnable() {
+                        @Override public void run() { if (source == webView) showQrScannerPage(); }
+                    });
+                } else {
+                    qrScannerViews.remove(source);
+                    source.post(new Runnable() {
+                        @Override public void run() { showQrResult(scanned); }
+                    });
+                }
+            }
+        } catch (Exception error) {
+            toast("无法读取扫码结果");
+            if (source != null) source.post(new Runnable() {
+                @Override public void run() { if (source == webView) showQrScannerPage(); }
+            });
+        }
+        return true;
+    }
+
+    private boolean launchExternalQrScanner() {
+        String[] actions = new String[] {
+                "com.google.zxing.client.android.SCAN",
+                "com.srowen.bs.android.SCAN"
+        };
+        for (String action : actions) {
+            Intent scan = new Intent(action);
+            scan.putExtra("SCAN_MODE", "QR_CODE_MODE");
+            scan.putExtra("PROMPT_MESSAGE", "扫描二维码");
+            try {
+                startActivityForResult(scan, QR_SCAN_REQUEST);
+                return true;
+            } catch (Exception ignored) {}
+        }
+        return false;
+    }
+
+    private void showQrResult(final String value) {
+        String preview = value.replace('\n', ' ').replace('\r', ' ');
+        preview = UiText.ellipsize(preview, 180);
+        final boolean link = isHttpUrl(value);
+        String[] items = link
+                ? new String[] { "打开链接", "在新标签页打开", "复制内容", "使用搜索引擎搜索" }
+                : new String[] { "使用搜索引擎搜索", "复制内容", "重新扫描" };
+        int[] icons = link
+                ? new int[] { BrowserIconView.SEARCH, BrowserIconView.PLUS,
+                        BrowserIconView.SHARE, BrowserIconView.SEARCH }
+                : new int[] { BrowserIconView.SEARCH, BrowserIconView.SHARE, BrowserIconView.QR };
+        final Runnable rescan = new Runnable() {
+            @Override public void run() { showQrScannerPage(); }
+        };
+        showActionSheet("二维码内容", preview, items, icons, null, null, rescan, rescan, new SheetHandler() {
+            @Override public void onItem(int which) {
+                if (link && which == 0) loadInput(value);
+                else if (link && which == 1) openUrlInNewTab(value, true);
+                else if ((link && which == 2) || (!link && which == 1)) {
+                    ClipboardManager manager = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    if (manager != null) manager.setPrimaryClip(ClipData.newPlainText("二维码内容", value));
+                    toast("二维码内容已复制");
+                    returnFromQrScanner();
+                } else if (!link && which == 2) {
+                    showQrScannerPage();
+                } else {
+                    loadInput(value);
+                }
+            }
+        });
+    }
+
+    private void returnFromQrScanner() {
+        if (webView == null) return;
+        qrScannerViews.remove(webView);
+        if (isQrScannerUrl(webView.getUrl()) && webView.canGoBack()) goBackWebView(webView);
+        else if (isQrScannerUrl(webView.getUrl())) showHome();
+    }
+
+    private void resumeQrScannerIfNeeded() {
+        if (webView == null || !isQrScannerUrl(webView.getUrl()) || !qrScannerViews.contains(webView)) return;
+        try { webView.evaluateJavascript("window.__medianRestartScanner&&window.__medianRestartScanner();", null); }
+        catch (RuntimeException ignored) {}
     }
 
     private void showPageTools() {
+        if (isInternalBrowserUrl(currentPageUrl)) { toast("当前页面没有网页工具"); return; }
         int offlineCount = services.offlinePages().getAll().size();
         PageAssistant assistant = services.assistant();
         String[] items = new String[] {
                 "页面内查找", "切换沉浸阅读模式", assistant.isSpeaking() ? "停止朗读" : "朗读正文",
                 "页面结构与统计", "TLS 证书与 SHA-256", "保存完整离线页面", "离线页面库 · " + offlineCount + " 页",
                 "分享当前页面", "复制页面地址", "复制无跟踪参数地址", "翻译为简体中文",
-                "打印或另存为 PDF", "媒体中心 · 已发现 " + mediaSniffer.size() + " 项", "当前页脚本命令"
+                "打印或另存为 PDF", "媒体中心 · 已发现 " + mediaSniffer.size() + " 项", "当前页脚本命令",
+                "使用系统浏览器打开\n可用于 Passkey 等系统凭据登录",
+                "收起工具栏\n全屏浏览，向下轻滑恢复"
         };
         int[] icons = new int[] { BrowserIconView.SEARCH, BrowserIconView.INFO, BrowserIconView.SPEED, BrowserIconView.INFO,
                 BrowserIconView.SHIELD, BrowserIconView.STORAGE, BrowserIconView.STORAGE, BrowserIconView.SHARE, BrowserIconView.PLUS,
                 BrowserIconView.SHIELD, BrowserIconView.INFO, BrowserIconView.STORAGE,
-                BrowserIconView.SPEED, BrowserIconView.SCRIPT };
+                BrowserIconView.SPEED, BrowserIconView.SCRIPT, BrowserIconView.PLUS, BrowserIconView.APPEARANCE };
         showActionSheet("页面工具", currentHost(), items, icons, new SheetHandler() {
             @Override public void onItem(int which) {
                 if (which == 0) showFindDialog();
@@ -3968,9 +6444,25 @@ public final class MainActivity extends Activity implements Runnable {
                 else if (which == 10) translatePage();
                 else if (which == 11) printPage();
                 else if (which == 12) probeAndShowMediaCenter();
-                else showPageScriptCommands();
+                else if (which == 13) showPageScriptCommands();
+                else if (which == 14) openCurrentPageInSystemBrowser();
+                else {
+                    immersiveScrollChrome = true;
+                    prefs.edit().putBoolean("immersive_scroll_chrome", true).apply();
+                    updateImmersivePageLayout();
+                    hideBrowserChrome();
+                }
             }
         });
+    }
+
+    private void openCurrentPageInSystemBrowser() {
+        if (!isNetworkPage(currentPageUrl)) { toast("当前页面没有可打开的网页"); return; }
+        try {
+            Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse(currentPageUrl));
+            intent.addCategory(Intent.CATEGORY_BROWSABLE);
+            startActivity(intent);
+        } catch (Exception e) { toast("没有可用的系统浏览器"); }
     }
 
     private void toggleReaderMode() {
@@ -4031,16 +6523,18 @@ public final class MainActivity extends Activity implements Runnable {
         final String url = currentPageUrl;
         final WebView source = webView;
         final long sequence = navigationSequence;
-        if (url == null || !url.startsWith("https://") || scriptExecutor == null || scriptExecutor.isShutdown()) {
+        if (url == null || !url.regionMatches(true, 0, "https://", 0, 8) ||
+                scriptExecutor == null || scriptExecutor.isShutdown()) {
             toast("当前页面不是可检查的 HTTPS 页面");
             return;
         }
-        toast("正在独立验证服务器证书…");
+        final String userAgent = source == null ? null : source.getSettings().getUserAgentString();
+        toast("正在独立探测服务器证书（结果不代表当前页面加载响应）…");
         executeTask(scriptExecutor, new Runnable() {
             @Override public void run() {
                 TlsInspector.Result value = null;
                 Exception failure = null;
-                try { value = TlsInspector.inspect(url); } catch (Exception e) { failure = e; }
+                try { value = TlsInspector.inspect(url, userAgent); } catch (Exception e) { failure = e; }
                 final TlsInspector.Result result = value;
                 final Exception error = failure;
                 uiHandler.post(new Runnable() {
@@ -4060,6 +6554,7 @@ public final class MainActivity extends Activity implements Runnable {
         toast("正在保存完整离线页面…");
         services.offlinePages().save(webView, webView.getTitle(), currentPageUrl, new OfflinePageStore.Callback() {
             @Override public void onComplete(OfflinePageStore.Entry entry, Exception error) {
+                if (activityDestroyed) return;
                 toast(error == null ? "离线页面已保存 · " + humanBytes(entry.size) : "保存失败：" + safeMessage(error));
             }
         });
@@ -4075,13 +6570,18 @@ public final class MainActivity extends Activity implements Runnable {
         }
         new AlertDialog.Builder(this).setTitle("离线页面").setItems(labels, new DialogInterface.OnClickListener() {
             @Override public void onClick(DialogInterface dialog, int which) { showOfflineActions(entries.get(which)); }
-        }).setNegativeButton("关闭", null).show();
+        }).setNegativeButton("返回", new DialogInterface.OnClickListener() {
+            @Override public void onClick(DialogInterface dialog, int which) { showBrowserLibrary(); }
+        }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface dialog) { showBrowserLibrary(); }
+        }).show();
     }
 
     private void showOfflineActions(final OfflinePageStore.Entry entry) {
         String[] items = new String[] { "离线打开", "打开原网页", "分享归档文件", "删除离线页面" };
         showActionSheet(entry.title, entry.url, items, new int[] { BrowserIconView.PLUS, BrowserIconView.RELOAD,
-                BrowserIconView.SHARE, BrowserIconView.CLOSE }, new SheetHandler() {
+                BrowserIconView.SHARE, BrowserIconView.CLOSE }, null, null,
+                new Runnable() { @Override public void run() { showOfflinePages(); } }, new SheetHandler() {
             @Override public void onItem(int which) {
                 if (which == 0) {
                     String offlineUrl = services.offlinePages().uriFor(entry).toString();
@@ -4097,11 +6597,26 @@ public final class MainActivity extends Activity implements Runnable {
                     try { startActivity(Intent.createChooser(share, "分享离线页面")); }
                     catch (Exception e) { toast("没有可用的分享应用"); }
                 } else {
-                    services.offlinePages().remove(entry.file);
-                    toast("离线页面已删除");
+                    confirmDeleteOfflinePage(entry);
                 }
             }
         });
+    }
+
+    private void confirmDeleteOfflinePage(final OfflinePageStore.Entry entry) {
+        new AlertDialog.Builder(this).setTitle("删除离线页面？").setMessage(entry.title)
+                .setPositiveButton("删除", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) {
+                        services.offlinePages().remove(entry.file);
+                        toast("离线页面已删除");
+                        if (services.offlinePages().getAll().isEmpty()) showBrowserLibrary();
+                        else showOfflinePages();
+                    }
+                }).setNegativeButton("取消", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) { showOfflineActions(entry); }
+                }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override public void onCancel(DialogInterface dialog) { showOfflineActions(entry); }
+                }).show();
     }
 
     private void copyCleanPageUrl() {
@@ -4116,63 +6631,190 @@ public final class MainActivity extends Activity implements Runnable {
     @Override public void run() { showBrowserSettings(); }
 
     private void showBrowserSettings() {
+        startupSessionPending = false;
         String[] items = new String[] {
-                "HTTPS 优先\n自动把可升级的地址优先使用安全连接",
-                "跟踪参数清理\n打开网页前移除常见的跨站跟踪参数",
-                "第三方 Cookie\n默认阻止；仍可在网站设置中单独放行",
-                "每次打开\n当前：" + homeOpenBehaviorLabel(),
-                "搜索\n当前：" + searchEngineLabel() + " · 默认与自定义规则",
-                "主页与外观\n布局、Logo、搜索框、背景与快捷网站",
-                "收藏与文件夹\n自定义网站、重命名与多级整理",
-                "性能调度\n响应、内存与耗电策略",
-                "存储与数据\n缓存、Cookie、历史与网站数据",
-                "关于 Median\n版本、隐私说明与 WebView 兼容诊断"
+                "广告拦截\n" + (adBlockEnabled ? "已开启" : "已关闭"),
+                "深色模式\n" + (nightMode ? "已开启" : "已关闭"),
+                "侧滑导航\n" + (edgeNavigationEnabled ? "已开启" : "已关闭"),
+                "标记页面广告\n" + (isNetworkPage(currentPageUrl) ? "点选并隐藏网页元素" : "请先打开网页"),
+                "浏览与搜索\n连接、启动和地址栏",
+                "主页与外观\n主页、布局和主题",
+                "脚本与拦截\n过滤器、规则和脚本",
+                "隐私与密码\n密码库、权限与数据",
+                "下载设置\n目录与下载策略",
+                "性能模式\n当前：" + modeLabel(),
+                "关于 Median\n版本信息与社区"
         };
         int[] icons = new int[] {
-                BrowserIconView.SHIELD, BrowserIconView.CLEAN, BrowserIconView.COOKIE,
-                BrowserIconView.STARTUP, BrowserIconView.SEARCH, BrowserIconView.APPEARANCE,
-                BrowserIconView.BOOKMARK, BrowserIconView.SPEED, BrowserIconView.STORAGE, BrowserIconView.INFO
+                BrowserIconView.SHIELD, BrowserIconView.APPEARANCE, BrowserIconView.BACK,
+                BrowserIconView.CLEAN, BrowserIconView.SEARCH, BrowserIconView.HOME,
+                BrowserIconView.SCRIPT, BrowserIconView.KEY, BrowserIconView.DOWNLOAD,
+                BrowserIconView.SPEED, BrowserIconView.INFO
         };
+        int[] kinds = new int[] {
+                adBlockEnabled ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                nightMode ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                edgeNavigationEnabled ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                SHEET_ROW_ACTION,
+                SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
+                SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
+                SHEET_ROW_NAVIGATE
+        };
+        showDashboardSheet("设置", "常用开关与分类设置", items, icons, kinds, 2,
+                new int[] { 0, 4, 10 }, new String[] { "常用操作", "设置分类", "其他" }, new Runnable() {
+            @Override public void run() { showMainMenu(); }
+        }, null, null, 0, new SheetHandler() {
+            @Override public void onItem(int which) {
+                if (which == 0) {
+                    adBlockEnabled = !adBlockEnabled;
+                    prefs.edit().putBoolean("adblock", adBlockEnabled).apply();
+                    adBlockActiveByView.clear();
+                    if (webView != null && isNetworkPage(currentPageUrl)) reloadWebView(webView);
+                    toast(adBlockEnabled ? "广告拦截已开启" : "广告拦截已关闭");
+                    showBrowserSettings();
+                } else if (which == 3) {
+                    if (!isNetworkPage(currentPageUrl)) {
+                        toast("请先打开普通网页再标记广告");
+                        showBrowserSettings();
+                        return;
+                    }
+                    startAdPicker();
+                } else if (which == 1) {
+                    toggleNightMode();
+                    // Keep the settings dashboard in place after a live theme switch so the
+                    // user can continue adjusting options without reopening the menu.
+                    showBrowserSettings();
+                }
+                else if (which == 2) {
+                    edgeNavigationEnabled = !edgeNavigationEnabled;
+                    prefs.edit().putBoolean("edge_navigation", edgeNavigationEnabled).apply();
+                    toast(edgeNavigationEnabled ? "网页边缘手势已开启" : "网页边缘手势已关闭");
+                    showBrowserSettings();
+                } else if (which == 4) showBrowsingSettings();
+                else if (which == 5) showHomeCustomization(MainActivity.this);
+                else if (which == 6) showExtensionSettings();
+                else if (which == 7) showPrivacyDataSettings();
+                else if (which == 8) showDownloadSettings();
+                else if (which == 9) showPerformancePanel(MainActivity.this);
+                else showAbout(MainActivity.this);
+            }
+        });
+    }
+
+    private void showBrowsingSettings() {
+        String[] items = new String[] {
+                "HTTPS 优先",
+                "清理跟踪参数",
+                "第三方 Cookie",
+                "启动时\n" + homeOpenBehaviorLabel(),
+                "默认搜索\n" + searchEngineLabel(),
+                "沉浸式滚动栏\n下滑隐藏顶栏和底栏，上滑显示"
+        };
+        int[] icons = new int[] { BrowserIconView.SHIELD, BrowserIconView.CLEAN,
+                BrowserIconView.COOKIE, BrowserIconView.STARTUP, BrowserIconView.SEARCH, BrowserIconView.APPEARANCE };
         int[] kinds = new int[] {
                 httpsOnly ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
                 cleanTrackingParameters ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
                 acceptThirdPartyCookies ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
-                SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
-                SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE
+                SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
+                immersiveScrollChrome ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF
         };
-        String[] sections = new String[items.length];
-        sections[0] = "隐私与安全";
-        sections[3] = "启动与搜索";
-        sections[5] = "界面";
-        sections[7] = "资源与数据";
-        sections[9] = "信息";
-        showActionSheet("浏览器设置", "轻触开关立即保存 · 返回键只关闭设置", items, icons,
-                kinds, sections, null, new SheetHandler() {
-            @Override public void onItem(int which) {
-                if (which == 0) {
-                    httpsOnly = !httpsOnly;
-                    prefs.edit().putBoolean("https_only", httpsOnly).apply();
-                } else if (which == 1) {
-                    cleanTrackingParameters = !cleanTrackingParameters;
-                    prefs.edit().putBoolean("clean_tracking_parameters", cleanTrackingParameters).apply();
-                } else if (which == 2) {
-                    acceptThirdPartyCookies = !acceptThirdPartyCookies;
-                    prefs.edit().putBoolean("accept_third_party_cookies", acceptThirdPartyCookies).apply();
-                    applyCookiePolicyToAll();
-                    toast(acceptThirdPartyCookies ? "第三方 Cookie 已全局允许" :
-                            "第三方 Cookie 已默认阻止，可按网站放行");
-                } else {
-                    final Runnable returnAction = MainActivity.this;
-                    if (which == 3) showHomeOpenBehaviorChoice(false);
-                    else if (which == 4) showSearchSettings();
-                    else if (which == 5) showHomeCustomization(returnAction);
-                    else if (which == 6) openBookmarkManager(returnAction);
-                    else if (which == 7) showPerformancePanel(returnAction);
-                    else if (which == 8) showStoragePanel(returnAction);
-                    else showAbout(returnAction);
-                }
-            }
-        });
+        showActionSheet("浏览与搜索", "连接、启动和地址栏", items, icons, kinds, null,
+                this, new SheetHandler() {
+                    @Override public void onItem(int which) {
+                        if (which == 0) {
+                            httpsOnly = !httpsOnly;
+                            prefs.edit().putBoolean("https_only", httpsOnly).apply();
+                        } else if (which == 1) {
+                            cleanTrackingParameters = !cleanTrackingParameters;
+                            prefs.edit().putBoolean("clean_tracking_parameters", cleanTrackingParameters).apply();
+                        } else if (which == 2) {
+                            acceptThirdPartyCookies = !acceptThirdPartyCookies;
+                            prefs.edit().putBoolean("accept_third_party_cookies", acceptThirdPartyCookies).apply();
+                            applyCookiePolicyToAll();
+                            toast(acceptThirdPartyCookies ? "第三方 Cookie 已全局允许" :
+                                    "第三方 Cookie 已默认阻止，可按网站放行");
+                        } else if (which == 3) showHomeOpenBehaviorChoice(false);
+                        else if (which == 4) showSearchSettings();
+                        else {
+                            immersiveScrollChrome = !immersiveScrollChrome;
+                            prefs.edit().putBoolean("immersive_scroll_chrome", immersiveScrollChrome).apply();
+                            updateImmersivePageLayout();
+                            if (!immersiveScrollChrome) showBrowserChrome(false);
+                            toast(immersiveScrollChrome ? "沉浸式滚动栏已开启" : "沉浸式滚动栏已关闭");
+                        }
+                    }
+                });
+    }
+
+    private void showExtensionSettings() {
+        String[] items = new String[] {
+                "广告拦截",
+                "手动屏蔽页面元素",
+                "过滤器订阅与规则",
+                "用户脚本"
+        };
+        int[] icons = new int[] { BrowserIconView.SHIELD, BrowserIconView.CLEAN,
+                BrowserIconView.STORAGE, BrowserIconView.SCRIPT };
+        int[] kinds = new int[] { adBlockEnabled ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF,
+                SHEET_ROW_ACTION, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE };
+        showActionSheet("脚本与广告拦截", "规则与脚本均在本机处理", items, icons,
+                kinds, null, this, new SheetHandler() {
+                    @Override public void onItem(int which) {
+                        if (which == 0) {
+                            adBlockEnabled = !adBlockEnabled;
+                            prefs.edit().putBoolean("adblock", adBlockEnabled).apply();
+                            adBlockActiveByView.clear();
+                            if (webView != null && isNetworkPage(currentPageUrl)) reloadWebView(webView);
+                            toast(adBlockEnabled ? "广告拦截已开启" : "广告拦截已关闭");
+                        } else if (which == 1) {
+                            if (!isNetworkPage(currentPageUrl)) {
+                                toast("请先打开普通网页再标记广告");
+                                showExtensionSettings();
+                            } else startAdPicker();
+                        }
+                        else if (which == 2) showFilterCenter(new Runnable() {
+                            @Override public void run() { showExtensionSettings(); }
+                        });
+                        else showScriptCenter(new Runnable() {
+                            @Override public void run() { showExtensionSettings(); }
+                        });
+                    }
+                });
+    }
+
+    private void showPrivacyDataSettings() {
+        String host = currentHost();
+        String[] items = new String[] {
+                "当前网站权限\n" + (host.length() == 0 ? "请先打开网页" : host),
+                "密码库",
+                "书签与历史",
+                "存储与数据",
+                "新建隐私窗口",
+                "退出时清理浏览数据\n不删除书签、密码、下载与脚本"
+        };
+        int[] icons = new int[] { BrowserIconView.SHIELD, BrowserIconView.KEY,
+                BrowserIconView.HISTORY, BrowserIconView.STORAGE, BrowserIconView.SHIELD, BrowserIconView.CLOSE };
+        int[] kinds = new int[] { SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
+                SHEET_ROW_NAVIGATE, SHEET_ROW_NAVIGATE,
+                clearDataOnExit ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF };
+        showActionSheet("隐私与数据", "本地优先", items, icons,
+                kinds, null, this, new SheetHandler() {
+                    @Override public void onItem(int which) {
+                        if (which == 0) showSiteSettings();
+                        else if (which == 1) showPasswordMenu(new Runnable() {
+                            @Override public void run() { showPrivacyDataSettings(); }
+                        });
+                        else if (which == 2) showBrowserLibrary();
+                        else if (which == 3) showStoragePanel(MainActivity.this);
+                        else if (which == 4) openPrivateWindow();
+                        else {
+                            clearDataOnExit = !clearDataOnExit;
+                            prefs.edit().putBoolean("clear_data_on_exit", clearDataOnExit).apply();
+                            toast(clearDataOnExit ? "退出时将清理浏览数据" : "退出时不自动清理浏览数据");
+                        }
+                    }
+                });
     }
 
     private void showSearchSettings() {
@@ -4185,7 +6827,7 @@ public final class MainActivity extends Activity implements Runnable {
         final Runnable returnHere = new Runnable() {
             @Override public void run() { showSearchSettings(); }
         };
-        showActionSheet("搜索设置", "地址栏与主页共用同一搜索策略", items, icons,
+        showActionSheet("搜索设置", "地址栏与主页共用", items, icons,
                 null, null, this, new SheetHandler() {
                     @Override public void onItem(int which) {
                         if (which == 0) showSearchEngineDialog(returnHere);
@@ -4201,262 +6843,49 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showHomeCustomization(Runnable backAction) {
-        homeCustomizationBackAction = backAction;
-        showHomeCustomizationPanel();
+        homeCustomization().show(backAction);
     }
 
-    private void showHomeCustomizationPanel() {
-        final HomePageConfig value = homePageConfig();
-        boolean hasCustomHtml = CustomHomeHtml.valid(prefs.getString("home_custom_html", ""));
-        boolean hasCustomCss = CustomHomeCss.clean(prefs.getString("home_custom_css", "")).length() > 0;
-        String[] items = new String[] {
-                "页面布局\n调整整体排版、副标题、时钟与强调色",
-                "每次打开\n当前：" + homeOpenBehaviorLabel(),
-                "Logo\n当前：" + logoModeLabel(value),
-                "搜索框\n当前：" + (!value.showSearch ? "隐藏" : ("glass".equals(value.searchStyle) ? "磨砂" : "纯色")),
-                "背景\n当前：" + (value.hasWallpaper ? "自定义壁纸" : "默认纯色"),
-                "快捷网站\n当前：" + (value.showShortcuts ? value.shortcutColumns + " 列" : "隐藏"),
-                "自定义主页\n当前：" + (value.customHtmlEnabled ? "完整 HTML" :
-                        (hasCustomCss ? "自定义 CSS" : (hasCustomHtml ? "HTML 已保存、未启用" : "未设置")))
-        };
-        int[] icons = new int[] {
-                BrowserIconView.TABS, BrowserIconView.HOME, BrowserIconView.INFO,
-                BrowserIconView.SEARCH, BrowserIconView.DESKTOP, BrowserIconView.TABS,
-                BrowserIconView.SCRIPT
-        };
-        showActionSheet("主页与外观", "修改立即保存 · 返回或关闭都不会离开当前网页", items, icons,
-                null, null, homeCustomizationBackAction, new SheetHandler() {
-            @Override public void onItem(int which) {
-                if (which == 0) showHomeLayoutCustomization();
-                else if (which == 1) showHomeOpenBehaviorChoice(true);
-                else if (which == 2) showLogoCustomization();
-                else if (which == 3) showSearchCustomization();
-                else if (which == 4) showBackgroundCustomization();
-                else if (which == 5) showShortcutCustomization();
-                else showCustomCodeCustomization();
-            }
-        });
-    }
-
-    private void showHomeLayoutCustomization() {
-        final HomePageConfig value = homePageConfig();
-        String[] items = new String[] {
-                "副标题：" + settingPreview(value.subtitle, 16, "未设置"),
-                "页面排列方式\n当前：" + ("compact".equals(value.layout) ? "紧凑" : "居中"),
-                "主页时钟：" + (value.showClock ? "显示" : "隐藏"),
-                "强调色：" + accentLabel(value.accent),
-                "左上角品牌：" + (value.showCornerBrand ? "显示" : "隐藏"),
-                "恢复全部默认外观"
-        };
-        showActionSheet("页面布局", "点击项目修改；选中后立即应用并返回此页", items,
-                new int[] { BrowserIconView.INFO, BrowserIconView.TABS, BrowserIconView.INFO,
-                        BrowserIconView.SPEED, BrowserIconView.TABS, BrowserIconView.CLOSE },
-                null, null, new HomeDialogReturn(HOME_SECTION_MAIN), new SheetHandler() {
-                    @Override public void onItem(int which) {
-                        if (which == 0) showHomeTextSetting(false, HOME_SECTION_LAYOUT);
-                        else if (which == 1) showHomeStringChoiceInSection("页面布局", "home_layout",
-                                new String[] { "center", "compact" }, new String[] { "居中", "紧凑" }, value.layout, HOME_SECTION_LAYOUT);
-                        else if (which == 2) toggleHomeBooleanInSection("home_show_clock", value.showClock, HOME_SECTION_LAYOUT);
-                        else if (which == 3) showHomeStringChoiceInSection("主页强调色", "home_accent",
-                                new String[] { "blue", "violet", "green", "orange", "rose", "teal" },
-                                new String[] { "蓝色", "紫色", "绿色", "橙色", "玫红", "青色" }, value.accent, HOME_SECTION_LAYOUT);
-                        else if (which == 4) toggleHomeBooleanInSection("home_show_corner", value.showCornerBrand, HOME_SECTION_LAYOUT);
-                        else confirmResetHomeCustomization(HOME_SECTION_LAYOUT);
-                    }
-                });
-    }
-
-    private void showLogoCustomization() {
-        final HomePageConfig value = homePageConfig();
-        ArrayList<String> labels = new ArrayList<String>();
-        ArrayList<Integer> actions = new ArrayList<Integer>();
-        labels.add("Logo 类型：" + logoModeLabel(value)); actions.add(Integer.valueOf(0));
-        if ("text".equals(value.logoMode)) {
-            labels.add("Logo 文字：" + settingPreview(value.title, 18, "Median")); actions.add(Integer.valueOf(1));
-            labels.add("文字配色：" + logoStyleLabel(value.logoStyle)); actions.add(Integer.valueOf(2));
-            labels.add("文字排版：" + value.logoFontSize + " px · " + value.logoFontWeight + " · " +
-                    logoLetterSpacingLabel(value.logoLetterSpacing)); actions.add(Integer.valueOf(3));
-            labels.add("高级文字代码"); actions.add(Integer.valueOf(7));
-        } else if ("image".equals(value.logoMode)) {
-            labels.add(value.hasLogo ? "更换 Logo 图片" : "选择 Logo 图片"); actions.add(Integer.valueOf(8));
-            labels.add("图片宽度：" + value.logoImageWidth + " px"); actions.add(Integer.valueOf(9));
-            labels.add("图片高度：" + value.logoImageHeight + " px"); actions.add(Integer.valueOf(10));
-            labels.add("图片圆角：" + value.logoImageRadius + "%"); actions.add(Integer.valueOf(11));
-        }
-        final int[] mapped = new int[actions.size()];
-        for (int i = 0; i < mapped.length; i++) mapped[i] = actions.get(i).intValue();
-        String[] items = labels.toArray(new String[labels.size()]);
-        int[] icons = new int[items.length];
-        for (int i = 0; i < icons.length; i++) icons[i] = i == 0 ? BrowserIconView.INFO : BrowserIconView.SPEED;
-        showActionSheet("Logo", "点击项目修改；高级文字代码只有保存后才会生效", items, icons,
-                null, null, new HomeDialogReturn(HOME_SECTION_MAIN), new SheetHandler() {
-            @Override public void onItem(int which) {
-                int action = mapped[which];
-                if (action == 0) showLogoModeChoice(value);
-                else if (action == 1) showHomeTextSetting(true, HOME_SECTION_LOGO);
-                else if (action == 2) showLogoStyleChoice(value, HOME_SECTION_LOGO);
-                else if (action == 3) showLogoTypographyCustomization();
-                else if (action == 7) showLogoCodeEditor(HOME_SECTION_LOGO);
-                else if (action == 8) chooseHomeImage(HomeImageStore.Kind.LOGO, HOME_SECTION_LOGO);
-                else if (action == 9) showHomeIntegerChoiceInSection("图片宽度", "home_logo_image_width",
-                        new int[] { 64, 88, 112, 132, 160, 200, 240 },
-                        new String[] { "64 px", "88 px", "112 px", "132 px", "160 px", "200 px", "240 px" }, value.logoImageWidth, HOME_SECTION_LOGO);
-                else if (action == 10) showHomeIntegerChoiceInSection("图片高度", "home_logo_image_height",
-                        new int[] { 48, 64, 80, 96, 112, 144, 176 },
-                        new String[] { "48 px", "64 px", "80 px", "96 px", "112 px", "144 px", "176 px" }, value.logoImageHeight, HOME_SECTION_LOGO);
-                else showHomeIntegerChoiceInSection("图片圆角", "home_logo_image_radius",
-                        new int[] { 0, 8, 16, 24, 32, 50 },
-                        new String[] { "0%", "8%", "16%", "24%", "32%", "50% 圆形" }, value.logoImageRadius, HOME_SECTION_LOGO);
-            }
-        });
-    }
-
-    private void showLogoTypographyCustomization() {
-        final HomePageConfig value = homePageConfig();
-        String[] items = new String[] {
-                "字号：" + value.logoFontSize + " px",
-                "字重：" + value.logoFontWeight,
-                "字间距：" + logoLetterSpacingLabel(value.logoLetterSpacing),
-                "渐变方向：" + logoGradientAngleLabel(value.logoGradientAngle)
-        };
-        showActionSheet("文字排版", "统一调整 Logo 的尺寸与间隔", items,
-                new int[] { BrowserIconView.SPEED, BrowserIconView.SPEED, BrowserIconView.SPEED, BrowserIconView.SPEED },
-                null, null, new HomeDialogReturn(HOME_SECTION_LOGO), new SheetHandler() {
-                    @Override public void onItem(int which) {
-                        if (which == 0) showHomeIntegerChoiceInSection("Logo 字号", "home_logo_font_size",
-                                new int[] { 28, 36, 44, 47, 52, 64, 72, 88 },
-                                new String[] { "28 px", "36 px", "44 px", "47 px", "52 px", "64 px", "72 px", "88 px" }, value.logoFontSize, HOME_SECTION_LOGO);
-                        else if (which == 1) showHomeIntegerChoiceInSection("Logo 字重", "home_logo_font_weight",
-                                new int[] { 300, 400, 500, 600, 700, 800, 900 },
-                                new String[] { "300 细", "400 常规", "500 中等", "600 半粗", "700 粗体", "800 特粗", "900 黑体" }, value.logoFontWeight, HOME_SECTION_LOGO);
-                        else if (which == 2) showHomeIntegerChoiceInSection("Logo 字间距", "home_logo_letter_spacing",
-                                new int[] { -3, -2, -1, 0, 1, 2, 3, 4, 6, 8, 10 },
-                                new String[] { "-3 px", "-2 px", "-1 px", "标准", "+1 px", "+2 px", "+3 px", "+4 px", "+6 px", "+8 px", "+10 px" }, value.logoLetterSpacing, HOME_SECTION_LOGO);
-                        else showHomeIntegerChoiceInSection("渐变方向", "home_logo_gradient_angle",
-                                new int[] { 90, 135, 180, 45, 0 },
-                                new String[] { "左 → 右", "左上 → 右下", "上 → 下", "左下 → 右上", "下 → 上" }, value.logoGradientAngle, HOME_SECTION_LOGO);
-                    }
-                });
-    }
-
-    private void showLogoModeChoice(final HomePageConfig value) {
-        HomeDialogReturn back = new HomeDialogReturn(HOME_SECTION_LOGO);
-        int checked;
-        boolean defaults = "text".equals(value.logoMode) && "Median".equals(value.title) &&
-                "median".equals(value.logoStyle) && value.logoFontSize == 47 &&
-                value.logoFontWeight == 720 && value.logoLetterSpacing == 0;
-        if ("none".equals(value.logoMode)) checked = 3;
-        else if ("image".equals(value.logoMode)) checked = 2;
-        else checked = defaults ? 0 : 1;
-        new AlertDialog.Builder(this).setTitle("Logo 类型").setSingleChoiceItems(
-                new String[] { "默认 Median", "自定义文字", "图片", "无" }, checked,
-                new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        dialog.dismiss();
-                        SharedPreferences.Editor editor = prefs.edit();
-                        if (which == 0) {
-                            editor.putString("home_logo_mode", "text").putString("home_title", "Median")
-                                    .putString("home_logo_style", "median").remove("home_logo_code")
-                                    .putInt("home_logo_font_size", 47).putInt("home_logo_font_weight", 720)
-                                    .putInt("home_logo_letter_spacing", 0).apply();
-                            homeCustomizationChanged("已恢复默认 Median Logo", HOME_SECTION_LOGO);
-                        } else if (which == 1) {
-                            editor.putString("home_logo_mode", "text").apply();
-                            homeCustomizationChanged(null, HOME_SECTION_LOGO);
-                        } else if (which == 2) {
-                            editor.putString("home_logo_mode", "image").apply();
-                            if (value.hasLogo) homeCustomizationChanged(null, HOME_SECTION_LOGO);
-                            else {
-                                if (isHomeUrl(currentPageUrl)) showHome();
-                                chooseHomeImage(HomeImageStore.Kind.LOGO, HOME_SECTION_LOGO);
-                            }
-                        } else {
-                            editor.putString("home_logo_mode", "none").apply();
-                            homeCustomizationChanged("主页 Logo 已隐藏", HOME_SECTION_LOGO);
+    /** Appearance editing is lazy and does not participate in first-page startup. */
+    private HomeCustomizationController homeCustomization() {
+        if (homeCustomizationController == null) {
+            homeCustomizationController = new HomeCustomizationController(this, prefs, homeImages, uiHandler,
+                    new HomeCustomizationController.TaskQueue() {
+                        @Override public boolean isAvailable() {
+                            return scriptExecutor != null && !scriptExecutor.isShutdown();
                         }
-                    }
-                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showSearchCustomization() {
-        final HomePageConfig value = homePageConfig();
-        String[] items = new String[] {
-                "搜索框：" + (!value.showSearch ? "隐藏" : ("glass".equals(value.searchStyle) ? "磨砂" : "纯色")),
-                "搜索引擎按钮：" + (value.showEngines ? "显示" : "隐藏"),
-                "默认搜索引擎：" + searchEngineLabel()
-        };
-        showActionSheet("搜索框", "功能保持内置，CSS 只修改外观", items,
-                new int[] { BrowserIconView.SEARCH, BrowserIconView.SEARCH, BrowserIconView.SEARCH },
-                null, null, new HomeDialogReturn(HOME_SECTION_MAIN), new SheetHandler() {
-                    @Override public void onItem(int which) {
-                        if (which == 0) showHomeSearchChoice(value, HOME_SECTION_SEARCH);
-                        else if (which == 1) toggleHomeBooleanInSection("home_show_engines", value.showEngines, HOME_SECTION_SEARCH);
-                        else showSearchEngineDialog(new HomeDialogReturn(HOME_SECTION_SEARCH));
-                    }
-                });
-    }
-
-    private void showBackgroundCustomization() {
-        final HomePageConfig value = homePageConfig();
-        String[] items = new String[] {
-                "主页壁纸：" + (value.hasWallpaper ? "已设置" : "默认纯色"),
-                "壁纸遮罩：" + value.wallpaperDim + "%",
-                "壁纸模糊：" + (value.wallpaperBlur == 0 ? "关闭" : value.wallpaperBlur + " px"),
-                "壁纸显示：" + ("contain".equals(value.wallpaperFit) ? "完整显示" : "填充裁剪")
-        };
-        showActionSheet("背景", "壁纸继续独立于 CSS 与 HTML", items,
-                new int[] { BrowserIconView.DESKTOP, BrowserIconView.SHIELD, BrowserIconView.SPEED, BrowserIconView.DESKTOP },
-                null, null, new HomeDialogReturn(HOME_SECTION_MAIN), new SheetHandler() {
-                    @Override public void onItem(int which) {
-                        if (which == 0) showHomeAssetActions(HomeImageStore.Kind.WALLPAPER);
-                        else if (which == 1) showHomeIntegerChoiceInSection("壁纸遮罩", "home_wallpaper_dim",
-                                new int[] { 0, 15, 28, 40, 55, 70 }, new String[] { "0%", "15%", "28%", "40%", "55%", "70%" }, value.wallpaperDim, HOME_SECTION_BACKGROUND);
-                        else if (which == 2) showHomeIntegerChoiceInSection("壁纸模糊", "home_wallpaper_blur",
-                                new int[] { 0, 3, 6, 9, 12 }, new String[] { "关闭", "3 px", "6 px", "9 px", "12 px" }, value.wallpaperBlur, HOME_SECTION_BACKGROUND);
-                        else showHomeStringChoiceInSection("壁纸显示方式", "home_wallpaper_fit",
-                                new String[] { "cover", "contain" }, new String[] { "填充裁剪", "完整显示" }, value.wallpaperFit, HOME_SECTION_BACKGROUND);
-                    }
-                });
-    }
-
-    private void showShortcutCustomization() {
-        final HomePageConfig value = homePageConfig();
-        String[] items = new String[] {
-                "快捷网站：" + (value.showShortcuts ? "显示" : "隐藏"),
-                "入口列数：" + value.shortcutColumns + " 列",
-                "入口形状：" + tileShapeLabel(value.tileShape),
-                "管理快捷网站"
-        };
-        showActionSheet("快捷网站", "显示内容来自本地书签", items,
-                new int[] { BrowserIconView.TABS, BrowserIconView.TABS, BrowserIconView.TABS, BrowserIconView.INFO },
-                null, null, new HomeDialogReturn(HOME_SECTION_MAIN), new SheetHandler() {
-                    @Override public void onItem(int which) {
-                        if (which == 0) toggleHomeBooleanInSection("home_show_shortcuts", value.showShortcuts, HOME_SECTION_SHORTCUTS);
-                        else if (which == 1) showHomeIntegerChoiceInSection("快捷入口列数", "home_shortcut_columns",
-                                new int[] { 3, 4, 5 }, new String[] { "3 列", "4 列", "5 列" }, value.shortcutColumns, HOME_SECTION_SHORTCUTS);
-                        else if (which == 2) showHomeStringChoiceInSection("快捷入口形状", "home_tile_shape",
-                                new String[] { "rounded", "circle", "square" }, new String[] { "圆角方形", "圆形", "小圆角方形" }, value.tileShape, HOME_SECTION_SHORTCUTS);
-                        else openBookmarkManager(new HomeDialogReturn(HOME_SECTION_SHORTCUTS));
-                    }
-                });
-    }
-
-    private void showCustomCodeCustomization() {
-        HomePageConfig value = homePageConfig();
-        boolean hasCss = value.customCss.length() > 0;
-        boolean hasHtml = CustomHomeHtml.valid(prefs.getString("home_custom_html", ""));
-        String[] items = new String[] {
-                "自定义 CSS\n" + (hasCss ? (value.customHtmlEnabled ? "已保存，HTML 模式下暂不显示" : "已启用") : "未设置") + " · 保留内置功能（推荐）",
-                "完整 HTML\n" + (value.customHtmlEnabled ? "已启用" : (hasHtml ? "已保存，未启用" : "未设置")) + " · 完全替换主页，JS 在沙箱内运行"
-        };
-        showActionSheet("自定义主页", "选择一种方式进入编辑或启停管理", items,
-                new int[] { BrowserIconView.SPEED, BrowserIconView.SCRIPT },
-                null, null, new HomeDialogReturn(HOME_SECTION_MAIN), new SheetHandler() {
-                    @Override public void onItem(int which) {
-                        if (which == 0) showCustomCssActions();
-                        else showCustomHomeActions(HOME_SECTION_CODE);
-                    }
-                });
+                        @Override public boolean execute(Runnable task) { return executeTask(scriptExecutor, task); }
+                    }, new HomeCustomizationController.Host() {
+                        @Override public HomePageConfig homePageConfig() { return MainActivity.this.homePageConfig(); }
+                        @Override public boolean isNightMode() { return nightMode; }
+                        @Override public void refreshHomeIfVisible() {
+                            if (isHomeUrl(currentPageUrl)) showHome();
+                        }
+                        @Override public void toast(String message) { MainActivity.this.toast(message); }
+                        @Override public void postAfterUiTransition(Runnable action) {
+                            MainActivity.this.postAfterUiTransition(action);
+                        }
+                        @Override public void showActionSheet(String title, String subtitle, String[] items, int[] icons,
+                                Runnable backAction, final HomeCustomizationController.SheetHandler handler) {
+                            MainActivity.this.showActionSheet(title, subtitle, items, icons, null, null, backAction,
+                                    new SheetHandler() {
+                                        @Override public void onItem(int which) { handler.onItem(which); }
+                                    });
+                        }
+                        @Override public String searchEngineLabel() { return MainActivity.this.searchEngineLabel(); }
+                        @Override public void showSearchEngineDialog(Runnable action) {
+                            MainActivity.this.showSearchEngineDialog(action);
+                        }
+                        @Override public void openBookmarkManager(Runnable action) {
+                            MainActivity.this.openBookmarkManager(action);
+                        }
+                        @Override public String homeOpenBehaviorLabel() { return MainActivity.this.homeOpenBehaviorLabel(); }
+                        @Override public void showHomeOpenBehaviorChoice() {
+                            MainActivity.this.showHomeOpenBehaviorChoice(true);
+                        }
+                    });
+        }
+        return homeCustomizationController;
     }
 
     private void showHomeOpenBehaviorChoice() { showHomeOpenBehaviorChoice(false); }
@@ -4466,9 +6895,9 @@ public final class MainActivity extends Activity implements Runnable {
         final String[] modes = new String[] { HomeOpenPolicy.OPEN_HOME, HomeOpenPolicy.OPEN_CUSTOM_URL,
                 HomeOpenPolicy.KEEP_LAST };
         String[] labels = new String[] {
-                "打开主页\n使用内置主页或自定义 HTML 主页",
-                "自定义页面\n将一个网页链接设为主页",
-                "保留上一次访问的内容\n冷启动时恢复上次标签页"
+                "打开主页",
+                "打开自定义网页",
+                "恢复上次标签"
         };
         int checked = 0;
         String current = homeOpenMode();
@@ -4500,7 +6929,7 @@ public final class MainActivity extends Activity implements Runnable {
         input.setSelectAllOnFocus(true);
         input.setPadding(dp(16), dp(8), dp(16), dp(8));
         final AlertDialog dialog = new AlertDialog.Builder(this).setTitle("自定义页面")
-                .setMessage("输入网页地址后，主页键、冷启动和每个新建标签页都会打开它。没有协议时自动使用 HTTPS。")
+                .setMessage("用于主页键、冷启动和新标签；未写协议时使用 HTTPS。")
                 .setView(input).setPositiveButton("保存并使用", null)
                 .setNegativeButton("取消", back).create();
         dialog.setOnCancelListener(back);
@@ -4529,415 +6958,9 @@ public final class MainActivity extends Activity implements Runnable {
         else continueSettingsPanel(this);
     }
 
-    private void showCustomCssActions() {
-        final String saved = CustomHomeCss.clean(prefs.getString("home_custom_css", ""));
-        if (saved.length() == 0) { showCustomCssEditor(); return; }
-        HomeDialogReturn back = new HomeDialogReturn(HOME_SECTION_CODE);
-        new AlertDialog.Builder(this).setTitle("自定义 CSS")
-                .setItems(new String[] { "编辑 CSS", "清除 CSS" }, new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        if (which == 0) showCustomCssEditor();
-                        else {
-                            prefs.edit().remove("home_custom_css").apply();
-                            homeCustomizationChanged("自定义 CSS 已清除", HOME_SECTION_CODE);
-                        }
-                    }
-                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showCustomCssEditor() {
-        final EditText input = compactCodeEditor();
-        final HomeDialogReturn back = new HomeDialogReturn(HOME_SECTION_CODE);
-        String saved = CustomHomeCss.clean(prefs.getString("home_custom_css", ""));
-        input.setText(saved.length() == 0 ? CustomHomeCss.EXAMPLE : saved);
-        input.setHint(CustomHomeCss.EXAMPLE);
-        final AlertDialog dialog = new AlertDialog.Builder(this).setTitle("自定义 CSS")
-                .setMessage("推荐方案：只改变外观，搜索、时钟和快捷网站继续由 Median 负责。常用选择器：.brand、.search、.engines、.shortcuts、.tile、.corner、.wrap。最大 32 KB；禁止外部 URL 与 @import。")
-                .setView(input).setPositiveButton("保存并使用", null).setNeutralButton("示例", null)
-                .setNegativeButton("取消", back).create();
-        dialog.setOnCancelListener(back);
-        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
-            @Override public void onShow(DialogInterface ignored) {
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View view) { input.setText(CustomHomeCss.EXAMPLE); input.setSelection(input.length()); }
-                });
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View view) {
-                        String raw = input.getText().toString().trim();
-                        if (raw.length() == 0) { toast("CSS 不能为空，可使用“清除 CSS”移除"); return; }
-                        String error = CustomHomeCss.error(raw);
-                        if (error.length() > 0) { toast(error); return; }
-                        prefs.edit().putString("home_custom_css", raw)
-                                .putBoolean("home_custom_html_enabled", false).apply();
-                        dialog.dismiss();
-                        homeCustomizationChanged("自定义 CSS 已启用", HOME_SECTION_CODE);
-                    }
-                });
-            }
-        });
-        dialog.show();
-    }
-
-    private EditText compactCodeEditor() {
-        EditText input = new EditText(this);
-        input.setMinLines(4);
-        input.setMaxLines(8);
-        input.setMinHeight(dp(132));
-        input.setMaxHeight(dp(238));
-        input.setVerticalScrollBarEnabled(true);
-        input.setHorizontallyScrolling(false);
-        input.setGravity(Gravity.TOP | Gravity.START);
-        input.setTypeface(android.graphics.Typeface.MONOSPACE);
-        input.setTextSize(13.5f);
-        input.setTextColor(nightMode ? Color.rgb(232, 234, 237) : TEXT);
-        input.setHintTextColor(nightMode ? Color.rgb(154, 160, 166) : MUTED);
-        input.setBackground(roundRect(nightMode ? Color.rgb(43, 46, 51) : SURFACE, 12));
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE |
-                InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        input.setPadding(dp(14), dp(10), dp(14), dp(10));
-        return input;
-    }
-
-    private void showCustomHomeActions() { showCustomHomeActions(HOME_SECTION_MAIN); }
-
-    private void showCustomHomeActions(final int returnSection) {
-        final String saved = prefs.getString("home_custom_html", "");
-        if (!CustomHomeHtml.valid(saved)) { showCustomHomeEditor(returnSection); return; }
-        final boolean enabled = prefs.getBoolean("home_custom_html_enabled", false);
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        new AlertDialog.Builder(this).setTitle("完整 HTML 页面")
-                .setItems(new String[] { "编辑 HTML", enabled ? "停用并显示默认主页" : "启用自定义主页", "删除自定义主页" },
-                        new DialogInterface.OnClickListener() {
-                            @Override public void onClick(DialogInterface dialog, int which) {
-                                if (which == 0) showCustomHomeEditor(returnSection);
-                                else if (which == 1) {
-                                    prefs.edit().putBoolean("home_custom_html_enabled", !enabled).apply();
-                                    homeCustomizationChanged(enabled ? "已停用完整 HTML" : "已启用完整 HTML", returnSection);
-                                } else confirmDeleteCustomHome(returnSection);
-                            }
-                        }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showCustomHomeEditor(final int returnSection) {
-        final EditText input = compactCodeEditor();
-        final HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        String saved = prefs.getString("home_custom_html", "");
-        input.setText(CustomHomeHtml.valid(saved) ? saved : CustomHomeHtml.EXAMPLE);
-        input.setHint(CustomHomeHtml.EXAMPLE);
-        final AlertDialog dialog = new AlertDialog.Builder(this).setTitle("自定义主页 HTML")
-                .setMessage("完整替换主页，支持 HTML、CSS 和本地 JavaScript，最大 64 KB。脚本在无同源、无联网、无内部权限的沙箱中运行；壁纸仍独立控制。")
-                .setView(input).setPositiveButton("保存并启用", null).setNeutralButton("示例", null)
-                .setNegativeButton("取消", back).create();
-        dialog.setOnCancelListener(back);
-        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
-            @Override public void onShow(DialogInterface ignored) {
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View view) {
-                        input.setText(CustomHomeHtml.EXAMPLE);
-                        input.setSelection(input.length());
-                    }
-                });
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View view) {
-                        String raw = input.getText().toString().trim();
-                        if (raw.length() == 0) { toast("HTML 不能为空"); return; }
-                        if (raw.getBytes(StandardCharsets.UTF_8).length > CustomHomeHtml.MAX_LENGTH) {
-                            toast("HTML 不能超过 64 KB"); return;
-                        }
-                        long previous = Math.max(0L, prefs.getLong("home_custom_html_version", 0L));
-                        long next = previous == Long.MAX_VALUE ? 1L : previous + 1L;
-                        boolean saved = prefs.edit().putString("home_custom_html", raw)
-                                .putBoolean("home_custom_html_enabled", true)
-                                .putLong("home_custom_html_version", next).commit();
-                        if (!saved) { toast("自定义主页保存失败"); return; }
-                        dialog.dismiss();
-                        homeCustomizationChanged("完整 HTML 已保存并启用", returnSection);
-                    }
-                });
-            }
-        });
-        dialog.show();
-    }
-
-    private void confirmDeleteCustomHome(final int returnSection) {
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        new AlertDialog.Builder(this).setTitle("删除自定义主页？")
-                .setMessage("HTML 代码将从本机永久删除，壁纸不会受影响。")
-                .setPositiveButton("删除", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        prefs.edit().remove("home_custom_html").remove("home_custom_html_enabled")
-                                .remove("home_custom_html_version").apply();
-                        homeCustomizationChanged("完整 HTML 已删除", returnSection);
-                    }
-                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showHomeAssetActions(final HomeImageStore.Kind kind) {
-        final int returnSection = kind == HomeImageStore.Kind.WALLPAPER ? HOME_SECTION_BACKGROUND : HOME_SECTION_LOGO;
-        if (homeImages == null || !homeImages.has(kind)) { chooseHomeImage(kind, returnSection); return; }
-        String label = kind == HomeImageStore.Kind.WALLPAPER ? "壁纸" : "Logo";
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        new AlertDialog.Builder(this).setTitle("主页" + label)
-                .setItems(new String[] { "更换图片", "移除自定义" + label }, new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        if (which == 0) chooseHomeImage(kind, returnSection);
-                        else {
-                            homeImages.remove(kind);
-                            if (kind == HomeImageStore.Kind.LOGO) prefs.edit().putString("home_logo_mode", "text").apply();
-                            homeCustomizationChanged(kind == HomeImageStore.Kind.WALLPAPER ?
-                                    "已恢复默认背景" : "已恢复文字 Logo", returnSection);
-                        }
-                    }
-                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void chooseHomeImage(HomeImageStore.Kind kind, int returnSection) {
-        pendingHomeImageReturnSection = returnSection;
-        try {
-            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            intent.setType("image/*");
-            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-            startActivityForResult(intent, kind == HomeImageStore.Kind.WALLPAPER ? HOME_WALLPAPER_REQUEST : HOME_LOGO_REQUEST);
-        } catch (Exception error) {
-            toast("没有可用的图片选择器");
-            continueHomeSection(pendingHomeImageReturnSection);
-        }
-    }
-
-    private void importHomeImage(final Uri uri, final HomeImageStore.Kind kind) {
-        if (uri == null || homeImages == null || scriptExecutor == null || scriptExecutor.isShutdown()) {
-            toast("无法读取所选图片");
-            continueHomeSection(pendingHomeImageReturnSection);
-            return;
-        }
-        toast(kind == HomeImageStore.Kind.WALLPAPER ? "正在优化壁纸…" : "正在优化 Logo…");
-        try {
-            executeTask(scriptExecutor, new Runnable() {
-                @Override public void run() {
-                    Exception failure = null;
-                    try { homeImages.save(uri, kind); }
-                    catch (Exception error) { failure = error; }
-                    final Exception result = failure;
-                    uiHandler.post(new Runnable() {
-                        @Override public void run() {
-                            if (result != null) {
-                                toast("图片处理失败：" + safeMessage(result));
-                                continueHomeSection(pendingHomeImageReturnSection);
-                                return;
-                            }
-                            if (kind == HomeImageStore.Kind.LOGO)
-                                prefs.edit().putString("home_logo_mode", "image").apply();
-                            homeCustomizationChanged(kind == HomeImageStore.Kind.WALLPAPER ?
-                                    "主页壁纸已更新" : "主页 Logo 已更新", pendingHomeImageReturnSection);
-                        }
-                    });
-                }
-            });
-        } catch (RuntimeException rejected) {
-            toast("图片处理队列繁忙，请稍后重试");
-            continueHomeSection(pendingHomeImageReturnSection);
-        }
-    }
-
-    private void showHomeTextSetting(final boolean title) { showHomeTextSetting(title, HOME_SECTION_MAIN); }
-
-    private void showHomeTextSetting(final boolean title, final int returnSection) {
-        final EditText input = new EditText(this);
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        input.setSingleLine(true);
-        input.setText(title ? homePageConfig().title : homePageConfig().subtitle);
-        input.setHint(title ? "Median" : "例如：今天也要保持好奇");
-        input.setSelectAllOnFocus(true);
-        input.setPadding(dp(16), dp(8), dp(16), dp(8));
-        new AlertDialog.Builder(this).setTitle(title ? "Logo 文字" : "主页副标题")
-                .setMessage(title ? "最多 28 个字符；留空恢复 Median。" : "最多 64 个字符；留空则隐藏。")
-                .setView(input).setPositiveButton("保存", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        String value = title ? HomePageConfig.cleanTitle(input.getText().toString()) :
-                                HomePageConfig.cleanSubtitle(input.getText().toString());
-                        SharedPreferences.Editor editor = prefs.edit().putString(title ? "home_title" : "home_subtitle", value);
-                        if (title) {
-                            editor.putString("home_logo_mode", "text");
-                            if ("custom".equals(homePageConfig().logoStyle))
-                                editor.putString("home_logo_style", "median").remove("home_logo_code");
-                        }
-                        editor.apply();
-                        homeCustomizationChanged(title ? "Logo 文字已更新" : "主页副标题已更新", returnSection);
-                    }
-                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showLogoStyleChoice(final HomePageConfig value) { showLogoStyleChoice(value, HOME_SECTION_MAIN); }
-
-    private void showLogoStyleChoice(final HomePageConfig value, final int returnSection) {
-        final String[] styles = new String[] { "median", "google", "aurora", "sunset", "ocean", "rose_gold", "custom" };
-        String[] labels = new String[] { "Median 经典", "Google 官方配色", "极光渐变", "日落渐变", "海洋渐变", "玫瑰金渐变", "自定义代码" };
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        int checked = 0;
-        for (int i = 0; i < styles.length; i++) if (styles[i].equals(value.logoStyle)) checked = i;
-        new AlertDialog.Builder(this).setTitle("文字 Logo 样式").setSingleChoiceItems(labels, checked, new DialogInterface.OnClickListener() {
-            @Override public void onClick(DialogInterface dialog, int which) {
-                String style = styles[which];
-                dialog.dismiss();
-                if ("custom".equals(style)) {
-                    showLogoCodeEditor(returnSection);
-                    return;
-                }
-                prefs.edit().putString("home_logo_style", style)
-                        .putString("home_logo_mode", "text").apply();
-                homeCustomizationChanged(null, returnSection);
-            }
-        }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showLogoCodeEditor() { showLogoCodeEditor(HOME_SECTION_MAIN); }
-
-    private void showLogoCodeEditor(final int returnSection) {
-        final EditText input = new EditText(this);
-        final HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        String saved = homePageConfig().logoCode;
-        String example = LogoMarkup.gradientExample(homePageConfig().title);
-        input.setText(saved.length() == 0 ? example : saved);
-        input.setHint(example);
-        input.setMinLines(5);
-        input.setMaxLines(9);
-        input.setHorizontallyScrolling(false);
-        input.setGravity(Gravity.TOP | Gravity.START);
-        input.setTypeface(android.graphics.Typeface.MONOSPACE);
-        input.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
-        input.setPadding(dp(14), dp(10), dp(14), dp(10));
-        final AlertDialog dialog = new AlertDialog.Builder(this).setTitle("自定义文字 Logo")
-                .setMessage("安全标记语法（不会执行 HTML/JavaScript）：\n\n" +
-                        "[color=#4285F4]文字[/color]\n" +
-                        "[gradient=#8B5CF6,#6366F1,#22D3EE]文字[/gradient]\n" +
-                        "Med[space=4]ian\n\n" +
-                        "普通空格会保留；[space=0–24] 可精确控制局部间隔。渐变支持 2–4 个颜色。")
-                .setView(input).setPositiveButton("保存", null)
-                .setNeutralButton("Google 示例", null)
-                .setNegativeButton("取消", back).create();
-        dialog.setOnCancelListener(back);
-        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
-            @Override public void onShow(DialogInterface ignored) {
-                dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View view) { input.setText(LogoMarkup.GOOGLE_CODE); input.setSelection(input.length()); }
-                });
-                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View view) {
-                        LogoMarkup.Result parsed = LogoMarkup.parse(input.getText().toString(), homePageConfig().logoGradientAngle);
-                        if (!parsed.valid()) { toast(parsed.error); return; }
-                        prefs.edit().putString("home_logo_mode", "text")
-                                .putString("home_logo_style", "custom")
-                                .putString("home_logo_code", LogoMarkup.clean(input.getText().toString()))
-                                .putString("home_title", HomePageConfig.cleanTitle(parsed.plainText)).apply();
-                        dialog.dismiss();
-                        homeCustomizationChanged("自定义文字 Logo 已保存", returnSection);
-                    }
-                });
-            }
-        });
-        dialog.show();
-    }
-
-    private void showHomeStringChoice(String title, final String key, final String[] values,
-                                      String[] labels, String current) {
-        showHomeStringChoiceInSection(title, key, values, labels, current, HOME_SECTION_MAIN);
-    }
-
-    private void showHomeStringChoiceInSection(String title, final String key, final String[] values,
-                                      String[] labels, String current, final int returnSection) {
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        int checked = 0;
-        for (int i = 0; i < values.length; i++) if (values[i].equals(current)) checked = i;
-        new AlertDialog.Builder(this).setTitle(title).setSingleChoiceItems(labels, checked, new DialogInterface.OnClickListener() {
-            @Override public void onClick(DialogInterface dialog, int which) {
-                prefs.edit().putString(key, values[which]).apply();
-                dialog.dismiss();
-                homeCustomizationChanged(null, returnSection);
-            }
-        }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showHomeIntegerChoice(String title, final String key, final int[] values,
-                                       String[] labels, int current) {
-        showHomeIntegerChoiceInSection(title, key, values, labels, current, HOME_SECTION_MAIN);
-    }
-
-    private void showHomeIntegerChoiceInSection(String title, final String key, final int[] values,
-                                       String[] labels, int current, final int returnSection) {
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        int checked = 0;
-        for (int i = 0; i < values.length; i++) if (values[i] == current) checked = i;
-        new AlertDialog.Builder(this).setTitle(title).setSingleChoiceItems(labels, checked, new DialogInterface.OnClickListener() {
-            @Override public void onClick(DialogInterface dialog, int which) {
-                prefs.edit().putInt(key, values[which]).apply();
-                dialog.dismiss();
-                homeCustomizationChanged(null, returnSection);
-            }
-        }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void showHomeSearchChoice(HomePageConfig value) { showHomeSearchChoice(value, HOME_SECTION_MAIN); }
-
-    private void showHomeSearchChoice(HomePageConfig value, final int returnSection) {
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        int checked = !value.showSearch ? 2 : ("glass".equals(value.searchStyle) ? 1 : 0);
-        new AlertDialog.Builder(this).setTitle("搜索框").setSingleChoiceItems(
-                new String[] { "显示 · 纯色", "显示 · 磨砂", "隐藏" }, checked, new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        SharedPreferences.Editor editor = prefs.edit().putBoolean("home_show_search", which != 2);
-                        if (which != 2) editor.putString("home_search_style", which == 1 ? "glass" : "solid");
-                        editor.apply();
-                        dialog.dismiss();
-                        homeCustomizationChanged(null, returnSection);
-                    }
-                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void toggleHomeBoolean(String key, boolean current) {
-        toggleHomeBooleanInSection(key, current, HOME_SECTION_MAIN);
-    }
-
-    private void toggleHomeBooleanInSection(String key, boolean current, int returnSection) {
-        prefs.edit().putBoolean(key, !current).apply();
-        homeCustomizationChanged(null, returnSection);
-    }
-
-    private void confirmResetHomeCustomization(final int returnSection) {
-        HomeDialogReturn back = new HomeDialogReturn(returnSection);
-        new AlertDialog.Builder(this).setTitle("恢复默认主页？")
-                .setMessage("将移除自定义壁纸、Logo、CSS 和 HTML，并恢复标题、颜色、布局及模块显示。书签和“每次打开”设置不会删除。")
-                .setPositiveButton("恢复", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        SharedPreferences.Editor editor = prefs.edit();
-                        String[] keys = new String[] { "home_title", "home_subtitle", "home_accent", "home_wallpaper_dim",
-                                "home_logo_style", "home_logo_code", "home_logo_letter_spacing", "home_logo_gradient_angle",
-                                "home_logo_mode", "home_logo_font_size", "home_logo_font_weight", "home_logo_image_width",
-                                "home_logo_image_height", "home_logo_image_radius", "home_custom_css",
-                                "home_wallpaper_blur", "home_wallpaper_fit", "home_search_style", "home_layout",
-                                "home_tile_shape", "home_shortcut_columns", "home_show_search", "home_show_engines",
-                                "home_show_shortcuts", "home_show_corner", "home_show_clock", "home_custom_html",
-                                "home_custom_html_enabled", "home_custom_html_version" };
-                        for (String key : keys) editor.remove(key);
-                        editor.apply();
-                        if (homeImages != null) homeImages.removeAll();
-                        homeCustomizationChanged("已恢复默认主页", returnSection);
-                    }
-                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
-    }
-
-    private void homeCustomizationChanged(String message) {
-        homeCustomizationChanged(message, HOME_SECTION_MAIN);
-    }
-
-    private void homeCustomizationChanged(String message, int returnSection) {
-        if (isHomeUrl(currentPageUrl)) showHome();
-        if (message != null && message.length() > 0) toast(message);
-        continueHomeSection(returnSection);
-    }
 
     private void continueHomeCustomization() {
-        continueHomeSection(HOME_SECTION_MAIN);
+        homeCustomization().continueCustomization();
     }
 
     private void continueSettingsPanel(final Runnable action) {
@@ -4948,21 +6971,6 @@ public final class MainActivity extends Activity implements Runnable {
                 action.run();
             }
         });
-    }
-
-    private void continueHomeSection(final int section) {
-        postAfterUiTransition(new HomeDialogReturn(section));
-    }
-
-    private void showHomeSection(int section) {
-        if (isFinishing() || isDestroyed()) return;
-        if (section == HOME_SECTION_LAYOUT) showHomeLayoutCustomization();
-        else if (section == HOME_SECTION_LOGO) showLogoCustomization();
-        else if (section == HOME_SECTION_SEARCH) showSearchCustomization();
-        else if (section == HOME_SECTION_BACKGROUND) showBackgroundCustomization();
-        else if (section == HOME_SECTION_SHORTCUTS) showShortcutCustomization();
-        else if (section == HOME_SECTION_CODE) showCustomCodeCustomization();
-        else showHomeCustomizationPanel();
     }
 
     private void postAfterUiTransition(Runnable action) {
@@ -4985,58 +6993,6 @@ public final class MainActivity extends Activity implements Runnable {
                 @Override public void onViewDetachedFromWindow(View view) {}
             });
         }
-    }
-
-    private static String settingPreview(String value, int max, String empty) {
-        String clean = value == null ? "" : value.trim();
-        if (clean.length() == 0) return empty;
-        int count = clean.codePointCount(0, clean.length());
-        return count <= max ? clean : clean.substring(0, clean.offsetByCodePoints(0, max)) + "…";
-    }
-
-    private static String accentLabel(String value) {
-        if ("violet".equals(value)) return "紫色";
-        if ("green".equals(value)) return "绿色";
-        if ("orange".equals(value)) return "橙色";
-        if ("rose".equals(value)) return "玫红";
-        if ("teal".equals(value)) return "青色";
-        return "蓝色";
-    }
-
-    private static String tileShapeLabel(String value) {
-        if ("circle".equals(value)) return "圆形";
-        if ("square".equals(value)) return "小圆角方形";
-        return "圆角方形";
-    }
-
-    private static String logoModeLabel(HomePageConfig value) {
-        if (value == null || "none".equals(value.logoMode)) return "无";
-        if ("image".equals(value.logoMode)) return value.hasLogo ? "图片" : "图片（未选择）";
-        return "文字 · " + settingPreview(value.title, 12, "Median");
-    }
-
-    private static String logoStyleLabel(String value) {
-        if ("google".equals(value)) return "Google 官方配色";
-        if ("aurora".equals(value)) return "极光渐变";
-        if ("sunset".equals(value)) return "日落渐变";
-        if ("ocean".equals(value)) return "海洋渐变";
-        if ("rose_gold".equals(value)) return "玫瑰金渐变";
-        if ("custom".equals(value)) return "自定义代码";
-        return "Median 经典";
-    }
-
-    private static String logoLetterSpacingLabel(int value) {
-        if (value == 0) return "标准";
-        return (value > 0 ? "+" : "") + value + " px";
-    }
-
-    private static String logoGradientAngleLabel(int value) {
-        if (value == 135) return "左上 → 右下";
-        if (value == 180) return "上 → 下";
-        if (value == 45) return "左下 → 右上";
-        if (value == 0) return "下 → 上";
-        if (value == 90) return "左 → 右";
-        return value + "°";
     }
 
     private void showSearchEngineDialog() {
@@ -5089,6 +7045,8 @@ public final class MainActivity extends Activity implements Runnable {
             }
         }).setNegativeButton("返回", new DialogInterface.OnClickListener() {
             @Override public void onClick(DialogInterface dialog, int which) { continueSettingsPanel(returnAction); }
+        }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface dialog) { continueSettingsPanel(returnAction); }
         }).show();
     }
 
@@ -5103,16 +7061,35 @@ public final class MainActivity extends Activity implements Runnable {
                 } else if (which == 1) {
                     showCustomSearchEditor(engine, returnAction);
                 } else {
-                    searchEngines.delete(engine.id);
-                    if (engine.id.equals(searchEngine)) setSearchEngine("google");
-                    cachedHomeKey = "";
-                    if (isHomeUrl(currentPageUrl)) showHome();
-                    showCustomSearchList(returnAction);
+                    confirmDeleteSearchEngine(engine, returnAction);
                 }
             }
         }).setNegativeButton("返回", new DialogInterface.OnClickListener() {
             @Override public void onClick(DialogInterface dialog, int which) { showCustomSearchList(returnAction); }
+        }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface dialog) { showCustomSearchList(returnAction); }
         }).show();
+    }
+
+    private void confirmDeleteSearchEngine(final SearchEngineStore.Engine engine, final Runnable returnAction) {
+        new AlertDialog.Builder(this).setTitle("删除搜索引擎？").setMessage(engine.name)
+                .setPositiveButton("删除", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) {
+                        searchEngines.delete(engine.id);
+                        if (engine.id.equals(searchEngine)) setSearchEngine("google");
+                        cachedHomeKey = "";
+                        if (isHomeUrl(currentPageUrl)) showHome();
+                        showCustomSearchList(returnAction);
+                    }
+                }).setNegativeButton("取消", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) {
+                        showCustomSearchActions(engine, returnAction);
+                    }
+                }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+                    @Override public void onCancel(DialogInterface dialog) {
+                        showCustomSearchActions(engine, returnAction);
+                    }
+                }).show();
     }
 
     private void showCustomSearchEditor(final SearchEngineStore.Engine existing, final Runnable returnAction) {
@@ -5137,6 +7114,9 @@ public final class MainActivity extends Activity implements Runnable {
                 .setNegativeButton("取消", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface ignored, int which) { showCustomSearchList(returnAction); }
                 }).create();
+        dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface ignored) { showCustomSearchList(returnAction); }
+        });
         dialog.setOnShowListener(new DialogInterface.OnShowListener() {
             @Override public void onShow(DialogInterface ignored) {
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
@@ -5170,7 +7150,7 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void copyPageUrl() {
         String url = webView == null ? null : webView.getUrl();
-        if (url == null || isHomeUrl(url)) return;
+        if (!isNetworkPage(url)) return;
         android.content.ClipboardManager manager = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
         if (manager != null) manager.setPrimaryClip(android.content.ClipData.newPlainText("页面地址", url));
         toast("页面地址已复制");
@@ -5178,13 +7158,13 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void translatePage() {
         String url = webView == null ? null : webView.getUrl();
-        if (url == null || !url.startsWith("http")) return;
+        if (!isNetworkPage(url)) return;
         try { loadInput("https://translate.google.com/translate?sl=auto&tl=zh-CN&u=" + URLEncoder.encode(url, "UTF-8")); }
         catch (Exception e) { toast("无法创建翻译地址"); }
     }
 
     private void printPage() {
-        if (webView == null || isHomeUrl(webView.getUrl())) return;
+        if (webView == null || !isNetworkPage(webView.getUrl())) return;
         try {
             PrintManager manager = (PrintManager) getSystemService(PRINT_SERVICE);
             if (manager != null) manager.print(safeTitle(webView.getTitle(), webView.getUrl()),
@@ -5208,7 +7188,22 @@ public final class MainActivity extends Activity implements Runnable {
         return out.toString();
     }
 
-    private void showDownloadPolicy() {
+    private void showDownloadSettings() {
+        String[] items = new String[] { "修改下载文件夹\n当前：" + DownloadDirectory.label(this),
+                "下载策略\n" + downloadPolicySummary(), "下载中心" };
+        final Runnable returnHere = new Runnable() { @Override public void run() { showDownloadSettings(); } };
+        showActionSheet("下载设置", "内置下载器与文件保存", items,
+                new int[] { BrowserIconView.STORAGE, BrowserIconView.SETTINGS, BrowserIconView.STORAGE },
+                null, null, this, new SheetHandler() {
+                    @Override public void onItem(int which) {
+                        if (which == 0) DownloadDirectory.showPickerDialog(MainActivity.this, DOWNLOAD_DIRECTORY_REQUEST, returnHere);
+                        else if (which == 1) showDownloadPolicy(returnHere);
+                        else showDownloadCenter();
+                    }
+                });
+    }
+
+    private void showDownloadPolicy(final Runnable returnAction) {
         final String[] labels = new String[] { "仅在非计费网络下载", "允许数据漫游下载", "仅在充电时下载" };
         final boolean[] checked = new boolean[] {
                 prefs.getBoolean("download_wifi_only", false),
@@ -5225,8 +7220,10 @@ public final class MainActivity extends Activity implements Runnable {
                                 .putBoolean("download_allow_roaming", checked[1])
                                 .putBoolean("download_charging_only", checked[2]).apply();
                         toast("下载策略已更新");
+                        continueSettingsPanel(returnAction);
                     }
-                }).setNegativeButton("取消", null).create();
+                }).setNegativeButton("取消", new SettingsDialogReturn(returnAction))
+                .setOnCancelListener(new SettingsDialogReturn(returnAction)).create();
         secureDialog(dialog);
         dialog.show();
     }
@@ -5381,8 +7378,9 @@ public final class MainActivity extends Activity implements Runnable {
                     while ((read = input.read(buffer)) != -1) digest.update(buffer, 0, read);
                     byte[] bytes = digest.digest();
                     final String hex = HexCodec.encode(bytes, bytes.length, false, false);
-                    runOnUiThread(new Runnable() {
+                    uiHandler.post(new Runnable() {
                         @Override public void run() {
+                            if (activityDestroyed) return;
                             copyText("SHA-256", hex, "SHA-256 已计算并复制");
                             AlertDialog dialog = new AlertDialog.Builder(MainActivity.this).setTitle("SHA-256")
                                     .setMessage(item.filename + "\n\n" + hex).setPositiveButton("确定", null).create();
@@ -5390,7 +7388,11 @@ public final class MainActivity extends Activity implements Runnable {
                         }
                     });
                 } catch (final Exception e) {
-                    runOnUiThread(new Runnable() { @Override public void run() { toast("校验失败：" + safeMessage(e)); } });
+                    uiHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (!activityDestroyed) toast("校验失败：" + safeMessage(e));
+                        }
+                    });
                 } finally { NetworkSecurity.closeQuietly(input); }
             }
         });
@@ -5453,7 +7455,7 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void probeAndShowMediaCenter() {
-        if (webView == null || isHomeUrl(webView.getUrl())) { showMediaCenter(); return; }
+        if (webView == null || !isNetworkPage(webView.getUrl())) { showMediaCenter(); return; }
         final WebView source = webView;
         final long sequence = navigationSequence;
         final String sourceHost = currentHost();
@@ -5536,19 +7538,20 @@ public final class MainActivity extends Activity implements Runnable {
                 resource.mime.contains("dash+xml") || resource.mime.contains("vnd.ms-sstr") ||
                 lowerUrl.contains(".m3u") || lowerUrl.contains(".mpd") ||
                 lowerUrl.contains(".ism/manifest") || lowerUrl.contains(".isml/manifest"));
-        String[] actions = manifest ? new String[] { "解析清单、轨道与加密信息", "使用外部播放器打开", "下载资源", "在新标签页打开", "复制媒体地址", "分享媒体地址" }
-                : new String[] { "使用外部播放器打开", "下载资源", "在新标签页打开", "复制媒体地址", "分享媒体地址" };
-        int[] icons = manifest ? new int[] { BrowserIconView.SPEED, BrowserIconView.SPEED, BrowserIconView.STORAGE, BrowserIconView.PLUS, BrowserIconView.PLUS, BrowserIconView.SHARE }
-                : new int[] { BrowserIconView.SPEED, BrowserIconView.STORAGE, BrowserIconView.PLUS, BrowserIconView.PLUS, BrowserIconView.SHARE };
+        String[] actions = manifest ? new String[] { "解析清单、轨道与加密信息", "使用外部播放器打开", "发送到外部下载器", "下载资源", "在新标签页打开", "复制媒体地址", "分享媒体地址" }
+                : new String[] { "使用外部播放器打开", "发送到外部下载器", "下载资源", "在新标签页打开", "复制媒体地址", "分享媒体地址" };
+        int[] icons = manifest ? new int[] { BrowserIconView.SPEED, BrowserIconView.SPEED, BrowserIconView.STORAGE, BrowserIconView.STORAGE, BrowserIconView.PLUS, BrowserIconView.PLUS, BrowserIconView.SHARE }
+                : new int[] { BrowserIconView.SPEED, BrowserIconView.STORAGE, BrowserIconView.STORAGE, BrowserIconView.PLUS, BrowserIconView.PLUS, BrowserIconView.SHARE };
         showActionSheet(resource.kind, hostOf(resource.url) + " · " + resource.mime, actions, icons, new SheetHandler() {
             @Override public void onItem(int which) {
                 if (manifest && which == 0) { inspectMediaManifest(resource); return; }
                 if (manifest) which--;
                 if (which == 0) openMediaExternally(resource);
-                else if (which == 1) enqueueDownload(webView, resource.url,
+                else if (which == 1) sendToExternalDownloader(resource.url);
+                else if (which == 2) enqueueDownload(webView, resource.url,
                         webView == null ? null : webView.getSettings().getUserAgentString(), null, resource.mime);
-                else if (which == 2) openUrlInNewTab(resource.url, true);
-                else if (which == 3) {
+                else if (which == 3) openUrlInNewTab(resource.url, true);
+                else if (which == 4) {
                     android.content.ClipboardManager manager = (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                     if (manager != null) manager.setPrimaryClip(android.content.ClipData.newPlainText("媒体地址", resource.url));
                     toast("媒体地址已复制");
@@ -5563,8 +7566,11 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void inspectMediaManifest(final MediaResourceSniffer.Resource resource) {
-        final HashMap<String, String> headers = new HashMap<String, String>(downloadContextHeaders(webView, resource.url));
-        headers.put("User-Agent", webView == null ? "MedianBrowser" : webView.getSettings().getUserAgentString());
+        final WebView sourceView = webView;
+        final long sourceSequence = navigationSequence;
+        if (sourceView == null || resource == null) return;
+        final HashMap<String, String> headers = new HashMap<String, String>(downloadContextHeaders(sourceView, resource.url));
+        headers.put("User-Agent", sourceView.getSettings().getUserAgentString());
         headers.put("Accept", "application/vnd.apple.mpegurl, application/x-mpegurl, application/dash+xml, application/vnd.ms-sstr+xml, application/xml, text/xml, text/plain, */*");
         String cookie = CookieManager.getInstance().getCookie(resource.url);
         if (cookie != null && cookie.length() > 0) headers.put("Cookie", cookie);
@@ -5586,12 +7592,16 @@ public final class MainActivity extends Activity implements Runnable {
                             new String(data, StandardCharsets.UTF_8));
                     uiHandler.post(new Runnable() {
                         @Override public void run() {
-                            if (!activityDestroyed) showManifestVariants(resource, parsed);
+                            if (!activityDestroyed && isCurrentPageCallback(sourceView, sourceSequence))
+                                showManifestVariants(resource, parsed);
                         }
                     });
                 } catch (final Exception error) {
                     uiHandler.post(new Runnable() {
-                        @Override public void run() { if (!activityDestroyed) toast("清单解析失败：" + safeMessage(error)); }
+                        @Override public void run() {
+                            if (!activityDestroyed && isCurrentPageCallback(sourceView, sourceSequence))
+                                toast("清单解析失败：" + safeMessage(error));
+                        }
                     });
                 } finally {
                     if (connection != null) connection.disconnect();
@@ -5641,8 +7651,31 @@ public final class MainActivity extends Activity implements Runnable {
         } catch (Exception e) { toast("没有兼容此外部媒体的播放器"); }
     }
 
+    /**
+     * Gives URL-only download clients (1DM, ADM, etc.) a safe hand-off. Cookies,
+     * Authorization headers and the WebView profile are intentionally not shared.
+     */
+    private void sendToExternalDownloader(String url) {
+        try {
+            final ArrayList<Intent> candidates = ExternalDownloadIntents.candidates(this, url);
+            if (candidates.isEmpty()) { toast("没有可接收下载链接的外部应用"); return; }
+            new AlertDialog.Builder(this).setTitle("选择外部下载器")
+                    .setItems(ExternalDownloadIntents.labels(this, candidates), new DialogInterface.OnClickListener() {
+                        @Override public void onClick(DialogInterface dialog, int which) {
+                            try { startActivity(candidates.get(which)); }
+                            catch (ActivityNotFoundException error) { toast("此外部应用已不可用，请重新选择下载器"); }
+                            catch (RuntimeException error) { toast("无法发送下载链接：" + safeMessage(error)); }
+                        }
+                    }).setNegativeButton("取消", null).show();
+        } catch (ActivityNotFoundException e) {
+            toast("没有可用的外部下载器");
+        } catch (Exception e) {
+            toast("无法发送下载链接：" + safeMessage(e));
+        }
+    }
+
     private void enterPagePictureInPicture() {
-        if (webView == null || isHomeUrl(currentPageUrl)) { toast("当前页面不能进入画中画"); return; }
+        if (webView == null || !isNetworkPage(currentPageUrl)) { toast("当前页面不能进入画中画"); return; }
         try {
             PictureInPictureParams params = new PictureInPictureParams.Builder().setAspectRatio(new Rational(16, 9)).build();
             if (!enterPictureInPictureMode(params)) toast("系统未允许进入画中画");
@@ -5650,7 +7683,7 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showPageScriptCommands() {
-        if (webView == null || isHomeUrl(currentPageUrl)) { toast("当前页面没有脚本命令"); return; }
+        if (webView == null || !isNetworkPage(currentPageUrl)) { toast("当前页面没有脚本命令"); return; }
         final WebView source = webView;
         final long sequence = navigationSequence;
         final String sourceUrl = currentPageUrl;
@@ -5658,7 +7691,7 @@ public final class MainActivity extends Activity implements Runnable {
         if (token == null || token.length() < 32) { toast("当前 WebView 不支持安全脚本命令"); return; }
         StringBuilder query = new StringBuilder("(function(){var a=[];");
         for (UserScriptStore.Script script : scriptStore.getAll()) {
-            if (!script.enabled || script.quarantined || !scriptStore.matchesUrl(script.id, sourceUrl)) continue;
+            if (!script.enabled || !scriptStore.matchesUrl(script.id, sourceUrl)) continue;
             String objectName = UserScriptStore.dispatchObjectName(token, script.id);
             query.append("try{var d=window[").append(JSONObject.quote(objectName)).append("];if(d&&typeof d.menus==='function'){var m=d.menus(")
                     .append(JSONObject.quote(token)).append(");if(Array.isArray(m))m.forEach(function(x){x.scriptId=")
@@ -5722,24 +7755,21 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void showPerformancePanel(final Runnable backAction) {
         String[] modes = new String[] {
-                "流畅模式 · 减少后台干扰",
-                "标准模式 · 日常稳定优先",
-                "低功耗模式 · 减少网页预热和后台资源",
-                "性能模式下保持广告拦截：" + (!performanceNetworkDirect ? "已开启" : "已关闭"),
+                "流畅模式",
+                "标准模式",
+                "低功耗模式",
+                "流畅模式保持广告拦截（始终开启）",
                 "立即释放后台网页内存"
         };
         int[] icons = new int[] { BrowserIconView.SPEED, BrowserIconView.HOME, BrowserIconView.SHIELD, BrowserIconView.SHIELD, BrowserIconView.STORAGE };
         int[] kinds = new int[] { SHEET_ROW_ACTION, SHEET_ROW_ACTION, SHEET_ROW_ACTION,
-                !performanceNetworkDirect ? SHEET_ROW_TOGGLE_ON : SHEET_ROW_TOGGLE_OFF, SHEET_ROW_ACTION };
-        showActionSheet("性能调度", modeLabel() + " · 快来自减少无效工作，不保持设备常亮", modes, icons,
+                SHEET_ROW_TOGGLE_ON, SHEET_ROW_ACTION };
+        showActionSheet("性能调度", modeLabel(), modes, icons,
                 kinds, null, backAction, new SheetHandler() {
             @Override public void onItem(int which) {
                 if (which == 3) {
-                    performanceNetworkDirect = !performanceNetworkDirect;
-                    prefs.edit().putBoolean("performance_network_direct", performanceNetworkDirect).apply();
-                    renderedShieldActive = null;
-                    requestChromeUpdate();
-                    toast(performanceNetworkDirect ? "性能模式下将暂停广告拦截" : "性能模式下仍保持广告拦截");
+                    toast("广告拦截与跳转保护始终开启");
+                    showPerformancePanel(backAction);
                     return;
                 }
                 if (which == 4) {
@@ -5793,129 +7823,53 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showScriptCenter() {
-        final AlertDialog dialog = new AlertDialog.Builder(this).create();
-        dialog.setTitle("用户脚本");
-
-        ScrollView scroll = new ScrollView(this);
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(18), dp(8), dp(18), dp(16));
-        scroll.addView(content);
-
-        TextView note = new TextView(this);
-        note.setText("脚本来自第三方，能读取和修改匹配网页。只安装你信任的脚本。Median 会优先在 document-start 运行，并在厂商 WebView 漏执行时自动补偿；安装后刷新页面生效。");
-        note.setTextColor(MUTED);
-        note.setTextSize(13f);
-        note.setPadding(0, 0, 0, dp(12));
-        content.addView(note);
-
-        Button browse = actionButton("浏览 Greasy Fork");
-        Button current = actionButton("查找适用于当前网站的脚本");
-        Button link = actionButton("粘贴链接或脚本代码安装");
-        Button updateAll = actionButton("检查并更新全部脚本");
-        content.addView(browse);
-        content.addView(current);
-        content.addView(link);
-        content.addView(updateAll);
-
-        TextView installedTitle = new TextView(this);
-        installedTitle.setText("已安装脚本");
-        installedTitle.setTextSize(15f);
-        installedTitle.setTextColor(TEXT);
-        installedTitle.setPadding(0, dp(18), 0, dp(6));
-        content.addView(installedTitle);
-
-        final List<UserScriptStore.Script> scripts = scriptStore.getAll();
-        if (scripts.size() == 0) {
-            TextView empty = new TextView(this);
-            empty.setText("还没有安装脚本。进入 Greasy Fork 后点击“安装此脚本”，Median 会接管安装。 ");
-            empty.setTextColor(MUTED);
-            empty.setPadding(0, dp(8), 0, dp(8));
-            content.addView(empty);
-        } else {
-            for (final UserScriptStore.Script script : scripts) {
-                LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.HORIZONTAL);
-                row.setGravity(Gravity.CENTER_VERTICAL);
-                row.setPadding(0, dp(3), 0, dp(3));
-
-                CheckBox enabled = new CheckBox(this);
-                String subtitle = script.version.length() > 0 ? "  v" + script.version : "";
-                String state = script.quarantined ? "\n已隔离 · " + script.disabledReason : "\n" + script.riskSummary;
-                enabled.setText(script.name + subtitle + state);
-                enabled.setTextColor(script.quarantined ? Color.rgb(176, 0, 32) : TEXT);
-                enabled.setTextSize(13.5f);
-                enabled.setChecked(script.enabled && !script.quarantined);
-                enabled.setEnabled(!script.quarantined);
-                row.addView(enabled, new LinearLayout.LayoutParams(0, dp(62), 1f));
-
-                Button details = new Button(this);
-                details.setText("详情");
-                details.setAllCaps(false);
-                details.setTextSize(13f);
-                details.setMinWidth(0);
-                details.setMinHeight(0);
-                row.addView(details, new LinearLayout.LayoutParams(dp(66), dp(42)));
-                content.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(66)));
-
-                enabled.setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        scriptStore.setEnabled(script.id, ((CheckBox) v).isChecked());
-                        refreshUserScriptRegistrations(true);
-                    }
-                });
-                details.setOnClickListener(new View.OnClickListener() {
-                    @Override public void onClick(View v) {
-                        dialog.dismiss();
-                        showScriptDetails(script);
-                    }
-                });
-            }
-        }
-
-        browse.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { dialog.dismiss(); loadNetworkUrl(webView, "https://greasyfork.org/zh-CN/scripts"); }
-        });
-        current.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) {
-                dialog.dismiss();
-                String host = currentHost();
-                loadNetworkUrl(webView, host.length() == 0 || isHomeUrl(webView.getUrl()) ?
-                        "https://greasyfork.org/zh-CN/scripts" : "https://greasyfork.org/zh-CN/scripts/by-site/" + host);
-            }
-        });
-        link.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { dialog.dismiss(); showScriptImportDialog(); }
-        });
-        updateAll.setOnClickListener(new View.OnClickListener() {
-            @Override public void onClick(View v) { dialog.dismiss(); updateAllUserScripts(); }
-        });
-
-        dialog.setView(scroll);
-        dialog.setButton(DialogInterface.BUTTON_NEGATIVE, "关闭", new DialogInterface.OnClickListener() {
-            @Override public void onClick(DialogInterface d, int which) { d.dismiss(); }
-        });
-        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
-            @Override public void onShow(DialogInterface d) {
-                dialog.getButton(DialogInterface.BUTTON_NEGATIVE).setTextColor(BLUE);
-            }
-        });
-        dialog.show();
+        showScriptCenter(scriptCenterBackAction);
     }
 
-    private Button actionButton(String text) {
-        Button button = new Button(this);
-        button.setText(text);
-        button.setAllCaps(false);
-        button.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
-        button.setTextSize(14f);
-        button.setTextColor(TEXT);
-        button.setBackground(roundRect(SURFACE, 12));
-        button.setPadding(dp(14), 0, dp(12), 0);
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(48));
-        params.setMargins(0, dp(4), 0, dp(4));
-        button.setLayoutParams(params);
-        return button;
+    private void showScriptCenter(final Runnable backAction) {
+        scriptCenterBackAction = backAction;
+        final List<UserScriptStore.Script> scripts = scriptStore.getAll();
+        final int actions = 4;
+        String[] items = new String[actions + scripts.size()];
+        int[] icons = new int[items.length];
+        int[] kinds = new int[items.length];
+        String[] sections = new String[items.length];
+        items[0] = "浏览 Greasy Fork\n查找公开用户脚本";
+        items[1] = "查找当前网站脚本\n按当前域名筛选 Greasy Fork";
+        items[2] = "粘贴链接或脚本代码安装";
+        items[3] = "检查并更新全部脚本";
+        icons[0] = BrowserIconView.SEARCH;
+        icons[1] = BrowserIconView.SEARCH;
+        icons[2] = BrowserIconView.PLUS;
+        icons[3] = BrowserIconView.RELOAD;
+        for (int i = 0; i < actions; i++) kinds[i] = SHEET_ROW_ACTION;
+        sections[0] = "获取与管理";
+        for (int i = 0; i < scripts.size(); i++) {
+            UserScriptStore.Script script = scripts.get(i);
+            String version = script.version.length() == 0 ? "" : " · v" + script.version;
+            items[i + actions] = script.name + version + "\n" +
+                    (script.enabled ? "已启用" : "已停用") + " · " + script.matches.size() +
+                    " 个匹配范围 · " + script.runAt;
+            icons[i + actions] = BrowserIconView.SCRIPT;
+            kinds[i + actions] = SHEET_ROW_NAVIGATE;
+        }
+        if (scripts.size() > 0) sections[actions] = "已安装 · " + scripts.size();
+        String subtitle = scripts.size() == 0 ? "尚未安装脚本 · 仅安装你信任的来源" :
+                "已启用 " + enabledScriptCount() + " 个 · 无风险评分或自动隔离";
+        showActionSheet("用户脚本", subtitle, items, icons, kinds, sections, backAction,
+                new SheetHandler() {
+            @Override public void onItem(int which) {
+                if (which == 0) loadNetworkUrl(webView, "https://greasyfork.org/zh-CN/scripts");
+                else if (which == 1) {
+                    String host = currentHost();
+                    loadNetworkUrl(webView, host.length() == 0 || isHomeUrl(webView.getUrl()) ?
+                            "https://greasyfork.org/zh-CN/scripts" :
+                            "https://greasyfork.org/zh-CN/scripts/by-site/" + host);
+                } else if (which == 2) showScriptImportDialog();
+                else if (which == 3) updateAllUserScripts();
+                else showScriptDetails(scripts.get(which - actions));
+            }
+        });
     }
 
     private void showScriptImportDialog() {
@@ -5931,13 +7885,17 @@ public final class MainActivity extends Activity implements Runnable {
         String clipboard = clipboardText();
         if (UserScriptInstallPolicy.looksLikeInstallUrl(clipboard) ||
                 UserScriptInstallPolicy.isSourceText(clipboard)) input.setText(clipboard);
+        final SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { showScriptCenter(); }
+        });
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("安装用户脚本")
                 .setMessage("复制脚本链接后打开这里会自动填入；也可以直接粘贴完整代码。网页中的 .user.js 安装按钮会由 Median 直接接管。")
                 .setView(input)
                 .setPositiveButton("读取并检查", null)
-                .setNegativeButton("取消", null)
+                .setNegativeButton("取消", back)
                 .create();
+        dialog.setOnCancelListener(back);
         dialog.setOnShowListener(new DialogInterface.OnShowListener() {
             @Override public void onShow(DialogInterface ignored) {
                 dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
@@ -5994,12 +7952,19 @@ public final class MainActivity extends Activity implements Runnable {
                 try { Process.setThreadPriority(scriptThreadPriority()); } catch (RuntimeException ignored) {}
                 try {
                     final UserScriptStore.Script script = downloadAndPrepareUserScript(normalizedSourceUrl, userAgent);
-                    runOnUiThread(new Runnable() {
-                        @Override public void run() { showScriptInstallConfirmation(script); }
+                    uiHandler.post(new Runnable() {
+                        @Override public void run() {
+                            // A network task may finish after Android has torn down this
+                            // Activity. Do not attach a dialog to the dead window.
+                            if (activityDestroyed) return;
+                            showScriptInstallConfirmation(script);
+                        }
                     });
                 } catch (final Exception e) {
-                    runOnUiThread(new Runnable() {
-                        @Override public void run() { toast("脚本安装失败：" + safeMessage(e)); }
+                    uiHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (!activityDestroyed) toast("脚本安装失败：" + safeMessage(e));
+                        }
                     });
                 } finally {
                     scriptDownloadInProgress = false;
@@ -6030,12 +7995,17 @@ public final class MainActivity extends Activity implements Runnable {
                 try { Process.setThreadPriority(scriptThreadPriority()); } catch (RuntimeException ignored) {}
                 try {
                     final UserScriptStore.Script script = prepareUserScriptSource(source, "", userAgent);
-                    runOnUiThread(new Runnable() {
-                        @Override public void run() { showScriptInstallConfirmation(script); }
+                    uiHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (activityDestroyed) return;
+                            showScriptInstallConfirmation(script);
+                        }
                     });
                 } catch (final Exception error) {
-                    runOnUiThread(new Runnable() {
-                        @Override public void run() { toast("脚本安装失败：" + safeMessage(error)); }
+                    uiHandler.post(new Runnable() {
+                        @Override public void run() {
+                            if (!activityDestroyed) toast("脚本安装失败：" + safeMessage(error));
+                        }
                     });
                 } finally {
                     scriptDownloadInProgress = false;
@@ -6051,6 +8021,8 @@ public final class MainActivity extends Activity implements Runnable {
 
     private UserScriptStore.Script prepareUserScriptSource(String source, String baseUrl, String userAgent) throws Exception {
         final UserScriptStore.Script parsed = scriptStore.parseUserScript(source, baseUrl);
+        if (parsed.requires.size() > UserScriptStore.MAX_DEPENDENCIES || parsed.resources.size() > UserScriptStore.MAX_RESOURCES)
+            throw new IllegalArgumentException("用户脚本依赖数量超过限制");
         if (parsed.updateUrl.length() > 0 && !"none".equalsIgnoreCase(parsed.updateUrl))
             parsed.updateUrl = resolveHttpsUrl(baseUrl, parsed.updateUrl, "@updateURL");
         if (parsed.downloadUrl.length() > 0 && !"none".equalsIgnoreCase(parsed.downloadUrl))
@@ -6072,9 +8044,12 @@ public final class MainActivity extends Activity implements Runnable {
             }
 
             StringBuilder dependencies = new StringBuilder();
+            long assetBytes = 0L;
             for (int i = 0; i < requireUrls.size(); i++) {
                 FetchedScriptBytes dependency = awaitScriptAsset(downloads.get(i));
                 downloads.set(i, null);
+                assetBytes += dependency.data.length;
+                if (assetBytes > SCRIPT_ASSET_TOTAL_MAX_BYTES) throw new IllegalArgumentException("用户脚本依赖总大小超过限制");
                 String resolved = requireUrls.get(i);
                 dependencies.append("\n/* @require ").append(resolved.replace("*/", "* /")).append(" */\n")
                         .append(new String(dependency.data, StandardCharsets.UTF_8)).append('\n');
@@ -6085,6 +8060,8 @@ public final class MainActivity extends Activity implements Runnable {
                 int index = resourceOffset + i;
                 FetchedScriptBytes data = awaitScriptAsset(downloads.get(index));
                 downloads.set(index, null);
+                assetBytes += data.data.length;
+                if (assetBytes > SCRIPT_ASSET_TOTAL_MAX_BYTES) throw new IllegalArgumentException("用户脚本资源总大小超过限制");
                 resource.mime = guessResourceMime(resource.url);
                 resource.base64 = android.util.Base64.encodeToString(data.data, android.util.Base64.NO_WRAP);
             }
@@ -6092,7 +8069,6 @@ public final class MainActivity extends Activity implements Runnable {
             for (Future<FetchedScriptBytes> download : downloads) if (download != null) download.cancel(true);
             throw failure;
         }
-        scriptStore.refreshAnalysis(parsed);
         return parsed;
     }
 
@@ -6103,7 +8079,7 @@ public final class MainActivity extends Activity implements Runnable {
         return scriptNetworkExecutor.submit(new Callable<FetchedScriptBytes>() {
             @Override public FetchedScriptBytes call() throws Exception {
                 try { Process.setThreadPriority(scriptThreadPriority()); } catch (RuntimeException ignored) {}
-                return fetchUserScriptBytes(url, userAgent, 32 * 1024 * 1024, label);
+                return fetchUserScriptBytes(url, userAgent, SCRIPT_ASSET_MAX_BYTES, label);
             }
         });
     }
@@ -6221,6 +8197,7 @@ public final class MainActivity extends Activity implements Runnable {
         if (!executeTask(scriptNetworkExecutor, new Runnable() {
             @Override public void run() {
                 try { Process.setThreadPriority(scriptThreadPriority()); } catch (RuntimeException ignored) {}
+                try {
                 int checked = 0;
                 int updated = 0;
                 int failed = 0;
@@ -6243,13 +8220,6 @@ public final class MainActivity extends Activity implements Runnable {
                             candidate.updatedAt = now;
                             candidate.lastUpdateCheck = now;
                             candidate.enabled = existing.enabled;
-                            candidate.quarantined = false;
-                            candidate.disabledReason = "";
-                            if (candidate.riskScore >= 8 || candidate.riskScore > existing.riskScore + 3) {
-                                candidate.enabled = false;
-                                candidate.quarantined = true;
-                                candidate.disabledReason = "更新后权限或风险明显增加，请检查后重新启用";
-                            }
                             pendingSaves.add(candidate);
                             updated++;
                         } else {
@@ -6260,14 +8230,19 @@ public final class MainActivity extends Activity implements Runnable {
                         failed++;
                     }
                 }
+                // onDestroy() closes the store while an in-flight fetch is winding down.
+                // Avoid writing through that closed instance and avoid posting a dialog to a
+                // destroyed Activity.
+                if (activityDestroyed || scriptStore == null) return;
                 scriptStore.saveBatch(pendingSaves);
                 final int finalChecked = checked;
                 final int finalUpdated = updated;
                 final int finalFailed = failed;
                 final int finalSkipped = skipped;
                 scriptDownloadInProgress = false;
-                runOnUiThread(new Runnable() {
+                uiHandler.post(new Runnable() {
                     @Override public void run() {
+                        if (activityDestroyed) return;
                         String result = "脚本更新完成：检查 " + finalChecked + " 个，更新 " + finalUpdated + " 个";
                         if (finalSkipped > 0) result += "，跳过 " + finalSkipped + " 个无更新地址脚本";
                         if (finalFailed > 0) result += "，失败 " + finalFailed + " 个";
@@ -6275,6 +8250,12 @@ public final class MainActivity extends Activity implements Runnable {
                         if (finalUpdated > 0) refreshUserScriptRegistrations(true);
                     }
                 });
+                } catch (RuntimeException ignored) {
+                    // The store can be closed while an update is winding down during Activity
+                    // destruction. The finally block below releases the in-progress gate.
+                } finally {
+                    scriptDownloadInProgress = false;
+                }
             }
         })) scriptDownloadInProgress = false;
     }
@@ -6358,9 +8339,8 @@ public final class MainActivity extends Activity implements Runnable {
                 "\nHTTPS 依赖：" + script.requires.size() + " 项" +
                 "\nHTTPS 资源：" + script.resources.size() + " 项" +
                 "\n网络范围：" + (script.connects.size() == 0 ? "未声明" : script.connects.toString()) +
-                "\n风险评估：" + script.riskSummary + "（" + script.riskScore + " 分）" +
                 "\n\n可运行的网站：" + scope.toString() +
-                "\n\nMedian 支持任意数量的 @require、@resource、常用 GM4 API 与批量更新，不再按脚本大小、数量或运行耗时自动禁用。旧版 WebView 会自动使用同源降级实现；原生网络请求仍按 @connect 校验，并阻止远程网页访问本机与私网地址。";
+                "\n\n请仅安装可信脚本。原生网络严格遵守 @connect，并拒绝本机与私网地址。";
         new AlertDialog.Builder(this)
                 .setTitle("安装“" + script.name + "”？")
                 .setMessage(message)
@@ -6385,12 +8365,42 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void showScriptDetails(final UserScriptStore.Script script) {
+        boolean canUpdate = preferredUpdateUrl(script).length() > 0;
+        String[] items = canUpdate
+                ? new String[] { script.enabled ? "停用脚本" : "启用脚本", "检查更新",
+                        "权限、来源与匹配范围", "删除脚本" }
+                : new String[] { script.enabled ? "停用脚本" : "启用脚本",
+                        "权限、来源与匹配范围", "删除脚本" };
+        int[] icons = canUpdate
+                ? new int[] { BrowserIconView.SCRIPT, BrowserIconView.RELOAD,
+                        BrowserIconView.INFO, BrowserIconView.DELETE }
+                : new int[] { BrowserIconView.SCRIPT, BrowserIconView.INFO, BrowserIconView.DELETE };
+        int[] kinds = new int[items.length];
+        for (int i = 0; i < kinds.length; i++) kinds[i] = SHEET_ROW_ACTION;
+        String subtitle = (script.enabled ? "已启用" : "已停用") +
+                (script.version.length() == 0 ? "" : " · v" + script.version) + " · " + script.runAt;
+        showActionSheet(script.name, subtitle, items, icons, kinds, null,
+                new Runnable() { @Override public void run() { showScriptCenter(); } },
+                new SheetHandler() {
+                    @Override public void onItem(int which) {
+                        boolean hasUpdate = preferredUpdateUrl(script).length() > 0;
+                        if (which == 0) {
+                            scriptStore.setEnabled(script.id, !script.enabled);
+                            refreshUserScriptRegistrations(true);
+                            toast(script.enabled ? "脚本已启用" : "脚本已停用");
+                            showScriptDetails(script);
+                        } else if (hasUpdate && which == 1) updateOneUserScript(script);
+                        else if (which == (hasUpdate ? 2 : 1)) showScriptMetadata(script);
+                        else confirmDeleteScript(script);
+                    }
+                });
+    }
+
+    private void showScriptMetadata(final UserScriptStore.Script script) {
         StringBuilder matches = new StringBuilder();
         for (String item : script.matches) matches.append("\n• ").append(item);
-        String message = "状态：" + (script.quarantined ? "已隔离" : (script.enabled ? "已启用" : "已禁用")) +
-                (script.disabledReason.length() == 0 ? "" : "\n原因：" + script.disabledReason) +
+        String message = "状态：" + (script.enabled ? "已启用" : "已禁用") +
                 "\n版本：" + (script.version.length() == 0 ? "未知" : script.version) +
-                "\n风险：" + script.riskSummary + "（" + script.riskScore + " 分）" +
                 "\n运行时机：" + script.runAt + (script.noFrames ? " · 仅顶层页面" : "") +
                 "\n声明授权：" + (script.grants.size() == 0 ? "未声明" : script.grants.toString()) +
                 "\nHTTPS 依赖：" + script.requires.size() + " 项" +
@@ -6398,30 +8408,30 @@ public final class MainActivity extends Activity implements Runnable {
                 "\n网络范围：" + (script.connects.size() == 0 ? "未声明" : script.connects.toString()) +
                 "\n来源：" + (script.sourceUrl.length() == 0 ? "本地" : script.sourceUrl) +
                 "\n匹配范围：" + matches.toString();
-        String positive = script.quarantined ? "重新启用" : (preferredUpdateUrl(script).length() > 0 ? "检查更新" : "确定");
-        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+        SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { showScriptDetails(script); }
+        });
+        new AlertDialog.Builder(this)
                 .setTitle(script.name)
                 .setMessage(message)
-                .setPositiveButton(positive, new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        if (script.quarantined) {
-                            scriptStore.setEnabled(script.id, true);
-                            refreshUserScriptRegistrations(true);
-                            toast("脚本已重新启用");
-                        } else if (preferredUpdateUrl(script).length() > 0) updateOneUserScript(script);
-                    }
-                })
-                .setNegativeButton("返回", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) { showScriptCenter(); }
-                });
-        builder.setNeutralButton("删除", new DialogInterface.OnClickListener() {
-            @Override public void onClick(DialogInterface dialog, int which) {
-                scriptStore.delete(script.id);
-                refreshUserScriptRegistrations(true);
-                toast("脚本已删除");
-            }
+                .setPositiveButton("确定", back)
+                .setNegativeButton("返回", back)
+                .setOnCancelListener(back).show();
+    }
+
+    private void confirmDeleteScript(final UserScriptStore.Script script) {
+        SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { showScriptDetails(script); }
         });
-        builder.show();
+        new AlertDialog.Builder(this).setTitle("删除脚本？").setMessage(script.name)
+                .setPositiveButton("删除", new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface dialog, int which) {
+                        scriptStore.delete(script.id);
+                        refreshUserScriptRegistrations(true);
+                        toast("脚本已删除");
+                        showScriptCenter();
+                    }
+                }).setNegativeButton("取消", back).setOnCancelListener(back).show();
     }
 
     private boolean looksLikeUserScript(String url) {
@@ -6437,12 +8447,12 @@ public final class MainActivity extends Activity implements Runnable {
     private void showTabs() {
         if (!requireStartupReady()) return;
         saveCurrentTab();
-        dismissOverlay();
-        final int pageBackground = nightMode ? Color.rgb(27, 29, 32) : Color.rgb(248, 249, 250);
-        final int cardBackground = nightMode ? Color.rgb(38, 41, 45) : WHITE;
-        final int activeCard = nightMode ? Color.rgb(32, 54, 82) : Color.rgb(232, 240, 254);
-        final int pageText = nightMode ? Color.rgb(232, 234, 237) : TEXT;
-        final int pageMuted = nightMode ? Color.rgb(154, 160, 166) : MUTED;
+        dismissOverlayForNavigation();
+        final int pageBackground = nightMode ? DARK_BACKGROUND : WHITE;
+        final int cardBackground = nightMode ? DARK_CARD : WHITE;
+        final int activeCard = nightMode ? 0xff203652 : 0xffe8f0fe;
+        final int pageText = nightMode ? DARK_TEXT : TEXT;
+        final int pageMuted = nightMode ? DARK_MUTED : MUTED;
         final FrameLayout overlay = new FrameLayout(this);
         overlay.setBackgroundColor(pageBackground);
         overlay.setClickable(true);
@@ -6581,6 +8591,8 @@ public final class MainActivity extends Activity implements Runnable {
         activeOverlay = overlay;
         activeOverlayPanel = page;
         activeOverlaySheet = false;
+        activeOverlayBackAction = null;
+        activeOverlayDismissAction = null;
         Motion.showPage(overlay, page, reduceMotion());
         add.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View v) { dismissOverlay(); newTab(); }
@@ -6608,7 +8620,6 @@ public final class MainActivity extends Activity implements Runnable {
         if (index < currentTabIndex) currentTabIndex--;
         renderedTabCount = null;
         persistSession();
-        dismissOverlay();
         showTabs();
     }
 
@@ -6630,7 +8641,10 @@ public final class MainActivity extends Activity implements Runnable {
     private void activateTab(int index) {
         if (index < 0 || index >= tabs.size()) return;
         BrowserTab previous = currentTabIndex >= 0 && currentTabIndex < tabs.size() ? tabs.get(currentTabIndex) : null;
+        BrowserTab targetTab = tabs.get(index);
         WebView previousView = webView;
+        boolean singleRendererSwap = targetTab.liveView == null && previous != null && previousView != null &&
+                deviceProfile != null && deviceProfile.hotWebViewLimit(performanceMode) <= 1;
         if (previous != null && previousView != null) {
             updateTabForView(previousView, previousView.getUrl(), previousView.getTitle());
             previous.lastActiveAt = SystemClock.uptimeMillis();
@@ -6639,11 +8653,23 @@ public final class MainActivity extends Activity implements Runnable {
         }
 
         currentTabIndex = index;
-        BrowserTab targetTab = tabs.get(index);
+        // In the one-renderer policy, capture and destroy the old surface before allocating the
+        // target. The former create-first/trim-next-frame order briefly doubled Chromium memory
+        // and produced exactly the tab-switch peaks users could feel as jank.
+        if (singleRendererSwap) {
+            previous.state = captureWebViewState(previousView);
+            previous.liveView = null;
+            webView = null;
+            destroyWebView(previousView);
+            trimColdTabStates();
+        }
         boolean created = targetTab.liveView == null;
-        if (created) targetTab.liveView = acquireWebView();
+        if (created) {
+            makeRoomForRenderer();
+            bindWebViewToTab(targetTab, acquireWebView());
+        }
         webView = targetTab.liveView;
-        if (previousView != null && previousView != webView) applyPerformanceMode(previousView);
+        if (!singleRendererSwap && previousView != null && previousView != webView) applyPerformanceMode(previousView);
         applyPerformanceMode(webView);
         targetTab.lastActiveAt = SystemClock.uptimeMillis();
         if (webView.getParent() instanceof ViewGroup) ((ViewGroup) webView.getParent()).removeView(webView);
@@ -6660,10 +8686,11 @@ public final class MainActivity extends Activity implements Runnable {
         injectedEndSequence = -1;
 
         if (created) {
-            boolean restored = targetTab.state != null && webView.restoreState(targetTab.state) != null;
+            boolean restored = restoreWebViewState(webView, targetTab.state);
             targetTab.state = null;
             if (!restored) {
                 if (isHomeUrl(targetTab.url)) showHome();
+                else if (isQrScannerUrl(targetTab.url)) showQrScannerPage();
                 else loadNetworkUrl(webView, targetTab.url);
             } else {
                 currentPageUrl = webView.getUrl() == null ? targetTab.url : webView.getUrl();
@@ -6671,8 +8698,10 @@ public final class MainActivity extends Activity implements Runnable {
                 if (isHomeUrl(currentPageUrl)) {
                     renderedHomeKeys.remove(webView);
                     showHome();
+                } else if (isQrScannerUrl(currentPageUrl)) {
+                    showQrScannerPage();
                 } else if (isNetworkPage(currentPageUrl)) {
-                    prepareNetworkDestination(webView, currentPageUrl);
+                    prepareNetworkDestination(webView, currentPageUrl, currentPageHost);
                     watchInitialNetworkNavigation(webView, currentPageUrl);
                 } else if (isOfflineUrl(currentPageUrl)) {
                     prepareOfflineDestination(webView, currentPageUrl);
@@ -6687,6 +8716,7 @@ public final class MainActivity extends Activity implements Runnable {
         }
 
         pageHosts.put(webView, currentPageHost == null ? "" : currentPageHost);
+        resumeQrScannerIfNeeded();
         scheduleHotWebViewTrim();
         requestChromeUpdate();
         persistSession();
@@ -6733,7 +8763,7 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void rememberClosedTab(BrowserTab tab) {
-        if (tab == null || tab.url == null || isHomeUrl(tab.url)) return;
+        if (tab == null || tab.url == null || isInternalBrowserUrl(tab.url)) return;
         BrowserTab copy = new BrowserTab();
         copy.title = tab.title;
         copy.url = tab.url;
@@ -6747,8 +8777,8 @@ public final class MainActivity extends Activity implements Runnable {
                 "搜索标签页",
                 "重新打开最近关闭的标签" + (closedTabs.size() == 0 ? " · 无记录" : " · " + closedTabs.size()),
                 "复制当前标签",
-                "关闭其他标签",
-                "冻结后台标签释放内存",
+                "关闭其他未固定标签",
+                "冻结未固定的后台标签",
                 "关闭全部并返回主页"
         };
         int[] icons = new int[] { BrowserIconView.SEARCH, BrowserIconView.RELOAD, BrowserIconView.PLUS,
@@ -6760,16 +8790,26 @@ public final class MainActivity extends Activity implements Runnable {
                 else if (which == 2) duplicateCurrentTab();
                 else if (which == 3) closeOtherTabs();
                 else if (which == 4) {
-                    for (int i = 0; i < tabs.size(); i++) if (i != currentTabIndex && !tabs.get(i).pinned) freezeTab(tabs.get(i));
-                    toast("后台标签已冻结");
+                    int frozen = 0;
+                    for (int i = 0; i < tabs.size(); i++) {
+                        BrowserTab tab = tabs.get(i);
+                        if (i != currentTabIndex && !tab.pinned && tab.liveView != null) {
+                            freezeTab(tab);
+                            frozen++;
+                        }
+                    }
+                    if (frozen == 0) {
+                        toast("没有可冻结的未固定后台标签");
+                        showTabTools();
+                    } else toast("已冻结 " + frozen + " 个后台标签");
                 } else closeAllTabs();
             }
         });
     }
 
     private void reopenClosedTab() {
-        if (closedTabs.size() == 0) { toast("没有最近关闭的标签"); return; }
-        if (tabs.size() >= MAX_TABS) { toast("标签页已达到上限"); return; }
+        if (closedTabs.size() == 0) { toast("没有最近关闭的标签"); showTabTools(); return; }
+        if (tabs.size() >= MAX_TABS) { toast("标签页已达到上限"); showTabTools(); return; }
         BrowserTab closed = closedTabs.remove(0);
         BrowserTab tab = new BrowserTab();
         tab.title = closed.title;
@@ -6781,7 +8821,7 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void duplicateCurrentTab() {
         if (currentTabIndex < 0 || currentTabIndex >= tabs.size()) return;
-        if (tabs.size() >= MAX_TABS) { toast("标签页已达到上限"); return; }
+        if (tabs.size() >= MAX_TABS) { toast("标签页已达到上限"); showTabTools(); return; }
         saveCurrentTab();
         BrowserTab current = tabs.get(currentTabIndex);
         BrowserTab duplicate = new BrowserTab();
@@ -6792,19 +8832,25 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void closeOtherTabs() {
-        if (tabs.size() <= 1) { toast("没有其他标签"); return; }
+        if (tabs.size() <= 1) { toast("没有其他标签"); showTabTools(); return; }
         BrowserTab current = tabs.get(currentTabIndex);
+        int closed = 0;
         for (int i = tabs.size() - 1; i >= 0; i--) {
             BrowserTab tab = tabs.get(i);
             if (tab == current || tab.pinned) continue;
             rememberClosedTab(tab);
             destroyTabView(tab, false);
             tabs.remove(i);
+            closed++;
         }
         currentTabIndex = tabs.indexOf(current);
         renderedTabCount = null;
         persistSession();
         requestChromeUpdate();
+        if (closed == 0) {
+            toast("其他标签均已固定");
+            showTabTools();
+        } else toast("已关闭 " + closed + " 个标签");
     }
 
     private void closeAllTabs() {
@@ -6815,6 +8861,7 @@ public final class MainActivity extends Activity implements Runnable {
         }
         tabs.clear();
         if (active == null) active = new BrowserTab();
+        else scriptTabValues.removeTab(active.scriptTabId);
         tabs.add(active);
         currentTabIndex = 0;
         resetOnlyTabToHome(false);
@@ -6824,26 +8871,44 @@ public final class MainActivity extends Activity implements Runnable {
         final EditText input = new EditText(this);
         input.setSingleLine(true);
         input.setHint("标题或网址");
-        new AlertDialog.Builder(this).setTitle("搜索标签页").setView(input)
-                .setPositiveButton("搜索", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
+        final AlertDialog dialog = new AlertDialog.Builder(this).setTitle("搜索标签页").setView(input)
+                .setPositiveButton("搜索", null)
+                .setNegativeButton("取消", null).create();
+        dialog.setOnCancelListener(new DialogInterface.OnCancelListener() {
+            @Override public void onCancel(DialogInterface ignored) { showTabTools(); }
+        });
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface ignored) {
+                dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) { dialog.dismiss(); showTabTools(); }
+                });
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) {
                         String query = input.getText().toString().trim().toLowerCase(Locale.US);
                         final ArrayList<Integer> matches = new ArrayList<Integer>();
                         for (int i = 0; i < tabs.size(); i++) {
                             BrowserTab tab = tabs.get(i);
                             if (query.length() == 0 || tab.title.toLowerCase(Locale.US).contains(query) || tab.url.toLowerCase(Locale.US).contains(query)) matches.add(Integer.valueOf(i));
                         }
-                        if (matches.size() == 0) { toast("没有匹配的标签"); return; }
+                        if (matches.size() == 0) { input.setError("没有匹配的标签"); return; }
                         String[] labels = new String[matches.size()];
                         for (int i = 0; i < labels.length; i++) {
                             BrowserTab tab = tabs.get(matches.get(i).intValue());
                             labels[i] = safeTitle(tab.title, tab.url) + "\n" + tab.url;
                         }
+                        dialog.dismiss();
                         new AlertDialog.Builder(MainActivity.this).setTitle("匹配标签").setItems(labels, new DialogInterface.OnClickListener() {
                             @Override public void onClick(DialogInterface dialog, int which) { activateTab(matches.get(which).intValue()); }
+                        }).setNegativeButton("返回", new DialogInterface.OnClickListener() {
+                            @Override public void onClick(DialogInterface dialog, int which) { showTabSearch(); }
+                        }).setOnCancelListener(new DialogInterface.OnCancelListener() {
+                            @Override public void onCancel(DialogInterface dialog) { showTabSearch(); }
                         }).show();
                     }
-                }).setNegativeButton("取消", null).show();
+                });
+            }
+        });
+        dialog.show();
     }
 
     private void saveCurrentTab() {
@@ -6869,6 +8934,22 @@ public final class MainActivity extends Activity implements Runnable {
                 enforceHotWebViewLimit();
             }
         });
+    }
+
+    /** Releases an older background renderer before allocation, never after the memory peak. */
+    private void makeRoomForRenderer() {
+        if (deviceProfile == null) return;
+        int limit = deviceProfile.hotWebViewLimit(performanceMode);
+        while (liveWebViewCount() >= limit) {
+            BrowserTab oldest = null;
+            for (int i = 0; i < tabs.size(); i++) {
+                BrowserTab candidate = tabs.get(i);
+                if (i == currentTabIndex || candidate.liveView == null || candidate.liveView == webView) continue;
+                if (oldest == null || candidate.lastActiveAt < oldest.lastActiveAt) oldest = candidate;
+            }
+            if (oldest == null) return;
+            freezeTab(oldest);
+        }
     }
 
     private void enforceHotWebViewLimit() {
@@ -6899,16 +8980,145 @@ public final class MainActivity extends Activity implements Runnable {
     private static Bundle captureWebViewState(WebView view) {
         if (view == null) return null;
         Bundle state = new Bundle();
-        if (view.saveState(state) == null) return null;
-        Parcel parcel = Parcel.obtain();
+        Parcel parcel = null;
         try {
+            if (view.saveState(state) == null) return null;
+            parcel = Parcel.obtain();
             state.writeToParcel(parcel, 0);
             return parcel.dataSize() <= MAX_WEBVIEW_STATE_BYTES ? state : null;
         } catch (RuntimeException ignored) {
             return null;
         } finally {
-            parcel.recycle();
+            if (parcel != null) parcel.recycle();
         }
+    }
+
+    private static boolean restoreWebViewState(WebView view, Bundle state) {
+        if (view == null || state == null) return false;
+        try { return view.restoreState(state) != null; }
+        catch (RuntimeException ignored) { return false; }
+    }
+
+    private static boolean isBoundedTabState(Bundle state) {
+        Parcel parcel = null;
+        try {
+            parcel = Parcel.obtain();
+            state.writeToParcel(parcel, 0);
+            return parcel.dataSize() <= MAX_WEBVIEW_STATE_BYTES;
+        } catch (RuntimeException ignored) { return false; }
+        finally { if (parcel != null) parcel.recycle(); }
+    }
+
+    private boolean isRestorableTabUrl(String url) {
+        if (url == null || url.length() == 0 || url.length() > MAX_SAVED_TAB_URL_CHARS) return false;
+        if (isHomeUrl(url) || isQrScannerUrl(url) || isOfflineUrl(url)) return true;
+        if (!isNetworkPage(url)) return false;
+        try { NetworkSecurity.parseHttpUrl(url); return true; }
+        catch (Exception ignored) { return false; }
+    }
+
+    /** Only lightweight metadata belongs in the Activity parcel; background histories stay out. */
+    private Bundle captureTabMetadata() {
+        int count = Math.min(tabs.size(), MAX_TABS);
+        if (count == 0) return null;
+        int selected = Math.max(0, Math.min(currentTabIndex, count - 1));
+        byte[][] urls = new byte[count][];
+        byte[][] titles = new byte[count][];
+        boolean[] replaced = new boolean[count];
+        byte[] home = HOME_URL.getBytes(StandardCharsets.UTF_8);
+        int bytes = 16 + count * 9;
+        for (int i = 0; i < count; i++) {
+            BrowserTab tab = tabs.get(i);
+            replaced[i] = !isRestorableTabUrl(tab.url);
+            urls[i] = replaced[i] ? home : tab.url.getBytes(StandardCharsets.UTF_8);
+            String title = tab.title == null ? "" : tab.title;
+            if (title.length() > MAX_SAVED_TAB_TITLE_CHARS) title = title.substring(0, MAX_SAVED_TAB_TITLE_CHARS);
+            titles[i] = title.getBytes(StandardCharsets.UTF_8);
+            bytes += urls[i].length + titles[i].length;
+        }
+        // Reserve ample room for Bundle/key/byte-array parcel headers. UTF-8 retains ordinary
+        // ASCII URLs efficiently. If pathological URLs exceed the total budget, retain every
+        // tab slot and prefer preserving the selected URL, rather than truncating valid URLs.
+        while (bytes > MAX_TAB_METADATA_BYTES - 1024) {
+            int largest = -1;
+            for (int i = 0; i < count; i++) {
+                if (i != selected && urls[i].length > home.length &&
+                        (largest < 0 || urls[i].length > urls[largest].length)) largest = i;
+            }
+            if (largest < 0 && urls[selected].length > home.length) largest = selected;
+            if (largest < 0) return null;
+            bytes -= urls[largest].length - home.length;
+            urls[largest] = home;
+            replaced[largest] = true;
+        }
+        Parcel parcel = null;
+        try {
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream(bytes);
+            DataOutputStream output = new DataOutputStream(buffer);
+            output.writeInt(1);
+            output.writeInt(count);
+            output.writeInt(selected);
+            int replacements = 0;
+            for (boolean value : replaced) if (value) replacements++;
+            output.writeInt(replacements);
+            for (int i = 0; i < count; i++) {
+                output.writeInt(urls[i].length);
+                output.write(urls[i]);
+                output.writeInt(titles[i].length);
+                output.write(titles[i]);
+                output.writeBoolean(tabs.get(i).pinned);
+            }
+            Bundle metadata = new Bundle();
+            metadata.putByteArray("data", buffer.toByteArray());
+            parcel = Parcel.obtain();
+            metadata.writeToParcel(parcel, 0);
+            return parcel.dataSize() <= MAX_TAB_METADATA_BYTES ? metadata : null;
+        } catch (IOException | RuntimeException ignored) { return null; }
+        finally { if (parcel != null) parcel.recycle(); }
+    }
+
+    private static String readTabMetadataString(DataInputStream input, int maxChars) throws IOException {
+        int length = input.readInt();
+        if (length < 0 || length > maxChars * 4 || length > input.available()) throw new IOException("Invalid tab string");
+        byte[] bytes = new byte[length];
+        input.readFully(bytes);
+        String value = new String(bytes, StandardCharsets.UTF_8);
+        if (value.length() > maxChars) throw new IOException("Tab string too long");
+        return value;
+    }
+
+    private boolean restoreTabMetadata(Bundle savedState) {
+        if (savedState == null) return false;
+        try {
+            Bundle metadata = savedState.getBundle(STATE_TABS);
+            byte[] bytes = metadata == null ? null : metadata.getByteArray("data");
+            if (bytes == null || bytes.length > MAX_TAB_METADATA_BYTES - 1024) return false;
+            DataInputStream input = new DataInputStream(new ByteArrayInputStream(bytes));
+            if (input.readInt() != 1) return false;
+            int count = input.readInt();
+            int selected = input.readInt();
+            int replacements = input.readInt();
+            if (count < 1 || count > MAX_TABS || selected < 0 || selected >= count ||
+                    replacements < 0 || replacements > count) return false;
+            ArrayList<BrowserTab> restored = new ArrayList<BrowserTab>(count);
+            for (int i = 0; i < count; i++) {
+                BrowserTab tab = new BrowserTab();
+                tab.url = readTabMetadataString(input, MAX_SAVED_TAB_URL_CHARS);
+                tab.title = readTabMetadataString(input, MAX_SAVED_TAB_TITLE_CHARS);
+                tab.pinned = input.readBoolean();
+                if (!isRestorableTabUrl(tab.url)) return false;
+                restored.add(tab);
+            }
+            if (input.available() != 0) return false;
+            tabs.clear();
+            tabs.addAll(restored);
+            currentTabIndex = selected;
+            BrowserTab active = tabs.get(selected);
+            bindWebViewToTab(active, webView);
+            active.lastActiveAt = SystemClock.uptimeMillis();
+            if (replacements > 0) toast("部分超长标签地址已恢复为主页，请从历史记录重新打开");
+            return true;
+        } catch (IOException | RuntimeException ignored) { return false; }
     }
 
     private void trimColdTabStates() {
@@ -6929,15 +9139,27 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void destroyTabView(BrowserTab tab, boolean keepState) {
-        if (tab == null || tab.liveView == null) return;
+        if (tab == null) return;
+        if (!keepState) {
+            tab.state = null;
+            scriptTabValues.removeTab(tab.scriptTabId);
+        }
+        if (tab.liveView == null) return;
         WebView view = tab.liveView;
         tab.liveView = null;
-        if (!keepState) tab.state = null;
         if (view.getParent() instanceof ViewGroup) ((ViewGroup) view.getParent()).removeView(view);
         destroyWebView(view);
     }
 
     private void recoverFromRendererLoss() {
+        if (activityDestroyed || isFinishing() || webContainer == null) {
+            rendererRecoveryPending = false;
+            return;
+        }
+        // Renderer loss invalidates every pending page enhancement. Advance the generation
+        // before replacing views so work queued for the dead renderer cannot target its replacement.
+        advanceNavigationSequence();
+        preparedInjection = null;
         String reloadUrl = currentPageUrl;
         if (reloadUrl == null || reloadUrl.length() == 0) reloadUrl = HOME_URL;
         if (customView != null) exitFullscreen();
@@ -6954,18 +9176,22 @@ public final class MainActivity extends Activity implements Runnable {
 
         BrowserTab active = currentTabIndex >= 0 && currentTabIndex < tabs.size() ? tabs.get(currentTabIndex) : null;
         webView = createConfiguredWebView();
+        applyPerformanceMode(webView);
         if (active != null) {
-            active.liveView = webView;
+            bindWebViewToTab(active, webView);
             active.lastActiveAt = SystemClock.uptimeMillis();
         }
         webContainer.removeAllViews();
         webContainer.addView(webView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        if (activityResumed) webView.onResume();
         currentPageUrl = reloadUrl;
         currentPageHost = hostOf(reloadUrl);
         pageHosts.put(webView, currentPageHost);
         adBlockActiveByView.put(webView, Boolean.valueOf(isAdBlockActiveForHost(currentPageHost)));
         rendererRecoveryPending = false;
-        if (isHomeUrl(reloadUrl)) showHome(); else loadNetworkUrl(webView, reloadUrl);
+        if (isHomeUrl(reloadUrl)) showHome();
+        else if (isQrScannerUrl(reloadUrl)) showQrScannerPage();
+        else loadNetworkUrl(webView, reloadUrl);
         requestChromeUpdate();
         toast("网页渲染进程已恢复");
     }
@@ -6973,8 +9199,16 @@ public final class MainActivity extends Activity implements Runnable {
     private void destroyWebView(WebView view) {
         if (view == null) return;
         initialNavigationGuards.remove(view);
+        navigationGestureGuards.remove(view);
+        navigationSourceDocuments.remove(view);
+        mainFrameNavigationContexts.remove(view);
+        popupSourceDocuments.remove(view);
+        startedPageUrls.remove(view);
         unresponsiveWebViews.remove(view);
+        scriptTabIds.remove(view);
+        scriptDocumentGenerations.remove(view);
         removeDocumentStartUserScripts(view);
+        removeConnectionHintScript(view);
         pageHosts.remove(view);
         adBlockActiveByView.remove(view);
         mobileUserAgents.remove(view);
@@ -6982,7 +9216,9 @@ public final class MainActivity extends Activity implements Runnable {
         cosmeticInjected.remove(view);
         trustedHomeViews.remove(view);
         customHomeViews.remove(view);
-        credentialCaptureTokens.remove(view);
+        adPickerViews.remove(view);
+        adPickerSessions.remove(view);
+        qrScannerViews.remove(view);
         renderedHomeKeys.remove(view);
         try { view.stopLoading(); } catch (RuntimeException ignored) {}
         try { view.onPause(); } catch (RuntimeException ignored) {}
@@ -7000,7 +9236,8 @@ public final class MainActivity extends Activity implements Runnable {
     private String safeTitle(String title, String url) {
         String value = title == null || title.trim().length() == 0 ? url : title.trim();
         if (isHomeUrl(url)) value = "主页";
-        return value.length() > 34 ? value.substring(0, 34) + "…" : value;
+        else if (isQrScannerUrl(url)) value = "扫描二维码";
+        return UiText.ellipsize(value, 34);
     }
 
     private void enterFullscreen(View view, WebChromeClient.CustomViewCallback callback) {
@@ -7018,10 +9255,8 @@ public final class MainActivity extends Activity implements Runnable {
         rootFrame.addView(view, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         view.requestFocus(View.FOCUS_DOWN);
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        getWindow().getDecorView().setSystemUiVisibility(
-                View.SYSTEM_UI_FLAG_FULLSCREEN |
-                View.SYSTEM_UI_FLAG_HIDE_NAVIGATION |
-                View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY);
+        setImmersiveSystemBars(true);
+        rootFrame.requestApplyInsets();
         setRequestedOrientation(ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
     }
 
@@ -7032,180 +9267,13 @@ public final class MainActivity extends Activity implements Runnable {
         browserChrome.setVisibility(View.VISIBLE);
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN | WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         getWindow().getDecorView().setSystemUiVisibility(previousSystemUi);
+        setImmersiveSystemBars(chromeHiddenByScroll);
+        rootFrame.requestApplyInsets();
         setRequestedOrientation(previousOrientation);
         if (customViewCallback != null) customViewCallback.onCustomViewHidden();
         customViewCallback = null;
         resetWebViewTransform(webView);
         if (webView != null) webView.requestFocus(View.FOCUS_DOWN);
-    }
-
-    private void installCredentialExperience(final WebView view, final String url, final long sequence) {
-        if (view == null || view != webView || !isSecureCredentialUrl(url) || activityDestroyed) {
-            if (view != null) credentialCaptureTokens.remove(view);
-            return;
-        }
-        final String host = hostOf(url);
-        if (passwordSavePromptsEnabled || passwordAutofillEnabled) {
-            String token = UrlCleaner.randomToken();
-            credentialCaptureTokens.put(view, token);
-            try { view.evaluateJavascript(CredentialAutofill.captureScript(token), null); }
-            catch (RuntimeException ignored) { credentialCaptureTokens.remove(view); }
-        } else credentialCaptureTokens.remove(view);
-
-        if (!passwordAutofillEnabled || services == null ||
-                !services.passwords().mightHaveForHost(host)) return;
-        long[] delays = new long[] { 0L, 700L, 2200L, 5200L };
-        for (final long delay : delays) uiHandler.postDelayed(new Runnable() {
-            @Override public void run() { probeCredentialAutofill(view, url, host, sequence); }
-        }, delay);
-    }
-
-    private void probeCredentialAutofill(final WebView view, final String expectedUrl,
-                                         final String host, final long sequence) {
-        if (!passwordAutofillEnabled || activityDestroyed || !activityResumed ||
-                view != webView || sequence != navigationSequence ||
-                !isSecureCredentialUrl(view.getUrl()) || !host.equalsIgnoreCase(hostOf(view.getUrl()))) return;
-        final String pageKey = sequence + "|" + expectedUrl;
-        try {
-            view.evaluateJavascript(CredentialAutofill.detectScript(), new ValueCallback<String>() {
-                @Override public void onReceiveValue(String value) {
-                    if (activityDestroyed || view != webView || sequence != navigationSequence ||
-                            !host.equalsIgnoreCase(currentHost())) return;
-                    try {
-                        Object decoded = new JSONTokener(value == null ? "{}" : value).nextValue();
-                        JSONObject state = new JSONObject(decoded instanceof String ? (String) decoded : String.valueOf(decoded));
-                        boolean login = state.optBoolean("login", false);
-                        boolean usernameOnly = state.optBoolean("usernameOnly", false);
-                        if (!login && !usernameOnly) return;
-                        String stateKey = pageKey + (login ? "|password" : "|username");
-                        if (stateKey.equals(handledCredentialPageKey)) return;
-                        handledCredentialPageKey = stateKey;
-                        withVaultUnlock(new Runnable() {
-                            @Override public void run() {
-                                fillSavedCredentialForPage(view, expectedUrl, host, sequence);
-                            }
-                        });
-                    } catch (Exception ignored) {}
-                }
-            });
-        } catch (RuntimeException ignored) {}
-    }
-
-    private void fillSavedCredentialForPage(final WebView view, final String expectedUrl,
-                                            final String host, final long sequence) {
-        if (services == null) return;
-        if (stagedCredential != null && host.equalsIgnoreCase(stagedCredential.host) &&
-                SystemClock.elapsedRealtime() - stagedCredentialAt < 120_000L) {
-            fillCredentialOnPage(view, expectedUrl, stagedCredential, true);
-            return;
-        }
-        services.passwords().forHost(host, new PasswordVault.Callback<List<PasswordVault.Credential>>() {
-            @Override public void onComplete(final List<PasswordVault.Credential> credentials, Exception error) {
-                if (error != null || activityDestroyed || view != webView || sequence != navigationSequence ||
-                        !host.equalsIgnoreCase(currentHost()) || !isSecureCredentialUrl(currentPageUrl)) return;
-                if (credentials == null || credentials.size() == 0) return;
-                if (credentials.size() == 1) {
-                    stageAutomaticCredential(credentials.get(0));
-                    fillCredentialOnPage(view, expectedUrl, stagedCredential, true);
-                    return;
-                }
-                String[] names = new String[credentials.size()];
-                for (int i = 0; i < credentials.size(); i++) names[i] = credentials.get(i).username;
-                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("选择要自动填充的账号")
-                        .setItems(names, new DialogInterface.OnClickListener() {
-                            @Override public void onClick(DialogInterface dialog, int which) {
-                                if (which >= 0 && which < credentials.size()) {
-                                    stageAutomaticCredential(credentials.get(which));
-                                    fillCredentialOnPage(view, expectedUrl, stagedCredential, true);
-                                }
-                            }
-                        }).setNegativeButton("取消", null).create();
-                secureDialog(dialog);
-                dialog.show();
-            }
-        });
-    }
-
-    private void stageAutomaticCredential(PasswordVault.Credential credential) {
-        stagedCredential = credential == null ? null : credential.copy();
-        stagedCredentialAt = stagedCredential == null ? 0L : SystemClock.elapsedRealtime();
-    }
-
-    private boolean handleCredentialAutofillPrompt(final WebView source, String message, JsPromptResult result) {
-        final String prefix = "__MEDIAN_AUTOFILL__";
-        if (message == null || !message.startsWith(prefix)) return false;
-        if (result != null) result.confirm("");
-        if (result == null || !passwordAutofillEnabled || activityDestroyed || source == null || source != webView ||
-                services == null || message.length() > 2048 || !isSecureCredentialUrl(source.getUrl())) return true;
-        try {
-            JSONObject request = new JSONObject(message.substring(prefix.length()));
-            String token = request.optString("t", "");
-            final String host = request.optString("h", "").trim().toLowerCase(Locale.US);
-            String expected = credentialCaptureTokens.get(source);
-            if (expected == null || !expected.equals(token) || !host.equalsIgnoreCase(hostOf(source.getUrl())) ||
-                    !services.passwords().mightHaveForHost(host)) return true;
-            final String url = source.getUrl();
-            final long sequence = navigationSequence;
-            source.post(new Runnable() {
-                @Override public void run() { probeCredentialAutofill(source, url, host, sequence); }
-            });
-        } catch (Exception ignored) {}
-        return true;
-    }
-
-    private boolean handleCredentialCapturePrompt(final WebView source, String message, JsPromptResult result) {
-        final String prefix = "__MEDIAN_CREDENTIAL__";
-        if (message == null || !message.startsWith(prefix)) return false;
-        if (result != null) result.confirm("");
-        if (!passwordSavePromptsEnabled || result == null || source == null || source != webView ||
-                message.length() > 10000 || !isSecureCredentialUrl(source.getUrl())) return true;
-        try {
-            JSONObject request = new JSONObject(message.substring(prefix.length()));
-            String token = request.optString("t", "");
-            final String host = request.optString("h", "").trim().toLowerCase(Locale.US);
-            final String username = request.optString("u", "").trim();
-            final String password = request.optString("p", "");
-            String expected = credentialCaptureTokens.get(source);
-            if (expected == null || !expected.equals(token) || !host.equalsIgnoreCase(hostOf(source.getUrl())) ||
-                    username.length() == 0 || username.length() > 512 || password.length() == 0 || password.length() > 8192)
-                return true;
-            String offerKey = UrlCleaner.stableId(host + "\n" + username + "\n" + password);
-            long now = SystemClock.elapsedRealtime();
-            if (offerKey.equals(lastCredentialOfferKey) && now - lastCredentialOfferAt < 15000L) return true;
-            lastCredentialOfferKey = offerKey;
-            lastCredentialOfferAt = now;
-            uiHandler.postDelayed(new Runnable() {
-                @Override public void run() {
-                    if (!activityDestroyed && passwordSavePromptsEnabled)
-                        offerToSaveCapturedCredential(host, username, password);
-                }
-            }, 350L);
-        } catch (Exception ignored) {}
-        return true;
-    }
-
-    private void offerToSaveCapturedCredential(final String host, final String username, final String password) {
-        AlertDialog dialog = new AlertDialog.Builder(this)
-                .setTitle("保存或更新密码？")
-                .setMessage(host + "\n" + username + "\n\n密码只会加密保存在本机，Median 不会自动提交表单。")
-                .setPositiveButton("保存", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        withVaultUnlock(new Runnable() {
-                            @Override public void run() {
-                                services.passwords().saveCredential(host, username, password,
-                                        new PasswordVault.Callback<Void>() {
-                                    @Override public void onComplete(Void value, Exception error) {
-                                        if (error == null) toast("账号已加密保存");
-                                        else toast("保存失败：" + safeMessage(error));
-                                    }
-                                });
-                            }
-                        });
-                    }
-                }).setNegativeButton("不保存", null).create();
-        secureDialog(dialog);
-        dialog.show();
     }
 
     private boolean isSecureCredentialUrl(String url) {
@@ -7216,51 +9284,87 @@ public final class MainActivity extends Activity implements Runnable {
         } catch (Exception ignored) { return false; }
     }
 
+    private int secureCredentialPort(String url) {
+        try {
+            URL parsed = NetworkSecurity.parseHttpsUrl(url);
+            return NetworkSecurity.effectivePort(parsed);
+        } catch (Exception ignored) { return -1; }
+    }
+
+    private static boolean sameCredentialDocument(String expected, String actual) {
+        return expected != null && actual != null && UrlCleaner.sameOrigin(expected, actual) &&
+                navigationDocumentUrl(expected).equals(navigationDocumentUrl(actual));
+    }
+
     private void showPasswordMenu() {
+        showPasswordMenu(passwordMenuBackAction);
+    }
+
+    private void showPasswordMenu(final Runnable backAction) {
+        passwordMenuBackAction = backAction;
         String[] items = new String[] {
-                "自动识别并填充：" + (passwordAutofillEnabled ? "已开启" : "已关闭"),
-                "登录后询问保存：" + (passwordSavePromptsEnabled ? "已开启" : "已关闭"),
+                "网页自动填充：已停用（请手动选择账号）",
+                "网页自动保存：已停用（请手动保存）",
                 "手动保存当前站点账号", "手动填充当前页面", "管理已保存密码", "密码安全说明"
         };
-        new AlertDialog.Builder(this)
+        SettingsDialogReturn back = new SettingsDialogReturn(backAction);
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("密码管理器")
                 .setItems(items, new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface dialog, int which) {
                         if (which == 0) {
-                            passwordAutofillEnabled = !passwordAutofillEnabled;
-                            prefs.edit().putBoolean("password_autofill", passwordAutofillEnabled).apply();
-                            handledCredentialPageKey = "";
-                            if (passwordAutofillEnabled && webView != null)
-                                installCredentialExperience(webView, currentPageUrl, navigationSequence);
-                            toast(passwordAutofillEnabled ? "密码自动填充已开启" : "密码自动填充已关闭");
+                            toast("网页自动填充已停用，请使用“手动填充当前页面”");
+                            postAfterUiTransition(new Runnable() {
+                                @Override public void run() { showPasswordMenu(); }
+                            });
                             return;
                         }
                         if (which == 1) {
-                            passwordSavePromptsEnabled = !passwordSavePromptsEnabled;
-                            prefs.edit().putBoolean("password_save_prompts", passwordSavePromptsEnabled).apply();
-                            if (webView != null) installCredentialExperience(webView, currentPageUrl, navigationSequence);
-                            toast(passwordSavePromptsEnabled ? "登录后将询问保存密码" : "登录保存提示已关闭");
+                            toast("网页自动保存已停用，请使用“手动保存当前站点账号”");
+                            postAfterUiTransition(new Runnable() {
+                                @Override public void run() { showPasswordMenu(); }
+                            });
                             return;
                         }
-                        if (which == 5) { showVaultInfo(); return; }
+                        if (which == 5) {
+                            showVaultInfo(new Runnable() {
+                                @Override public void run() { showPasswordMenu(); }
+                            });
+                            return;
+                        }
                         final int action = which;
+                        if ((action == 2 || action == 3) && !requireSecurePage()) {
+                            showPasswordMenu();
+                            return;
+                        }
                         withVaultUnlock(new Runnable() {
                             @Override public void run() {
                                 if (action == 2) saveCredentialDialog();
                                 else if (action == 3) chooseCredentialToFill();
                                 else manageCredentials();
                             }
+                        }, new Runnable() {
+                            @Override public void run() { showPasswordMenu(); }
                         });
                     }
                 })
-                .show();
+                .setNegativeButton(backAction == null ? "关闭" : "返回", back)
+                .setOnCancelListener(back)
+                .create();
+        secureDialog(dialog);
+        dialog.show();
     }
 
     private void withVaultUnlock(Runnable action) {
+        withVaultUnlock(action, null);
+    }
+
+    private void withVaultUnlock(Runnable action, final Runnable cancelAction) {
         if (action == null) return;
         if (SystemClock.elapsedRealtime() < vaultUnlockedUntil) { action.run(); return; }
         android.app.KeyguardManager manager = (android.app.KeyguardManager) getSystemService(KEYGUARD_SERVICE);
         if (manager == null || !manager.isDeviceSecure()) {
+            SettingsDialogReturn cancel = new SettingsDialogReturn(cancelAction);
             new AlertDialog.Builder(this).setTitle("需要安全锁屏")
                     .setMessage("Median 现在把 Keystore 密钥直接绑定到系统身份验证。请先设置 PIN、图案、密码或生物识别，密码库不会提供绕过入口。")
                     .setPositiveButton("打开安全设置", new DialogInterface.OnClickListener() {
@@ -7268,29 +9372,42 @@ public final class MainActivity extends Activity implements Runnable {
                             try { startActivity(new Intent(Settings.ACTION_SECURITY_SETTINGS)); }
                             catch (Exception e) { toast("无法打开系统安全设置"); }
                         }
-                    }).setNegativeButton("取消", null).show();
+                    }).setNegativeButton("取消", cancel).setOnCancelListener(cancel).show();
             return;
         }
         Intent unlock = manager.createConfirmDeviceCredentialIntent("解锁 Median 密码库", "确认设备身份后继续");
-        if (unlock == null) { toast("系统身份验证不可用，密码库保持锁定"); return; }
+        if (unlock == null) {
+            toast("系统身份验证不可用，密码库保持锁定");
+            continueSettingsPanel(cancelAction);
+            return;
+        }
         pendingVaultAction = action;
+        pendingVaultCancelAction = cancelAction;
         try { startActivityForResult(unlock, VAULT_UNLOCK_REQUEST); }
-        catch (Exception e) { pendingVaultAction = null; toast("无法调用系统身份验证"); }
+        catch (Exception e) {
+            pendingVaultAction = null;
+            pendingVaultCancelAction = null;
+            toast("无法调用系统身份验证");
+            continueSettingsPanel(cancelAction);
+        }
     }
 
     private boolean requireSecurePage() {
         Uri uri = currentUri();
-        if (uri == null || !"https".equalsIgnoreCase(uri.getScheme()) || uri.getUserInfo() != null || isHomeUrl(uri.toString())) {
+        if (uri == null || !"https".equalsIgnoreCase(uri.getScheme()) || uri.getUserInfo() != null ||
+                isInternalBrowserUrl(uri.toString())) {
             toast("仅允许在 HTTPS 网站保存或填充密码");
             return false;
         }
-        return currentHost().length() > 0;
+        return currentHost().length() > 0 && secureCredentialPort(currentPageUrl) > 0;
     }
 
     private void saveCredentialDialog() {
         if (!requireSecurePage()) return;
+        final WebView source = webView;
         final String expectedUrl = currentPageUrl;
         final String expectedHost = currentHost();
+        final int expectedPort = secureCredentialPort(expectedUrl);
         final EditText username = new EditText(this);
         username.setHint("用户名或邮箱");
         username.setSingleLine(true);
@@ -7303,7 +9420,7 @@ public final class MainActivity extends Activity implements Runnable {
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(dp(18), 0, dp(18), 0);
         TextView host = new TextView(this);
-        host.setText("站点：" + expectedHost);
+        host.setText("站点：" + expectedHost + (expectedPort == 443 ? "" : ":" + expectedPort));
         host.setPadding(0, dp(8), 0, dp(8));
         content.addView(host);
         content.addView(username);
@@ -7312,36 +9429,61 @@ public final class MainActivity extends Activity implements Runnable {
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("保存账号")
                 .setView(content)
-                .setPositiveButton("保存", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface d, int which) {
+                .setPositiveButton("保存", null)
+                .setNegativeButton("取消", new SettingsDialogReturn(new Runnable() {
+                    @Override public void run() { showPasswordMenu(); }
+                }))
+                .create();
+        dialog.setOnCancelListener(new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { showPasswordMenu(); }
+        }));
+        secureDialog(dialog);
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface ignored) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) {
                         final String user = username.getText().toString().trim();
                         final String pass = password.getText().toString();
-                        if (!UrlCleaner.sameOrigin(expectedUrl, currentPageUrl) || !expectedHost.equalsIgnoreCase(currentHost()) ||
+                        if (source != webView || !sameCredentialDocument(expectedUrl, currentPageUrl) ||
+                                !expectedHost.equalsIgnoreCase(currentHost()) ||
+                                expectedPort != secureCredentialPort(currentPageUrl) ||
                                 !requireSecurePage()) {
                             toast("页面来源已经变化，已拒绝保存");
+                            dialog.dismiss();
                             return;
                         }
                         if (user.length() == 0 || pass.length() == 0) {
-                            toast("用户名和密码不能为空");
+                            if (user.length() == 0) username.setError("用户名不能为空");
+                            if (pass.length() == 0) password.setError("密码不能为空");
                             return;
                         }
-                        if (user.length() > 512 || pass.length() > 8192) { toast("账号或密码长度超过安全限制"); return; }
-                        services.passwords().saveCredential(expectedHost, user, pass, new PasswordVault.Callback<Void>() {
+                        if (user.length() > 512 || pass.length() > 8192) {
+                            toast("账号或密码长度超过安全限制");
+                            return;
+                        }
+                        final Button save = dialog.getButton(AlertDialog.BUTTON_POSITIVE);
+                        save.setEnabled(false);
+                        services.passwords().saveCredential(expectedHost, expectedPort, user, pass, new PasswordVault.Callback<Void>() {
                             @Override public void onComplete(Void value, Exception error) {
-                                if (error == null) toast("已加密保存");
-                                else toast("保存失败：" + safeMessage(error));
+                                if (activityDestroyed) return;
+                                if (error == null) {
+                                    dialog.dismiss();
+                                    toast("已加密保存");
+                                } else {
+                                    save.setEnabled(true);
+                                    toast("保存失败：" + safeMessage(error));
+                                }
                             }
                         });
                     }
-                })
-                .setNegativeButton("取消", null)
-                .create();
-        secureDialog(dialog);
+                });
+            }
+        });
         dialog.show();
-        String probe = "(function(){function v(e){return e&&!e.disabled&&e.offsetParent!==null;}var ps=Array.from(document.querySelectorAll('input[type=password]')).filter(v),p=ps.find(function(e){return e.autocomplete!=='new-password';})||ps[0],scope=p&&p.form?p.form:document;var us=Array.from(scope.querySelectorAll('input[autocomplete=username],input[type=email],input[type=text]')).filter(v),u=us[0];return JSON.stringify([u&&u.value||'',p&&p.value||'']);})();";
-        webView.evaluateJavascript(probe, new ValueCallback<String>() {
+        webView.evaluateJavascript(CredentialAutofill.captureFieldsScript(), new ValueCallback<String>() {
             @Override public void onReceiveValue(String value) {
-                if (!UrlCleaner.sameOrigin(expectedUrl, currentPageUrl)) return;
+                if (activityDestroyed || !dialog.isShowing() || source != webView ||
+                        !sameCredentialDocument(expectedUrl, currentPageUrl)) return;
                 try {
                     Object decoded = new JSONTokener(value).nextValue();
                     JSONArray fields = new JSONArray(decoded instanceof String ? (String) decoded : String.valueOf(decoded));
@@ -7355,50 +9497,100 @@ public final class MainActivity extends Activity implements Runnable {
     private void chooseCredentialToFill() {
         if (!requireSecurePage()) return;
         final String requestedHost = currentHost();
-        services.passwords().forHost(requestedHost, new PasswordVault.Callback<List<PasswordVault.Credential>>() {
+        final int requestedPort = secureCredentialPort(currentPageUrl);
+        final String expectedUrl = currentPageUrl;
+        final long expectedSequence = navigationSequence;
+        services.passwords().forOrigin(requestedHost, requestedPort, new PasswordVault.Callback<List<PasswordVault.Credential>>() {
             @Override public void onComplete(final List<PasswordVault.Credential> credentials, Exception error) {
-                if (error != null) {
-                    toast("读取密码库失败：" + safeMessage(error));
+                if (activityDestroyed) {
+                    PasswordVault.clearCredentials(credentials);
                     return;
                 }
-                if (!requestedHost.equalsIgnoreCase(currentHost())) {
+                if (error != null) {
+                    PasswordVault.clearCredentials(credentials);
+                    toast("读取密码库失败：" + safeMessage(error));
+                    showPasswordMenu();
+                    return;
+                }
+                if (!requestedHost.equalsIgnoreCase(currentHost()) || expectedSequence != navigationSequence ||
+                        requestedPort != secureCredentialPort(currentPageUrl) ||
+                        !sameCredentialDocument(expectedUrl, currentPageUrl)) {
+                    PasswordVault.clearCredentials(credentials);
                     toast("页面已经变化，请重新选择账号");
+                    showPasswordMenu();
                     return;
                 }
                 if (credentials == null || credentials.size() == 0) {
+                    PasswordVault.clearCredentials(credentials);
                     toast("当前站点没有已保存账号");
+                    showPasswordMenu();
                     return;
                 }
                 String[] names = new String[credentials.size()];
                 for (int i = 0; i < credentials.size(); i++) names[i] = credentials.get(i).username;
-                new AlertDialog.Builder(MainActivity.this)
+                SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+                    @Override public void run() { showPasswordMenu(); }
+                });
+                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
                         .setTitle("选择账号")
                         .setItems(names, new DialogInterface.OnClickListener() {
-                            @Override public void onClick(DialogInterface dialog, int which) { fillCredential(credentials.get(which)); }
-                        })
-                        .show();
+                            @Override public void onClick(DialogInterface dialog, int which) {
+                                // The dialog's dismiss listener clears the backing list. Pass an
+                                // independent copy so the async WebView callback can still validate
+                                // the credential after the list is wiped.
+                                fillCredentialOnPage(webView, expectedUrl, credentials.get(which).copy(), false, expectedSequence);
+                            }
+                        }).setNegativeButton("返回", back).setOnCancelListener(back)
+                        .create();
+                dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                    @Override public void onDismiss(DialogInterface ignored) {
+                        PasswordVault.clearCredentials(credentials);
+                    }
+                });
+                secureDialog(dialog);
+                dialog.show();
             }
         });
     }
 
     private void fillCredential(PasswordVault.Credential credential) {
         if (!requireSecurePage()) return;
-        fillCredentialOnPage(webView, currentPageUrl, credential, false);
+        fillCredentialOnPage(webView, currentPageUrl, credential, false, navigationSequence);
     }
 
     private void fillCredentialOnPage(final WebView target, final String expectedUrl,
                                       PasswordVault.Credential credential, final boolean automatic) {
+        fillCredentialOnPage(target, expectedUrl, credential, automatic, navigationSequence);
+    }
+
+    private void fillCredentialOnPage(final WebView target, final String expectedUrl,
+                                      PasswordVault.Credential credential, final boolean automatic,
+                                      final long expectedSequence) {
         if (target == null || target != webView || credential == null ||
-                !isSecureCredentialUrl(target.getUrl()) || !currentHost().equalsIgnoreCase(credential.host) ||
-                !UrlCleaner.sameOrigin(expectedUrl, target.getUrl())) {
+                expectedSequence != navigationSequence ||
+                !isSecureCredentialUrl(target.getUrl()) ||
+                !credential.host.equalsIgnoreCase(currentHost()) ||
+                credential.port != secureCredentialPort(currentPageUrl) ||
+                credential.port != secureCredentialPort(target.getUrl()) ||
+                !credential.host.equalsIgnoreCase(hostOf(target.getUrl())) ||
+                !sameCredentialDocument(expectedUrl, target.getUrl())) {
             if (!automatic) toast("站点或页面已经变化，已拒绝填充");
             return;
         }
         try {
-            target.evaluateJavascript(CredentialAutofill.fillScript(credential.username, credential.password),
+            target.evaluateJavascript(CredentialAutofill.fillScript(
+                            credential.username, credential.password, !automatic),
                     new ValueCallback<String>() {
                 @Override public void onReceiveValue(String value) {
-                    if (target != webView || !UrlCleaner.sameOrigin(expectedUrl, target.getUrl())) return;
+                    if (target != webView || expectedSequence != navigationSequence ||
+                            !isSecureCredentialUrl(currentPageUrl) ||
+                            !credential.host.equalsIgnoreCase(currentHost()) ||
+                            credential.port != secureCredentialPort(currentPageUrl) ||
+                            credential.port != secureCredentialPort(target.getUrl()) ||
+                            !credential.host.equalsIgnoreCase(hostOf(target.getUrl())) ||
+                            !isSecureCredentialUrl(target.getUrl()) ||
+                            !sameCredentialDocument(expectedUrl, currentPageUrl) ||
+                            !sameCredentialDocument(expectedUrl, target.getUrl())) return;
                     boolean filled = false;
                     try {
                         Object decoded = new JSONTokener(value == null ? "{}" : value).nextValue();
@@ -7417,89 +9609,190 @@ public final class MainActivity extends Activity implements Runnable {
     private void manageCredentials() {
         services.passwords().getAll(new PasswordVault.Callback<List<PasswordVault.Credential>>() {
             @Override public void onComplete(final List<PasswordVault.Credential> all, Exception error) {
+                if (activityDestroyed) {
+                    PasswordVault.clearCredentials(all);
+                    return;
+                }
                 if (error != null) {
+                    PasswordVault.clearCredentials(all);
                     toast("读取密码库失败：" + safeMessage(error));
+                    showPasswordMenu();
                     return;
                 }
                 if (all == null || all.size() == 0) {
+                    PasswordVault.clearCredentials(all);
                     toast("密码库为空");
+                    showPasswordMenu();
                     return;
                 }
                 String[] names = new String[all.size()];
                 for (int i = 0; i < all.size(); i++) names[i] = all.get(i).host + "\n" + all.get(i).username;
-                new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("已保存密码（点按删除）")
+                SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+                    @Override public void run() { showPasswordMenu(); }
+                });
+                AlertDialog dialog = new AlertDialog.Builder(MainActivity.this)
+                        .setTitle("已保存账号")
                         .setItems(names, new DialogInterface.OnClickListener() {
-                            @Override public void onClick(DialogInterface dialog, int which) { confirmDeleteCredential(all.get(which)); }
+                            @Override public void onClick(DialogInterface dialog, int which) {
+                                showCredentialActions(all.get(which).copy());
+                            }
                         })
-                        .setNegativeButton("关闭", null)
-                        .show();
+                        .setNegativeButton("返回", back)
+                        .setOnCancelListener(back)
+                        .create();
+                dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+                    @Override public void onDismiss(DialogInterface ignored) {
+                        PasswordVault.clearCredentials(all);
+                    }
+                });
+                secureDialog(dialog);
+                dialog.show();
             }
         });
     }
 
+    private void showCredentialActions(final PasswordVault.Credential credential) {
+        if (credential == null) {
+            manageCredentials();
+            return;
+        }
+        final boolean canFill = isSecureCredentialUrl(currentPageUrl) &&
+                credential.port == secureCredentialPort(currentPageUrl) &&
+                credential.host.equalsIgnoreCase(currentHost());
+        String[] actions = new String[] {
+                canFill ? "填充当前页面" : "打开此网站",
+                "复制用户名",
+                "删除账号"
+        };
+        SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { manageCredentials(); }
+        });
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setTitle("账号操作")
+                .setMessage(credential.host + (credential.port == 443 ? "" : ":" + credential.port) + "\n" + credential.username)
+                .setItems(actions, new DialogInterface.OnClickListener() {
+                    @Override public void onClick(DialogInterface ignored, int which) {
+                        if (which == 0) {
+                            if (canFill) fillCredential(credential);
+                            else loadInput("https://" + credential.host +
+                                    (credential.port == 443 ? "" : ":" + credential.port));
+                        } else if (which == 1) {
+                            ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                            if (clipboard != null) {
+                                clipboard.setPrimaryClip(ClipData.newPlainText("Median 用户名", credential.username));
+                                toast("用户名已复制");
+                            }
+                            postAfterUiTransition(new Runnable() {
+                                @Override public void run() { manageCredentials(); }
+                            });
+                        } else {
+                            confirmDeleteCredential(credential.copy());
+                        }
+                    }
+                })
+                .setNegativeButton("返回", back)
+                .setOnCancelListener(back)
+                .create();
+        dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface ignored) { credential.clear(); }
+        });
+        secureDialog(dialog);
+        dialog.show();
+    }
+
     private void confirmDeleteCredential(final PasswordVault.Credential credential) {
-        new AlertDialog.Builder(this)
+        SettingsDialogReturn back = new SettingsDialogReturn(new Runnable() {
+            @Override public void run() { manageCredentials(); }
+        });
+        AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("删除账号？")
-                .setMessage(credential.host + "\n" + credential.username)
+                .setMessage(credential.host + (credential.port == 443 ? "" : ":" + credential.port) + "\n" + credential.username)
                 .setPositiveButton("删除", new DialogInterface.OnClickListener() {
                     @Override public void onClick(DialogInterface dialog, int which) {
                         services.passwords().delete(credential.id, new PasswordVault.Callback<Void>() {
                             @Override public void onComplete(Void value, Exception error) {
+                                if (activityDestroyed) return;
                                 if (error == null) toast("已删除");
                                 else toast("删除失败：" + safeMessage(error));
+                                manageCredentials();
                             }
                         });
                     }
                 })
-                .setNegativeButton("取消", null)
-                .show();
+                .setNegativeButton("取消", back)
+                .setOnCancelListener(back)
+                .create();
+        dialog.setOnDismissListener(new DialogInterface.OnDismissListener() {
+            @Override public void onDismiss(DialogInterface ignored) {
+                if (credential != null) credential.clear();
+            }
+        });
+        secureDialog(dialog);
+        dialog.show();
     }
 
-    private void showVaultInfo() {
+    private void showVaultInfo(final Runnable returnAction) {
+        SettingsDialogReturn back = new SettingsDialogReturn(returnAction);
         new AlertDialog.Builder(this)
                 .setTitle("密码安全说明")
-                .setMessage("密码数据使用 AES-GCM 加密，密钥存放在 Android Keystore，并要求最近 120 秒内完成系统身份验证；旧版未绑定身份的密钥会在首次成功解锁时迁移。应用禁止系统备份。\n\n自动填充严格匹配 HTTPS 主机，跳过新密码、确认密码和验证码字段，不会自动提交。登录保存监听只在真实用户提交时弹出本机确认，不向网页开放长期原生桥。\n\n仍未经过独立安全审计，不建议保存金融账户或主要邮箱密码。")
-                .setPositiveButton("知道了", null)
+                .setMessage("密码使用 AES-GCM 加密，密钥由 Android Keystore 保护，解锁需系统身份验证；应用禁止系统备份。\n\n填充必须由浏览器密码菜单手动发起，仅匹配 HTTPS 主机，不填新密码、确认密码或验证码，也不会自动提交。\n\n密码库尚未经独立安全审计，请勿保存金融账户或主要邮箱密码。")
+                .setPositiveButton("知道了", back)
+                .setOnCancelListener(back)
                 .show();
     }
 
     private void secureDialog(final AlertDialog dialog) {
-        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
-            @Override public void onShow(DialogInterface d) {
-                if (dialog.getWindow() != null) dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
-            }
-        });
+        if (dialog != null && dialog.getWindow() != null)
+            dialog.getWindow().addFlags(WindowManager.LayoutParams.FLAG_SECURE);
     }
 
     private void showFindDialog() {
+        final WebView target = webView;
+        if (target == null) return;
         final EditText input = new EditText(this);
         input.setSingleLine(true);
+        input.setHint("输入要查找的内容");
+        input.setContentDescription("页面内查找内容");
+        input.setImeOptions(EditorInfo.IME_ACTION_SEARCH);
         input.setPadding(dp(18), dp(8), dp(18), dp(8));
-        new AlertDialog.Builder(this)
+        final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("页面内查找")
                 .setView(input)
-                .setPositiveButton("查找", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface dialog, int which) {
-                        webView.findAllAsync(input.getText().toString());
-                        webView.showFindDialog(input.getText().toString(), false);
-                    }
-                })
+                .setPositiveButton("查找", null)
                 .setNegativeButton("取消", null)
-                .show();
+                .create();
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface ignored) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) {
+                        String query = input.getText().toString().trim();
+                        if (query.length() == 0) {
+                            input.setError("请输入要查找的内容");
+                            return;
+                        }
+                        if (target != webView) {
+                            toast("页面已经变化，请重新查找");
+                            dialog.dismiss();
+                            return;
+                        }
+                        dialog.dismiss();
+                        target.clearMatches();
+                        target.findAllAsync(query);
+                        target.showFindDialog(query, false);
+                    }
+                });
+            }
+        });
+        dialog.show();
     }
 
     private void sharePage() {
         String url = webView.getUrl();
-        if (url == null || isHomeUrl(url)) return;
+        if (!isNetworkPage(url)) return;
         Intent share = new Intent(Intent.ACTION_SEND);
         share.setType("text/plain");
         share.putExtra(Intent.EXTRA_TEXT, (webView.getTitle() == null ? "" : webView.getTitle() + "\n") + url);
         startActivity(Intent.createChooser(share, "分享页面"));
-    }
-
-    private void showStoragePanel() {
-        showStoragePanel(this);
     }
 
     private void showStoragePanel(final Runnable backAction) {
@@ -7529,14 +9822,19 @@ public final class MainActivity extends Activity implements Runnable {
             @Override public void onItem(int which) {
                 if (which == 0) {
                     webView.clearCache(true);
+                    clearConnectionHints();
                     toast("临时缓存已清理");
+                    showStoragePanel(backAction);
                 } else if (which == 1) {
                     CookieManager.getInstance().removeAllCookies(null);
                     CookieManager.getInstance().flush();
                     android.webkit.WebStorage.getInstance().deleteAllData();
                     toast("Cookie 与站点数据已清除");
+                    showStoragePanel(backAction);
                 } else if (which == 2) {
-                    confirmClearData();
+                    confirmClearData(new Runnable() {
+                        @Override public void run() { showStoragePanel(backAction); }
+                    });
                 } else {
                     showStoragePanel(backAction);
                 }
@@ -7567,7 +9865,8 @@ public final class MainActivity extends Activity implements Runnable {
         });
     }
 
-    private void confirmClearData() {
+    private void confirmClearData(final Runnable returnAction) {
+        SettingsDialogReturn back = new SettingsDialogReturn(returnAction);
         new AlertDialog.Builder(this)
                 .setTitle("清除浏览数据")
                 .setMessage("将清除 Cookie、缓存、表单、HTTP 身份验证、历史、下载索引、网站权限与本地存储。下载文件、书签、离线页面、密码和用户脚本不会删除。")
@@ -7582,6 +9881,7 @@ public final class MainActivity extends Activity implements Runnable {
                             tab.liveView.clearHistory();
                         }
                         if (dataStore != null) dataStore.clearHistory();
+                        clearConnectionHints();
                         services.downloads().clear();
                         if (siteSettingsStore != null) siteSettingsStore.clearAll();
                         appliedSiteSettings.clear();
@@ -7592,29 +9892,51 @@ public final class MainActivity extends Activity implements Runnable {
                         database.clearHttpAuthUsernamePassword();
                         database.clearFormData();
                         toast("浏览数据已清除");
+                        continueSettingsPanel(returnAction);
                     }
                 })
-                .setNegativeButton("取消", null)
+                .setNegativeButton("取消", back)
+                .setOnCancelListener(back)
                 .show();
+    }
+
+    private void clearDataForExit() {
+        if (exitDataCleared) return;
+        exitDataCleared = true;
+        clearConnectionHints();
+        try {
+            CookieManager.getInstance().removeAllCookies(null);
+            CookieManager.getInstance().flush();
+        } catch (RuntimeException ignored) {}
+        try { WebStorage.getInstance().deleteAllData(); } catch (RuntimeException ignored) {}
+        for (BrowserTab tab : tabs) if (tab.liveView != null) {
+            try { tab.liveView.clearCache(true); } catch (RuntimeException ignored) {}
+            try { tab.liveView.clearFormData(); } catch (RuntimeException ignored) {}
+            try { tab.liveView.clearHistory(); } catch (RuntimeException ignored) {}
+        }
+        if (dataStore != null) dataStore.clearHistory();
+        if (dataStore != null) dataStore.clearSession();
+        if (siteSettingsStore != null) siteSettingsStore.clearAll();
+        try { GeolocationPermissions.getInstance().clearAll(); } catch (RuntimeException ignored) {}
+        try { WebViewDatabase.getInstance(this).clearHttpAuthUsernamePassword(); } catch (RuntimeException ignored) {}
     }
 
     private void showCommunityNoticeOnFirstLaunch(Bundle state) {
         if (state != null || prefs.getBoolean(PREF_COMMUNITY_NOTICE_SHOWN, false)) return;
         prefs.edit().putBoolean(PREF_COMMUNITY_NOTICE_SHOWN, true).apply();
+        // Never put a large dialog allocation into the launch/first-interaction window.
         uiHandler.postDelayed(new Runnable() {
             @Override public void run() {
                 if (isFinishing() || (Build.VERSION.SDK_INT >= 17 && isDestroyed())) return;
                 showCommunityNotice();
             }
-        }, 350L);
+        }, 2400L);
     }
 
     private void showCommunityNotice() {
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("欢迎使用 Median Browser")
-                .setMessage("感谢你使用 Median Browser。我们会持续改进轻量体验、隐私保护与网页兼容性。\n\n"
-                        + COMMUNITY_INFO
-                        + "\n\n本提示仅在首次启动时显示。之后可在“设置 → 关于 Median”中再次查看。")
+                .setMessage("轻量、本地优先、无广告与遥测。\n\n" + COMMUNITY_INFO)
                 .setPositiveButton("开始使用", null)
                 .create();
         dialog.setOnShowListener(new DialogInterface.OnShowListener() {
@@ -7639,7 +9961,8 @@ public final class MainActivity extends Activity implements Runnable {
         String profile = deviceProfile == null ? "设备策略：尚未初始化" : deviceProfile.summary();
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("Median Browser " + appVersionName())
-                .setMessage("本版重点强化用户脚本兼容、HTTPS 密码自动填充和动态媒体发现，并整合过滤订阅、Median 单连接下载、独立隐私进程、离线 MHTML、阅读模式、系统朗读、标签批量工具、跟踪参数清理、站点权限和三档性能调度。所有新下载均由 Median 自己处理，不调用系统下载器。\n\n密码库使用系统身份验证与 Android Keystore；自动填充不会覆盖已输入内容或自动提交。应用不集成广告、分析或遥测 SDK。\n\n" + profile + "\n\nMedian 使用设备的 Android System WebView；网页兼容性、协议与媒体能力取决于系统 WebView 版本。\n\n" + COMMUNITY_INFO)
+                .setMessage("轻量、无广告、无分析与遥测 SDK。\n\n" + profile
+                        + "\n\n网页能力取决于 Android System WebView。\n\n" + COMMUNITY_INFO)
                 .setPositiveButton("确定", null)
                 .setNeutralButton("隐私说明", null)
                 .setNegativeButton("兼容诊断", null)
@@ -7667,9 +9990,7 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void showCompatibilityDiagnostics() {
         final String report = WebViewCompat.getDocumentStartDiagnosticReport()
-                + "\n\n兼容恢复：厂商 WebView 若接受 document-start 注册却漏执行，Median 会在页面提交后只补运行缺失脚本。"
-                + "完全不支持 document-start 时仍会运行脚本，并为存储、同源 XHR 和页面 API 提供安全降级；"
-                + "跨域请求、下载、原生剪贴板等能力在没有可信桥接时保持关闭。\n\n最近一次首导航：\n"
+                + "\n\n不支持 document-start 时会安全降级；无可信桥接时禁用跨域、下载与剪贴板能力。\n\n最近首导航：\n"
                 + prefs.getString(PREF_STARTUP_DIAGNOSTIC, "尚无网络首导航记录");
         final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle("WebView 兼容诊断")
@@ -7700,6 +10021,7 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void runDocumentStartSelfTest() {
+        if (activityDestroyed || rootFrame == null) return;
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
             toast("当前 System WebView 不支持安全的 document-start 注入");
             return;
@@ -7733,7 +10055,8 @@ public final class MainActivity extends Activity implements Runnable {
                     @Override public void onReceiveValue(String value) {
                         boolean passed = value != null && value.contains("before");
                         cleanup.run();
-                        toast(passed ? "document-start 自测通过" : "document-start 自测失败，已保持安全降级");
+                        if (!activityDestroyed)
+                            toast(passed ? "document-start 自测通过" : "document-start 自测失败，已保持安全降级");
                     }
                 });
             }
@@ -7750,7 +10073,7 @@ public final class MainActivity extends Activity implements Runnable {
                 @Override public void run() {
                     if (finished[0]) return;
                     cleanup.run();
-                    toast("document-start 自测超时，已保持安全降级");
+                    if (!activityDestroyed) toast("document-start 自测超时，已保持安全降级");
                 }
             }, 6000L);
         } catch (RuntimeException error) {
@@ -7769,7 +10092,7 @@ public final class MainActivity extends Activity implements Runnable {
     private void showPrivacyNotice() {
         new AlertDialog.Builder(this)
                 .setTitle("隐私与数据处理")
-                .setMessage("Median 默认在设备本地保存书签、历史记录、标签会话、网站设置、下载记录、用户脚本和过滤规则。应用本身不包含广告、分析或遥测 SDK，也不运营同步服务器。\n\n访问网页时，目标网站、其内容提供方、所选搜索引擎、翻译服务或过滤订阅源会接收正常网络请求。网站可按其自身政策使用 Cookie 和其他存储。\n\n摄像头、麦克风和位置仅在 HTTPS 网站主动请求、当前页面来源匹配且你授予 Android 权限后提供。密码库使用 Android Keystore 与 AES-GCM；完整备份由你设置的密码加密。\n\n用户脚本属于第三方代码。Median 会显示其匹配范围和权限，并限制原生网络范围，但你仍应只安装可信脚本。清除浏览数据或卸载应用会删除相应本地数据；导出的文件由你自行保管。完整政策见 Google Play 商店页面或项目仓库中的 PRIVACY_POLICY.md。")
+                .setMessage("书签、历史、标签、设置、脚本与过滤规则保存在本机；Median 不含广告、分析、遥测或同步服务。\n\n网站、搜索、翻译和订阅服务会收到正常网络请求。摄像头、麦克风与位置仅在 HTTPS 页面请求且你授权后提供。\n\n密码库使用 Keystore 与 AES-GCM。用户脚本是第三方代码，请只安装可信脚本。导出文件请自行保管。")
                 .setPositiveButton("知道了", null)
                 .show();
     }
@@ -7788,9 +10111,19 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void applyPerformanceMode(WebView target) {
         if (target == null) return;
-        WebSettings settings = target.getSettings();
+        applyPerformanceMode(target, target.getSettings());
+    }
+
+    private void applyPerformanceMode(WebView target, WebSettings settings) {
         settings.setCacheMode(WebSettings.LOAD_DEFAULT);
+
+        settings.setDomStorageEnabled(true);
+        settings.setDatabaseEnabled(true);
+        // Chromium rasterizes visible content on demand. Hidden hot tabs do not need
+        // pre-rasterized tiles competing with the active page for memory and GPU work.
         settings.setOffscreenPreRaster(false);
+        settings.setLoadsImagesAutomatically(true);
+
         try {
             // Only the visible renderer stays IMPORTANT. Hot background tabs remain
             // restorable but cannot compete at the same OOM/CPU scheduling class.
@@ -7807,12 +10140,20 @@ public final class MainActivity extends Activity implements Runnable {
     private void applyDesktopMode(WebView target) {
         if (target == null) return;
         WebSettings settings = target.getSettings();
+        applyDesktopMode(target, settings, settings.getUserAgentString());
+    }
+
+    private void applyDesktopMode(WebView target, WebSettings settings) {
+        applyDesktopMode(target, settings, settings.getUserAgentString());
+    }
+
+    private void applyDesktopMode(WebView target, WebSettings settings, String currentUserAgent) {
         SiteSettingsStore.SiteSettings site = siteSettingsStore == null ? new SiteSettingsStore.SiteSettings() : siteSettingsStore.forHost(pageHostFor(target));
         int desktop = site.get(SiteSettingsStore.DESKTOP);
         boolean enabled = desktop == SiteSettingsStore.ALLOW || (desktop == SiteSettingsStore.INHERIT && desktopMode);
         String mobile = mobileUserAgents.get(target);
         if (mobile == null || mobile.length() == 0) {
-            mobile = WebViewPolicy.mobileUserAgent(settings.getUserAgentString());
+            mobile = WebViewPolicy.mobileUserAgent(currentUserAgent);
             mobileUserAgents.put(target, mobile);
         }
         String desiredUserAgent = mobile;
@@ -7824,7 +10165,7 @@ public final class MainActivity extends Activity implements Runnable {
             settings.setUseWideViewPort(false);
             settings.setLoadWithOverviewMode(false);
         }
-        if (!desiredUserAgent.equals(settings.getUserAgentString())) settings.setUserAgentString(desiredUserAgent);
+        if (!desiredUserAgent.equals(currentUserAgent)) settings.setUserAgentString(desiredUserAgent);
     }
 
     private String desktopUserAgent(String mobile) {
@@ -7865,8 +10206,8 @@ public final class MainActivity extends Activity implements Runnable {
         boolean allowThirdParty = compatibility || thirdPartyCookies == SiteSettingsStore.ALLOW ||
                 (thirdPartyCookies == SiteSettingsStore.INHERIT && acceptThirdPartyCookies);
         CookieManager.getInstance().setAcceptThirdPartyCookies(target, allowThirdParty);
-        applyDesktopMode(target);
-        applyDarkMode(target);
+        applyDesktopMode(target, settings);
+        applyDarkMode(target, settings);
         appliedSiteSettings.put(target, configKey);
     }
 
@@ -7887,6 +10228,51 @@ public final class MainActivity extends Activity implements Runnable {
         scheduleCookieFlush();
     }
 
+    private void toggleNightMode() {
+        nightMode = !nightMode;
+        prefs.edit().putBoolean("night_mode", nightMode).apply();
+
+        // Immediately update all backgrounds before re-rendering content
+        applyDarkMode();
+
+        // Update WebView background color immediately to prevent flash
+        if (webView != null) {
+            webView.setBackgroundColor(nightMode ? DARK_WEB : WHITE);
+        }
+
+        // Update all tab backgrounds
+        for (BrowserTab tab : tabs) {
+            if (tab.liveView != null) {
+                tab.liveView.setBackgroundColor(nightMode ? DARK_WEB : WHITE);
+            }
+        }
+
+        // Clear cached home render key to force regeneration with new theme
+        cachedHomeKey = "";
+        renderedHomeKeys.clear();
+
+        // Re-render content after backgrounds are updated
+        String activeUrl = webView == null ? currentPageUrl : webView.getUrl();
+        if (activeUrl == null || activeUrl.length() == 0) activeUrl = currentPageUrl;
+        homeThemeRepairPending = true;
+        if (isHomeUrl(activeUrl)) {
+            // Rewrite the current home document so the previous theme cannot remain in the
+            // WebView back stack as a stale page.
+            showHome(true);
+        } else if (isQrScannerUrl(activeUrl)) {
+            showQrScannerPage();
+        } else if (webView != null && isInternalBrowserUrl(activeUrl)) {
+            // Reload internal pages (settings, etc.) to apply new theme
+            reloadWebView(webView);
+        } else if (webView != null && isNetworkPage(activeUrl)) {
+            // Re-apply the complete site policy so WebView providers that cache the darkening
+            // flag do not leave a light surface behind after a live theme switch.
+            appliedSiteSettings.remove(webView);
+            applySiteSettings(webView, hostOf(activeUrl));
+            webView.postInvalidateOnAnimation();
+        }
+    }
+
     private void applyDarkMode() {
         applyThemeSignal();
         for (BrowserTab tab : tabs) if (tab.liveView != null) applyDarkMode(tab.liveView);
@@ -7901,15 +10287,28 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void applyChromeTheme() {
         if (browserChrome == null || topBar == null || bottomBar == null || addressPill == null || addressBar == null) return;
-        int background = nightMode ? Color.rgb(27, 29, 32) : WHITE;
-        int surface = nightMode ? Color.rgb(43, 46, 51) : SURFACE;
-        int foreground = nightMode ? Color.rgb(232, 234, 237) : TEXT;
-        int hint = nightMode ? Color.rgb(154, 160, 166) : Color.rgb(128, 134, 139);
+        int background = nightMode ? DARK_BACKGROUND : WHITE;
+        int surface = nightMode ? DARK_SURFACE : SURFACE;
+        int foreground = nightMode ? DARK_TEXT : TEXT;
+        int hint = nightMode ? DARK_MUTED : 0xff80868b;
         if (rootFrame != null) rootFrame.setBackgroundColor(background);
         browserChrome.setBackgroundColor(background);
         topBar.setBackgroundColor(background);
         bottomBar.setBackgroundColor(background);
-        addressPill.setBackground(roundRect(surface, 22));
+        if (statusBarBackground != null) statusBarBackground.setBackgroundColor(background);
+        if (navigationBarBackground != null) navigationBarBackground.setBackgroundColor(background);
+        if (webContainer != null) {
+            int webBackground = nightMode ? DARK_WEB : WHITE;
+            webContainer.setBackgroundColor(webBackground);
+            // During the short WebView construction window the container still owns the
+            // startup surface. Repaint that child as well so a live toggle cannot leave a
+            // bright rectangle behind the dark chrome.
+            for (int i = 0; i < webContainer.getChildCount(); i++) {
+                View child = webContainer.getChildAt(i);
+                if (child != null && child != webView) child.setBackgroundColor(webBackground);
+            }
+        }
+        addressPill.setBackground(roundRect(surface, 999));
         addressBar.setTextColor(foreground);
         addressBar.setHintTextColor(hint);
         tintIconTree(topBar, foreground);
@@ -7938,6 +10337,7 @@ public final class MainActivity extends Activity implements Runnable {
             }
             window.getDecorView().setSystemUiVisibility(flags);
         }
+        setImmersiveSystemBars(chromeHiddenByScroll);
     }
 
     private void refreshActiveSheetTheme() {
@@ -7946,29 +10346,45 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void themeSheetTree(View view) {
         if (view == null) return;
-        int surface = nightMode ? Color.rgb(35, 38, 42) : WHITE;
-        int primary = nightMode ? Color.rgb(232, 234, 237) : TEXT;
-        int muted = nightMode ? Color.rgb(154, 160, 166) : MUTED;
-        int accent = nightMode ? Color.rgb(110, 157, 216) : BLUE;
-        Object tag = view.getTag();
-        if (SHEET_TAG_SURFACE.equals(tag)) view.setBackground(roundRect(surface, 24));
-        else if (SHEET_TAG_HANDLE.equals(tag))
-            view.setBackground(roundRect(Color.argb(nightMode ? 80 : 54, 95, 99, 104), 2));
-        if (view instanceof BrowserIconView) ((BrowserIconView) view).setTintColor(primary);
+        int surface = nightMode ? DARK_SHEET : WHITE;
+        int primary = nightMode ? DARK_TEXT : TEXT;
+        int muted = nightMode ? DARK_MUTED : MUTED;
+        int accent = nightMode ? DARK_ACCENT : BLUE;
+        Object marker = view.getTag();
+        int tag = marker instanceof Integer ? (Integer) marker : 0;
+        if (tag == SHEET_TAG_SURFACE) view.setBackground(roundRect(surface, 20));
+        else if (tag == SHEET_TAG_PLAIN_SURFACE) {
+            // Scroll/list surfaces are separate views; repainting only the rounded panel leaves
+            // the old theme visible in the gaps after an in-place mode switch.
+            view.setBackgroundColor(surface);
+            view.setForeground(null);
+            view.setStateListAnimator(null);
+            view.setBackgroundTintList(null);
+        }
+        else if (tag == SHEET_TAG_HANDLE)
+            view.setBackground(sheetHandleDrawable());
+        else if (tag == SHEET_TAG_ROW) {
+            // Rows must be repainted as well as their labels. A platform foreground or animator
+            // can otherwise keep the light-theme drawable alive after a live dark-mode switch.
+            view.setBackgroundColor(surface);
+            view.setForeground(null);
+            view.setStateListAnimator(null);
+            view.setBackgroundTintList(null);
+        }
+        if (view instanceof BrowserIconView) ((BrowserIconView) view).setTintColor(tag == SHEET_TAG_ACCENT ? accent : primary);
         if (view instanceof TextView) {
-            if (SHEET_TAG_PRIMARY.equals(tag)) ((TextView) view).setTextColor(primary);
-            else if (SHEET_TAG_MUTED.equals(tag)) ((TextView) view).setTextColor(muted);
-            else if (SHEET_TAG_ACCENT.equals(tag)) ((TextView) view).setTextColor(accent);
+            if (tag == SHEET_TAG_PRIMARY) ((TextView) view).setTextColor(primary);
+            else if (tag == SHEET_TAG_MUTED) ((TextView) view).setTextColor(muted);
+            else if (tag == SHEET_TAG_ACCENT) ((TextView) view).setTextColor(accent);
         }
         if (view instanceof Switch) {
             Switch toggle = (Switch) view;
             int[][] states = new int[][] { new int[] { android.R.attr.state_checked }, new int[] {} };
             toggle.setThumbTintList(new ColorStateList(states, new int[] {
-                    accent, nightMode ? Color.rgb(189, 193, 198) : Color.rgb(117, 117, 117)
+                    accent, nightMode ? 0xffbdc1c6 : 0xff757575
             }));
             toggle.setTrackTintList(new ColorStateList(states, new int[] {
-                    Color.argb(118, 26, 115, 232),
-                    nightMode ? Color.rgb(80, 84, 89) : Color.rgb(189, 193, 198)
+                    0x761a73e8, nightMode ? 0xff505459 : 0xffbdc1c6
             }));
         }
         if (view instanceof ViewGroup) {
@@ -7987,11 +10403,26 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void applyDarkMode(WebView target) {
         if (target == null) return;
+        applyDarkMode(target, target.getSettings());
+    }
+
+    private void applyDarkMode(WebView target, WebSettings settings) {
         boolean enabled = darkModeEnabled(target);
-        target.setBackgroundColor(enabled ? Color.rgb(17, 19, 21) : WHITE);
+        target.setBackgroundColor(enabled ? DARK_WEB : WHITE);
         if (WebViewFeature.isFeatureSupported(WebViewFeature.ALGORITHMIC_DARKENING)) {
-            try { WebSettingsCompat.setAlgorithmicDarkeningAllowed(target.getSettings(), enabled); }
-            catch (RuntimeException ignored) {}
+            try {
+                WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, enabled);
+            } catch (RuntimeException ignored) {
+            }
+        }
+        // Android 10-12 WebView builds commonly expose the support-library feature flag but
+        // still implement darkening through the platform Force Dark API. Explicitly clear the
+        // flag on every transition too; otherwise a site-level light override can remain dark.
+        if (Build.VERSION.SDK_INT >= 29) {
+            try {
+                settings.setForceDark(enabled ? WebSettings.FORCE_DARK_ON : WebSettings.FORCE_DARK_OFF);
+            } catch (RuntimeException ignored) {
+            }
         }
         target.postInvalidateOnAnimation();
     }
@@ -8002,7 +10433,7 @@ public final class MainActivity extends Activity implements Runnable {
                 ? new SiteSettingsStore.SiteSettings() : siteSettingsStore.forHost(host);
         int dark = site.get(SiteSettingsStore.DARK);
         boolean enabled = dark == SiteSettingsStore.ALLOW || (dark == SiteSettingsStore.INHERIT && nightMode);
-        return enabled && !isHomeUrl(target == null ? null : target.getUrl());
+        return enabled && !isInternalBrowserUrl(target == null ? null : target.getUrl());
     }
 
     private boolean isMediaCompatibilityHost(String host) {
@@ -8013,8 +10444,9 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private boolean isNetworkPage(String url) {
-        return url != null && !isHomeUrl(url) &&
-                (url.startsWith("https://") || url.startsWith("http://"));
+        return url != null && !isReservedInternalHost(url) &&
+                (url.regionMatches(true, 0, "https://", 0, 8) ||
+                        url.regionMatches(true, 0, "http://", 0, 7));
     }
 
     private boolean validSearchTemplate(String value) {
@@ -8030,12 +10462,11 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private boolean shouldUpgradeHttp(String url) {
-        if (!httpsOnly || url == null || !url.startsWith("http://")) return false;
+        if (!httpsOnly || url == null || !url.regionMatches(true, 0, "http://", 0, 7)) return false;
         String host = hostOf(url);
         SiteSettingsStore.SiteSettings site = siteSettingsStore == null ? null : siteSettingsStore.forHost(host);
         if (site != null && site.compatibilityMode()) return false;
-        if (host.length() == 0 || "localhost".equals(host) || host.endsWith(".local") || host.endsWith(".onion")) return false;
-        return !host.matches("^(10\\.|127\\.|169\\.254\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.).*");
+        return host.length() > 0 && !host.endsWith(".onion") && !NetworkSecurity.isObviouslyLocalHost(host);
     }
 
     private void confirmExternalNavigation(final String url) {
@@ -8051,7 +10482,7 @@ public final class MainActivity extends Activity implements Runnable {
     private void startExternalNavigation(String url) {
         try {
             Intent external;
-            if (url.startsWith("intent:")) {
+            if (url.regionMatches(true, 0, "intent:", 0, 7)) {
                 Intent parsed = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
                 if (parsed.getData() == null) throw new IllegalArgumentException("外部地址无效");
                 external = new Intent(Intent.ACTION_VIEW, parsed.getData());
@@ -8069,19 +10500,34 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private void handleWebPermissionRequest(final WebView source, final PermissionRequest request) {
+        if (pendingPermissionRequest != null && pendingPermissionRequest != request) clearPendingWebPermission(true);
         if (request == null || source == null || source != webView || request.getOrigin() == null ||
                 !sameSecureOrigin(request.getOrigin().toString(), source.getUrl())) {
             if (request != null) request.deny();
             return;
         }
-        if (pendingPermissionRequest != null) pendingPermissionRequest.deny();
+        if (isQrScannerUrl(source.getUrl()) && qrScannerViews.contains(source)) {
+            boolean wantsCamera = false;
+            for (String resource : request.getResources()) {
+                if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource)) wantsCamera = true;
+            }
+            if (!wantsCamera) { request.deny(); return; }
+            ArrayList<String> webResources = new ArrayList<String>();
+            webResources.add(PermissionRequest.RESOURCE_VIDEO_CAPTURE);
+            ArrayList<String> androidPermissions = new ArrayList<String>();
+            androidPermissions.add(Manifest.permission.CAMERA);
+            grantWebPermission(source, request.getOrigin().toString(), request,
+                    webResources, androidPermissions);
+            return;
+        }
         final ArrayList<String> webResources = new ArrayList<String>();
         final ArrayList<String> androidPermissions = new ArrayList<String>();
         StringBuilder names = new StringBuilder();
         boolean autoGrant = true;
         String originHost = request.getOrigin().getHost();
         if (originHost == null || originHost.length() == 0) { request.deny(); return; }
-        final SiteSettingsStore.SiteSettings site = siteSettingsStore.forHost(originHost);
+        final SiteSettingsStore.SiteSettings site = siteSettingsStore == null
+                ? new SiteSettingsStore.SiteSettings() : siteSettingsStore.forHost(originHost);
         for (String resource : request.getResources()) {
             if (PermissionRequest.RESOURCE_VIDEO_CAPTURE.equals(resource)) {
                 int camera = site.get(SiteSettingsStore.CAMERA);
@@ -8124,6 +10570,7 @@ public final class MainActivity extends Activity implements Runnable {
         for (String permission : androidPermissions) if (checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) missing.add(permission);
         if (missing.size() == 0) request.grant(webResources.toArray(new String[webResources.size()]));
         else {
+            if (pendingPermissionRequest != null && pendingPermissionRequest != request) clearPendingWebPermission(true);
             pendingPermissionRequest = request;
             pendingPermissionView = source;
             pendingPermissionOrigin = origin;
@@ -8132,14 +10579,30 @@ public final class MainActivity extends Activity implements Runnable {
         }
     }
 
+    private void clearPendingWebPermission(boolean deny) {
+        PermissionRequest pending = pendingPermissionRequest;
+        pendingPermissionRequest = null;
+        pendingWebPermissionResources = null;
+        pendingPermissionView = null;
+        pendingPermissionOrigin = null;
+        if (deny && pending != null) pending.deny();
+    }
+
     private void handleGeolocationRequest(final WebView source, final String origin, final GeolocationPermissions.Callback callback) {
         if (callback == null) return;
+        if (pendingGeolocationCallback != null && pendingGeolocationCallback != callback) {
+            pendingGeolocationCallback.invoke(pendingGeolocationOrigin, false, false);
+            pendingGeolocationCallback = null;
+            pendingGeolocationOrigin = null;
+            pendingGeolocationView = null;
+        }
         final String host = hostOf(origin);
         if (source == null || source != webView || !sameSecureOrigin(origin, source.getUrl())) {
             callback.invoke(origin, false, false);
             return;
         }
-        SiteSettingsStore.SiteSettings site = siteSettingsStore.forHost(host);
+        SiteSettingsStore.SiteSettings site = siteSettingsStore == null
+                ? new SiteSettingsStore.SiteSettings() : siteSettingsStore.forHost(host);
         int location = site.get(SiteSettingsStore.LOCATION);
         if (location == SiteSettingsStore.BLOCK) { callback.invoke(origin, false, false); return; }
         if (location == SiteSettingsStore.ALLOW) {
@@ -8179,10 +10642,7 @@ public final class MainActivity extends Activity implements Runnable {
                     pendingPermissionOrigin != null && sameSecureOrigin(pendingPermissionOrigin, webView.getUrl()))
                 pendingPermissionRequest.grant(pendingWebPermissionResources);
             else pendingPermissionRequest.deny();
-            pendingPermissionRequest = null;
-            pendingWebPermissionResources = null;
-            pendingPermissionView = null;
-            pendingPermissionOrigin = null;
+            clearPendingWebPermission(false);
         } else if (requestCode == GEOLOCATION_PERMISSION_REQUEST && pendingGeolocationCallback != null) {
             boolean locationGranted = checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
                     checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
@@ -8213,9 +10673,12 @@ public final class MainActivity extends Activity implements Runnable {
 
     private void performChromeUpdate() {
         if (webView == null) return;
+        updateImmersivePageLayout();
         updateAddressBar();
         boolean canBack = webView.canGoBack();
         boolean canForward = webView.canGoForward();
+        EdgeNavigationController.updateSystemGestureExclusion(webView, edgeNavigationEnabled,
+                canBack, canForward);
         if (renderedBackEnabled == null || renderedBackEnabled.booleanValue() != canBack) {
             renderedBackEnabled = Boolean.valueOf(canBack);
             backButton.setEnabled(canBack);
@@ -8231,8 +10694,7 @@ public final class MainActivity extends Activity implements Runnable {
             renderedTabCount = Integer.valueOf(tabCount);
             tabButton.setCount(tabCount);
         }
-        boolean shieldActive = isAdBlockActiveForHost(currentPageHost) &&
-                !(MODE_PERFORMANCE.equals(performanceMode) && performanceNetworkDirect);
+        boolean shieldActive = isAdBlockActiveForHost(currentPageHost);
         if (renderedShieldActive == null || renderedShieldActive.booleanValue() != shieldActive) {
             renderedShieldActive = Boolean.valueOf(shieldActive);
             shieldButton.setActive(shieldActive);
@@ -8243,7 +10705,9 @@ public final class MainActivity extends Activity implements Runnable {
         if (addressBar == null || addressBar.hasFocus()) return;
         String url = currentPageUrl;
         String display = "";
-        if (url != null && !isHomeUrl(url) && !"about:blank".equals(url)) {
+        if (isQrScannerUrl(url)) {
+            display = "扫描二维码";
+        } else if (url != null && !isHomeUrl(url) && !"about:blank".equals(url)) {
             String host = currentPageHost;
             if (host != null && host.length() > 0) {
                 Uri uri = currentUri();
@@ -8268,10 +10732,13 @@ public final class MainActivity extends Activity implements Runnable {
                 progressUpdatePending = false;
                 int value = pendingProgress;
                 if (value >= 100) {
+                    // A navigation can begin while the previous 100% fade is still running.
+                    // Cancel that end action before starting the new terminal fade.
+                    cancelViewAnimationIfRunning(progressBar);
                     if (renderedProgress != 100) Motion.animateProgress(progressBar, renderedProgress, 100, reduceMotion());
                     renderedProgress = 100;
                     if (progressBar.getVisibility() != View.GONE) {
-                        progressBar.animate().cancel();
+                        cancelViewAnimationIfRunning(progressBar);
                         progressBar.animate().alpha(0f).setDuration(reduceMotion() ? 70L : 130L).withEndAction(new Runnable() {
                             @Override public void run() { progressBar.setVisibility(View.GONE); progressBar.setAlpha(1f); }
                         }).start();
@@ -8281,8 +10748,21 @@ public final class MainActivity extends Activity implements Runnable {
                 if (renderedProgress >= 0 && renderedProgress < 100 && Math.abs(value - renderedProgress) < progressStep()) return;
                 int previous = renderedProgress;
                 renderedProgress = value;
+                if (immersiveGestureActive) {
+                    cancelViewAnimationIfRunning(progressBar);
+                    syncChromeProgress(immersiveGestureOffset);
+                    Motion.animateProgress(progressBar, previous, value, reduceMotion());
+                    return;
+                }
+                if (chromeHiddenByScroll || isInPictureInPictureMode()) {
+                    cancelViewAnimationIfRunning(progressBar);
+                    progressBar.setVisibility(View.GONE);
+                    return;
+                }
+                // Retire the old completion callback before exposing progress for a new load.
+                if (previous == 100) cancelViewAnimationIfRunning(progressBar);
+                progressBar.setAlpha(1f);
                 if (progressBar.getVisibility() != View.VISIBLE) {
-                    progressBar.animate().cancel();
                     progressBar.setAlpha(0f);
                     progressBar.setVisibility(View.VISIBLE);
                     progressBar.animate().alpha(1f).setDuration(100L).start();
@@ -8326,6 +10806,34 @@ public final class MainActivity extends Activity implements Runnable {
         return UrlCleaner.isInternalPage(url, "median.invalid");
     }
 
+    private boolean isInternalBrowserUrl(String url) {
+        if (!isReservedInternalHost(url)) return false;
+        try { return "https".equalsIgnoreCase(Uri.parse(url).getScheme()); }
+        catch (RuntimeException ignored) { return false; }
+    }
+
+    private boolean isReservedInternalHost(String url) {
+        if (url == null) return false;
+        try { return "median.invalid".equalsIgnoreCase(Uri.parse(url).getHost()); }
+        catch (RuntimeException ignored) { return false; }
+    }
+
+    private static String navigationDocumentUrl(String url) {
+        if (url == null) return "";
+        int fragment = url.indexOf('#');
+        return fragment < 0 ? url : url.substring(0, fragment);
+    }
+
+    private boolean isQrScannerUrl(String url) {
+        if (!UrlCleaner.isHttpsOrigin(url, "median.invalid")) return false;
+        try {
+            Uri uri = Uri.parse(url);
+            return "/scan".equals(uri.getPath()) && uri.getQuery() == null;
+        } catch (RuntimeException ignored) {
+            return false;
+        }
+    }
+
     private GradientDrawable roundRect(int color, int radiusDp) {
         GradientDrawable drawable = new GradientDrawable();
         drawable.setColor(color);
@@ -8333,21 +10841,22 @@ public final class MainActivity extends Activity implements Runnable {
         return drawable;
     }
 
-    private int selectableBorderless() {
-        TypedValue out = new TypedValue();
-        getTheme().resolveAttribute(android.R.attr.selectableItemBackgroundBorderless, out, true);
-        return out.resourceId;
-    }
-
-    private int selectableBounded() {
-        TypedValue out = new TypedValue();
-        getTheme().resolveAttribute(android.R.attr.selectableItemBackground, out, true);
-        return out.resourceId;
+    private android.graphics.drawable.Drawable sheetHandleDrawable() {
+        return new android.graphics.drawable.InsetDrawable(
+                roundRect(nightMode ? 0x505f6368 : 0x365f6368, 2), 0, dp(14), 0, dp(14));
     }
 
     private void hideKeyboard() {
         InputMethodManager manager = (InputMethodManager) getSystemService(Context.INPUT_METHOD_SERVICE);
         if (manager != null) manager.hideSoftInputFromWindow(addressBar.getWindowToken(), 0);
+    }
+
+    private void finishFileChooser(Uri[] result) {
+        ValueCallback<Uri[]> callback = fileChooserCallback;
+        fileChooserCallback = null;
+        fileChooserView = null;
+        fileChooserDocumentUrl = "";
+        if (callback != null) try { callback.onReceiveValue(result); } catch (RuntimeException ignored) {}
     }
 
     private int dp(int value) {
@@ -8359,9 +10868,7 @@ public final class MainActivity extends Activity implements Runnable {
     }
 
     private String safeMessage(Exception e) {
-        if (e == null) return "未知错误";
-        String message = e.getMessage();
-        return message == null || message.length() == 0 ? e.getClass().getSimpleName() : message;
+        return ErrorText.message(e, 180);
     }
 
     private void writeBackup(final Uri uri) {
@@ -8409,10 +10916,15 @@ public final class MainActivity extends Activity implements Runnable {
                         output.write(buffer, 0, read);
                     }
                     String raw = output.toString("UTF-8");
-                    imported = dataStore.importJson(raw);
-                    JSONObject root = new JSONObject(raw);
-                    JSONObject folders = root.optJSONObject("bookmarkFolders");
-                    if (folders != null) bookmarkFolders.mergeJson(folders.toString());
+                    String trimmed = raw.trim();
+                    if (trimmed.startsWith("<")) {
+                        imported = importBookmarkHtml(raw);
+                    } else {
+                        imported = dataStore.importJson(raw);
+                        JSONObject root = new JSONObject(raw);
+                        JSONObject folders = root.optJSONObject("bookmarkFolders");
+                        if (folders != null) bookmarkFolders.mergeJson(folders.toString());
+                    }
                 } catch (Exception e) { failure = e; }
                 finally { NetworkSecurity.closeQuietly(input); }
                 final int count = imported;
@@ -8423,6 +10935,39 @@ public final class MainActivity extends Activity implements Runnable {
                 } });
             }
         });
+    }
+
+    private int importBookmarkHtml(String raw) {
+        List<BookmarkHtmlParser.Item> items = BookmarkHtmlParser.parse(raw);
+        if (items.isEmpty()) throw new IllegalArgumentException("HTML 中没有可导入的网页书签");
+        HashMap<String, String> folderIds = new HashMap<String, String>();
+        int imported = 0;
+        for (BookmarkHtmlParser.Item item : items) {
+            BrowserDataStore.Bookmark added = dataStore.addBookmark(item.title, item.url);
+            if (added == null) continue;
+            imported++;
+            String parent = BookmarkFolderStore.ROOT;
+            StringBuilder path = new StringBuilder();
+            for (String name : item.folders) {
+                if (path.length() > 0) path.append('/');
+                path.append(name);
+                String key = path.toString();
+                String folderId = folderIds.get(key);
+                if (folderId == null) {
+                    BookmarkFolderStore.Folder found = null;
+                    for (BookmarkFolderStore.Folder candidate : bookmarkFolders.foldersIn(parent))
+                        if (candidate.name.equals(name)) { found = candidate; break; }
+                    if (found == null) found = bookmarkFolders.create(name, parent, false);
+                    if (found == null) break;
+                    folderId = found.id;
+                    folderIds.put(key, folderId);
+                }
+                parent = folderId;
+            }
+            bookmarkFolders.setParentForUrl(added.url, parent);
+        }
+        if (imported == 0) throw new IllegalArgumentException("没有新的网页书签可导入");
+        return imported;
     }
 
     private void showFullBackupPassword(final Uri uri, final boolean exporting) {
@@ -8440,21 +10985,34 @@ public final class MainActivity extends Activity implements Runnable {
         fields.setPadding(dp(18), 0, dp(18), 0);
         fields.addView(password);
         if (exporting) fields.addView(confirmation);
-        AlertDialog dialog = new AlertDialog.Builder(this)
+        final AlertDialog dialog = new AlertDialog.Builder(this)
                 .setTitle(exporting ? "加密完整备份" : "解密完整备份")
                 .setMessage(exporting ? "包含书签、历史、标签、设置、脚本、过滤订阅和密码。离线页面及下载文件不包含在内。忘记口令将无法恢复。" :
                         "恢复会替换当前浏览数据、脚本、设置和密码。AES-GCM 校验失败时不会应用备份。")
                 .setView(fields)
-                .setPositiveButton(exporting ? "加密导出" : "解密恢复", new DialogInterface.OnClickListener() {
-                    @Override public void onClick(DialogInterface d, int which) {
+                .setPositiveButton(exporting ? "加密导出" : "解密恢复", null)
+                .setNegativeButton("取消", null).create();
+        secureDialog(dialog);
+        dialog.setOnShowListener(new DialogInterface.OnShowListener() {
+            @Override public void onShow(DialogInterface ignored) {
+                dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+                    @Override public void onClick(View ignored) {
                         String first = password.getText().toString();
-                        if (first.length() < 10 || first.length() > 256) { toast("备份口令需为 10–256 个字符"); return; }
-                        if (exporting && !first.equals(confirmation.getText().toString())) { toast("两次输入的口令不一致"); return; }
+                        if (first.length() < 10 || first.length() > 256) {
+                            password.setError("备份口令需为 10–256 个字符");
+                            return;
+                        }
+                        if (exporting && !first.equals(confirmation.getText().toString())) {
+                            confirmation.setError("两次输入的口令不一致");
+                            return;
+                        }
+                        dialog.dismiss();
                         if (exporting) createFullBackup(uri, first.toCharArray());
                         else restoreFullBackup(uri, first.toCharArray());
                     }
-                }).setNegativeButton("取消", null).create();
-        secureDialog(dialog);
+                });
+            }
+        });
         dialog.show();
     }
 
@@ -8519,7 +11077,9 @@ public final class MainActivity extends Activity implements Runnable {
         value.put("customSearch", customEngines.size() == 0 ? "" : customEngines.get(0).template);
         value.put("customSearchEngines", searchEngines.exportJson());
         value.put("performanceMode", performanceMode);
-        value.put("networkDirect", performanceNetworkDirect);
+        // Retain the legacy field for older backup readers; the unsafe direct-network mode was
+        // removed and is never restored.
+        value.put("networkDirect", false);
         value.put("autoPip", autoPictureInPicture);
         value.put("cleanTracking", cleanTrackingParameters);
         value.put("passwordAutofill", passwordAutofillEnabled);
@@ -8624,7 +11184,7 @@ public final class MainActivity extends Activity implements Runnable {
         String restoredCustomSearch = value.optString("customSearch", "").trim();
         if (!validSearchTemplate(restoredCustomSearch)) restoredCustomSearch = "";
         JSONArray restoredCustomEngines = value.optJSONArray("customSearchEngines");
-        boolean legacyRestoreTabs = value.optBoolean("restoreTabs", true);
+        boolean legacyRestoreTabs = value.optBoolean("restoreTabs", false);
         String restoredOpenMode = HomeOpenPolicy.normalize(value.optString("homeOpenMode", ""), legacyRestoreTabs);
         String restoredHomeUrl = normalizeConfiguredHomeUrl(value.optString("homeCustomUrl", ""));
         if (HomeOpenPolicy.OPEN_CUSTOM_URL.equals(restoredOpenMode) && restoredHomeUrl.length() == 0)
@@ -8673,7 +11233,6 @@ public final class MainActivity extends Activity implements Runnable {
                 .putString("search_engine", restoredSearch)
                 .putString("custom_search_template", restoredCustomSearch)
                 .putString("performance_mode", restoredMode)
-                .putBoolean("performance_network_direct", value.optBoolean("networkDirect", false))
                 .putBoolean("auto_picture_in_picture", value.optBoolean("autoPip", false))
                 .putBoolean("clean_tracking_parameters", value.optBoolean("cleanTracking", true))
                 .putBoolean("password_autofill", value.optBoolean("passwordAutofill", true))
@@ -8724,7 +11283,6 @@ public final class MainActivity extends Activity implements Runnable {
         acceptThirdPartyCookies = value.optBoolean("thirdPartyCookies", false);
         searchEngine = restoredSearch;
         performanceMode = restoredMode;
-        performanceNetworkDirect = value.optBoolean("networkDirect", false);
         autoPictureInPicture = value.optBoolean("autoPip", false);
         cleanTrackingParameters = value.optBoolean("cleanTracking", true);
         passwordAutofillEnabled = value.optBoolean("passwordAutofill", true);
@@ -8748,6 +11306,7 @@ public final class MainActivity extends Activity implements Runnable {
         ArrayList<WebView> oldViews = new ArrayList<WebView>();
         for (BrowserTab tab : tabs) if (tab.liveView != null && !oldViews.contains(tab.liveView)) oldViews.add(tab.liveView);
         for (WebView old : oldViews) destroyWebView(old);
+        scriptTabValues.clear();
         tabs.clear();
         closedTabs.clear();
         if (restoreTabs) {
@@ -8768,13 +11327,16 @@ public final class MainActivity extends Activity implements Runnable {
         currentTabIndex = restoreTabs ? Math.min(dataStore.restoredSessionIndex(), tabs.size() - 1) : 0;
         BrowserTab active = tabs.get(currentTabIndex);
         webView = createConfiguredWebView();
-        active.liveView = webView;
+        bindWebViewToTab(active, webView);
+        applyPerformanceMode(webView);
         active.lastActiveAt = SystemClock.uptimeMillis();
         webContainer.addView(webView, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
         currentPageUrl = active.url;
         currentPageHost = hostOf(active.url);
         pageHosts.put(webView, currentPageHost);
-        if (isHomeUrl(active.url)) showHome(); else loadNetworkUrl(webView, active.url);
+        if (isHomeUrl(active.url)) showHome();
+        else if (isQrScannerUrl(active.url)) showQrScannerPage();
+        else loadNetworkUrl(webView, active.url);
         renderedTabCount = null;
         requestChromeUpdate();
     }
@@ -8793,6 +11355,20 @@ public final class MainActivity extends Activity implements Runnable {
         setIntent(intent);
         if (isExternalHttpIntent(intent)) loadInput(intent.getData().toString());
         else if (intent != null && Intent.ACTION_VIEW.equals(intent.getAction())) toast("已拒绝非 HTTP(S) 外部地址");
+        else if (intent != null && Intent.ACTION_MAIN.equals(intent.getAction()) &&
+                intent.hasCategory(Intent.CATEGORY_LAUNCHER) &&
+                !HomeOpenPolicy.KEEP_LAST.equals(homeOpenMode())) {
+            // A fresh tap on the launcher follows the selected startup destination even
+            // when Android reuses this task. Returning from another app keeps the page.
+            dismissOverlayForNavigation();
+            startupSessionPending = false;
+            if (startupReady) openConfiguredHome();
+            else {
+                startupSavedState = null;
+                startupExternalUrl = "";
+                pendingStartupInput = null;
+            }
+        }
     }
 
     private static boolean isExternalHttpIntent(Intent intent) {
@@ -8806,18 +11382,49 @@ public final class MainActivity extends Activity implements Runnable {
     @Override
     protected void onSaveInstanceState(Bundle outState) {
         super.onSaveInstanceState(outState);
+        saveCurrentTab();
         Bundle webViewState = captureWebViewState(webView);
+        Bundle tabMetadata = captureTabMetadata();
+        Bundle browserState = new Bundle();
+        if (webViewState != null) browserState.putBundle(STATE_WEBVIEW, webViewState);
+        if (tabMetadata != null) browserState.putBundle(STATE_TABS, tabMetadata);
+        // Keep the combined browser contribution within the original history-only budget.
+        // Tab identity/selection and a reloadable URL take precedence over optional history.
+        if (!isBoundedTabState(browserState)) webViewState = null;
         if (webViewState != null) outState.putBundle(STATE_WEBVIEW, webViewState);
+        if (tabMetadata != null) outState.putBundle(STATE_TABS, tabMetadata);
         persistSession();
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == FILE_CHOOSER_REQUEST && fileChooserCallback != null) {
-            Uri[] result = WebChromeClient.FileChooserParams.parseResult(resultCode, data);
-            fileChooserCallback.onReceiveValue(result);
-            fileChooserCallback = null;
+        if (requestCode == DOWNLOAD_DIRECTORY_REQUEST) {
+            DownloadDirectory.handlePickerResult(this, resultCode, data, new Runnable() {
+                @Override public void run() { showDownloadSettings(); }
+            });
+        } else if (requestCode == QR_SCAN_REQUEST) {
+            String scanned = "";
+            if (resultCode == RESULT_OK && data != null) {
+                scanned = data.getStringExtra("SCAN_RESULT");
+                if (scanned == null || scanned.trim().length() == 0) scanned = data.getDataString();
+                if (scanned == null || scanned.trim().length() == 0) scanned = data.getStringExtra("result");
+            }
+            String value = scanned == null ? "" : scanned.trim();
+            if (value.length() > 16 * 1024) {
+                toast("二维码内容异常过长");
+                if (webView != null && isQrScannerUrl(webView.getUrl())) showQrScannerPage();
+            } else if (value.length() > 0) showQrResult(value);
+            else if (webView != null && isQrScannerUrl(webView.getUrl())) showQrScannerPage();
+        } else if (requestCode == FILE_CHOOSER_REQUEST && fileChooserCallback != null) {
+            Uri[] result = null;
+            try { result = WebChromeClient.FileChooserParams.parseResult(resultCode, data); }
+            catch (RuntimeException ignored) {}
+            WebView chooserView = fileChooserView;
+            String current = chooserView == null ? null : chooserView.getUrl();
+            if (chooserView == null || chooserView != webView || activityDestroyed ||
+                    !fileChooserDocumentUrl.equals(navigationDocumentUrl(current))) result = null;
+            finishFileChooser(result);
         } else if (requestCode == BACKUP_EXPORT_REQUEST && resultCode == RESULT_OK && data != null) {
             writeBackup(data.getData());
         } else if (requestCode == BACKUP_IMPORT_REQUEST && resultCode == RESULT_OK && data != null) {
@@ -8829,18 +11436,23 @@ public final class MainActivity extends Activity implements Runnable {
             final Uri uri = data.getData();
             withVaultUnlock(new Runnable() { @Override public void run() { showFullBackupPassword(uri, false); } });
         } else if (requestCode == HOME_WALLPAPER_REQUEST) {
-            if (resultCode == RESULT_OK && data != null) importHomeImage(data.getData(), HomeImageStore.Kind.WALLPAPER);
-            else continueHomeSection(pendingHomeImageReturnSection);
+            homeCustomization().onImagePickerResult(HomeImageStore.Kind.WALLPAPER, resultCode, data);
         } else if (requestCode == HOME_LOGO_REQUEST) {
-            if (resultCode == RESULT_OK && data != null) importHomeImage(data.getData(), HomeImageStore.Kind.LOGO);
-            else continueHomeSection(pendingHomeImageReturnSection);
+            homeCustomization().onImagePickerResult(HomeImageStore.Kind.LOGO, resultCode, data);
         } else if (requestCode == VAULT_UNLOCK_REQUEST) {
             Runnable action = pendingVaultAction;
+            Runnable cancelAction = pendingVaultCancelAction;
             pendingVaultAction = null;
+            pendingVaultCancelAction = null;
             if (resultCode == RESULT_OK) {
-                vaultUnlockedUntil = SystemClock.elapsedRealtime() + 120_000L;
+                uiHandler.removeCallbacks(vaultLock);
+                vaultUnlockedUntil = SystemClock.elapsedRealtime() + VAULT_UNLOCK_WINDOW_MS;
+                uiHandler.postDelayed(vaultLock, VAULT_UNLOCK_WINDOW_MS);
                 if (action != null) action.run();
-            } else toast("密码库保持锁定");
+            } else {
+                toast("密码库保持锁定");
+                continueSettingsPanel(cancelAction);
+            }
         }
     }
 
@@ -8856,13 +11468,28 @@ public final class MainActivity extends Activity implements Runnable {
             navigateOverlayBack();
         } else if (customView != null) {
             exitFullscreen();
+        } else if (webView != null && adPickerSessions.containsKey(webView)) {
+            finishAdPickerSession(webView, adPickerSessions.get(webView));
         } else if (webView != null && webView.canGoBack()) {
-            webView.goBack();
+            goBackWebView(webView);
+            scheduleRestoredHomeRepair(webView);
         } else if (tabs.size() > 1) {
             closeCurrentTab();
         } else {
+            if (clearDataOnExit) clearDataForExit();
             finishAfterTransition();
         }
+    }
+
+    private void trimRuntimeCaches(boolean severe) {
+        preparedInjection = null;
+        adBlock.trimMemory();
+        if (scriptStore != null) scriptStore.trimMemory();
+        if (services != null) services.trimMemory();
+        // The active WebView owns the rendered document; these Java strings are rebuildable.
+        cachedHomeKey = "";
+        cachedHomeHtml = "";
+        if (severe) scriptTabValues.trimMemory();
     }
 
     @Override
@@ -8875,9 +11502,10 @@ public final class MainActivity extends Activity implements Runnable {
             uiHandler.removeCallbacks(deferredStartup);
             deferredStartupPending = false;
         }
-        vaultUnlockedUntil = 0L;
-        stagedCredential = null;
-        stagedCredentialAt = 0L;
+        uiHandler.removeCallbacks(vaultLock);
+        vaultLock.run();
+        // Preserve hot-tab resume behavior. Android's memory-pressure callbacks below own
+        // renderer freezing; merely opening another Activity must not turn a hot tab cold.
         if (services != null) services.trimMemory();
         maybeTrimTransientCache();
         super.onStop();
@@ -8885,6 +11513,8 @@ public final class MainActivity extends Activity implements Runnable {
 
     @Override
     protected void onPause() {
+        immersiveGestureActive = false;
+        updatePageMargins();
         boolean pictureInPicture = isInPictureInPictureMode();
         activityResumed = pictureInPicture;
         startupReadiness.set(StartupReadiness.RESUMED, pictureInPicture);
@@ -8900,14 +11530,12 @@ public final class MainActivity extends Activity implements Runnable {
         activityResumed = true;
         if (webView != null) {
             webView.onResume();
+            resumeQrScannerIfNeeded();
         }
         startupReadiness.set(StartupReadiness.RESUMED, true);
+        maybeStartFastStartup();
         maybeCompleteStartup();
-        InitialNavigationGuard navigationGuard = webView == null ? null : initialNavigationGuards.get(webView);
-        long pendingInitialNavigation = navigationGuard == null ? 0L : navigationGuard.pendingGeneration();
-        if (pendingInitialNavigation != 0L)
-            scheduleInitialNavigationRetry(webView, pendingInitialNavigation, 250L);
-        scheduleDeferredStartupWork();
+        if (pageFinished && isNetworkPage(currentPageUrl)) scheduleDeferredStartupWork();
     }
 
     @Override
@@ -8920,9 +11548,19 @@ public final class MainActivity extends Activity implements Runnable {
     @Override
     public void onPictureInPictureModeChanged(boolean inPictureInPictureMode, android.content.res.Configuration newConfig) {
         super.onPictureInPictureModeChanged(inPictureInPictureMode, newConfig);
-        if (topBar != null) topBar.setVisibility(inPictureInPictureMode ? View.GONE : View.VISIBLE);
-        if (bottomBar != null) bottomBar.setVisibility(inPictureInPictureMode ? View.GONE : View.VISIBLE);
-        if (progressBar != null && inPictureInPictureMode) progressBar.setVisibility(View.GONE);
+        updatePageMargins();
+        if (rootFrame != null) rootFrame.requestApplyInsets();
+        if (inPictureInPictureMode) {
+            if (topBar != null) topBar.setVisibility(View.INVISIBLE);
+            if (bottomBar != null) bottomBar.setVisibility(View.INVISIBLE);
+            if (progressBar != null) progressBar.setVisibility(View.GONE);
+        } else if (chromeHiddenByScroll) {
+            if (topBar != null) topBar.setVisibility(View.INVISIBLE);
+            if (bottomBar != null) bottomBar.setVisibility(View.INVISIBLE);
+            setImmersiveSystemBars(true);
+        } else {
+            showBrowserChrome(false);
+        }
         activityResumed = inPictureInPictureMode || hasWindowFocus();
         if (webView != null) {
             if (inPictureInPictureMode) webView.onResume();
@@ -8936,8 +11574,9 @@ public final class MainActivity extends Activity implements Runnable {
         boolean runningPressure = level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW &&
                 level <= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL;
         if (runningPressure || level >= android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
-            preparedInjection = null;
-            if (services != null) services.trimMemory();
+            boolean severe = level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
+                    level >= android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE;
+            trimRuntimeCaches(severe);
         }
 
         boolean releaseTabs;
@@ -8959,7 +11598,7 @@ public final class MainActivity extends Activity implements Runnable {
 
     @Override
     public void onLowMemory() {
-        preparedInjection = null;
+        trimRuntimeCaches(true);
         releaseInactiveTabStates();
         clearColdTabBundles();
         super.onLowMemory();
@@ -8979,18 +11618,33 @@ public final class MainActivity extends Activity implements Runnable {
     protected void onDestroy() {
         activityResumed = false;
         activityDestroyed = true;
+        if (adBlockRuleLoader != null) adBlockRuleLoader.close();
+        if (startupDataLoader != null) startupDataLoader.close();
+        if (connectionHints != null) connectionHints.close();
+        if (userScriptNetwork != null) userScriptNetwork.close();
+        if (homeCustomizationController != null) homeCustomizationController.close();
+        pendingVaultAction = null;
+        pendingVaultCancelAction = null;
+        uiHandler.removeCallbacks(vaultLock);
+        vaultLock.run();
         unregisterPredictiveBack();
-        persistSession();
-        if (pendingPermissionRequest != null) pendingPermissionRequest.deny();
+        if (!(clearDataOnExit && exitDataCleared)) persistSession();
+        clearPendingWebPermission(true);
         if (pendingGeolocationCallback != null) pendingGeolocationCallback.invoke(pendingGeolocationOrigin, false, false);
+        pendingGeolocationCallback = null;
+        pendingGeolocationOrigin = null;
+        pendingGeolocationView = null;
+        finishFileChooser(null);
         dismissOverlay();
         uiHandler.removeCallbacksAndMessages(null);
         if (startupExecutor != null) startupExecutor.shutdownNow();
+        // Provider startup is process-wide. Do not interrupt its queued work on Activity teardown;
+        // its terminal callback retires this executor even if this Activity has been destroyed.
         if (navigationExecutor != null) navigationExecutor.shutdownNow();
         if (scriptExecutor != null) scriptExecutor.shutdownNow();
         if (scriptNetworkExecutor != null) scriptNetworkExecutor.shutdownNow();
-        for (HttpURLConnection connection : scriptConnections.values()) try { connection.disconnect(); } catch (RuntimeException ignored) {}
-        scriptConnections.clear();
+        faviconFetchQueued.clear();
+        scriptTabValues.clear();
         if (services != null) services.close();
         if (dataStore != null) dataStore.close();
         if (siteSettingsStore != null) siteSettingsStore.close();

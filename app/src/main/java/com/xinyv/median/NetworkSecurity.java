@@ -100,29 +100,37 @@ final class NetworkSecurity {
         Map<String, String> safeHeaders = headers == null ? Collections.<String, String>emptyMap() : headers;
         for (int redirects = 0; redirects <= MAX_REDIRECTS; redirects++) {
             if (publicOnly) requirePublicHost(normalizedHost(current));
-            HttpURLConnection connection = (HttpURLConnection) current.openConnection();
-            connection.setInstanceFollowRedirects(false);
-            connection.setConnectTimeout(connectTimeout);
-            connection.setReadTimeout(readTimeout);
-            connection.setUseCaches(false);
-            connection.setRequestMethod("GET");
-            for (Map.Entry<String, String> header : safeHeaders.entrySet()) {
-                boolean trustedCookie = publicOnly && "cookie".equalsIgnoreCase(header.getKey());
-                if (!validHeader(header.getKey(), header.getValue()) ||
-                        (isForbiddenRequestHeader(header.getKey()) && !trustedCookie)) continue;
-                if (!sameOrigin(first, current) && isCredentialHeader(header.getKey())) continue;
-                connection.setRequestProperty(header.getKey(), header.getValue());
-            }
-            int status = connection.getResponseCode();
-            if (!isRedirect(status)) return connection;
-            if (redirects == MAX_REDIRECTS) {
+            HttpURLConnection connection = null;
+            try {
+                connection = (HttpURLConnection) current.openConnection();
+                connection.setInstanceFollowRedirects(false);
+                connection.setConnectTimeout(connectTimeout);
+                connection.setReadTimeout(readTimeout);
+                connection.setUseCaches(false);
+                connection.setRequestMethod("GET");
+                for (Map.Entry<String, String> header : safeHeaders.entrySet()) {
+                    boolean trustedCookie = publicOnly && "cookie".equalsIgnoreCase(header.getKey());
+                    if (!validHeader(header.getKey(), header.getValue()) ||
+                            (isForbiddenRequestHeader(header.getKey()) && !trustedCookie)) continue;
+                    if (!sameOrigin(first, current) && isCredentialHeader(header.getKey())) continue;
+                    connection.setRequestProperty(header.getKey(), header.getValue());
+                }
+                int status = connection.getResponseCode();
+                // Defense in depth only: this checks a fresh DNS answer, not the
+                // connected socket peer. HttpURLConnection does not expose that
+                // peer, so this is not a complete DNS-rebinding defense.
+                if (publicOnly) requirePublicHost(normalizedHost(current));
+                if (!isRedirect(status)) return connection;
+                if (redirects == MAX_REDIRECTS) throw new MalformedURLException("Too many redirects");
+                String location = connection.getHeaderField("Location");
+                URL next = resolveRedirect(current, location, httpsOnly);
                 connection.disconnect();
-                throw new MalformedURLException("Too many redirects");
+                connection = null;
+                current = next;
+            } catch (Exception error) {
+                if (connection != null) connection.disconnect();
+                throw error;
             }
-            String location = connection.getHeaderField("Location");
-            URL next = resolveRedirect(current, location, httpsOnly);
-            connection.disconnect();
-            current = next;
         }
         throw new MalformedURLException("Too many redirects");
     }
@@ -147,7 +155,15 @@ final class NetworkSecurity {
         String host = url == null ? "" : url.getHost();
         if (host == null) return "";
         host = host.trim().toLowerCase(Locale.US);
+        if (host.startsWith("[") && host.endsWith("]") && host.length() > 2)
+            host = host.substring(1, host.length() - 1);
         while (host.endsWith(".")) host = host.substring(0, host.length() - 1);
+        if (host.indexOf(':') >= 0) {
+            try {
+                InetAddress address = InetAddress.getByName(host);
+                return address instanceof Inet6Address ? address.getHostAddress().toLowerCase(Locale.US) : "";
+            } catch (Exception ignored) { return ""; }
+        }
         try { return IDN.toASCII(host, IDN.USE_STD3_ASCII_RULES).toLowerCase(Locale.US); }
         catch (IllegalArgumentException ignored) { return ""; }
     }
@@ -180,6 +196,8 @@ final class NetworkSecurity {
     static boolean isObviouslyLocalHost(String host) {
         if (host == null) return false;
         String normalized = host.trim().toLowerCase(Locale.US);
+        if (normalized.startsWith("[") && normalized.endsWith("]") && normalized.length() > 2)
+            normalized = normalized.substring(1, normalized.length() - 1);
         if (normalized.equals("localhost") || normalized.endsWith(".localhost") || normalized.endsWith(".local")) return true;
         boolean looksLiteral = normalized.indexOf(':') >= 0 || normalized.matches("[0-9.]+");
         if (!looksLiteral) return false; // Never perform DNS on the UI thread for ordinary hostnames.
@@ -202,6 +220,31 @@ final class NetworkSecurity {
         return false;
     }
 
+    /**
+     * Classifies a page origin as local only after a successful, unambiguous
+     * resolution. This is deliberately different from isLocalOrPrivateHost:
+     * native requests fail closed on DNS errors, while a failed DNS lookup for
+     * a public page must never grant access to private targets.
+     */
+    static boolean isConfirmedLocalOrPrivateHost(String host) {
+        if (host == null) return false;
+        String normalized = host.trim().toLowerCase(Locale.US);
+        if (normalized.startsWith("[") && normalized.endsWith("]") && normalized.length() > 2)
+            normalized = normalized.substring(1, normalized.length() - 1);
+        if (normalized.equals("localhost") || normalized.endsWith(".localhost") || normalized.endsWith(".local"))
+            return true;
+        try {
+            InetAddress[] addresses = InetAddress.getAllByName(normalized);
+            if (addresses.length == 0) return false;
+            for (InetAddress address : addresses) {
+                if (!isLocalOrPrivateAddress(address)) return false;
+            }
+            return true;
+        } catch (Exception ignored) {
+            return false;
+        }
+    }
+
     /** Validates native executable downloads without misreporting a transient DNS failure as a private host. */
     private static void requirePublicHost(String host) throws Exception {
         String normalized = host == null ? "" : host.trim().toLowerCase(Locale.US);
@@ -219,18 +262,30 @@ final class NetworkSecurity {
         if (address.isAnyLocalAddress() || address.isLoopbackAddress() || address.isLinkLocalAddress() ||
                 address.isSiteLocalAddress() || address.isMulticastAddress()) return true;
         byte[] bytes = address.getAddress();
-        if (address instanceof Inet4Address && bytes.length == 4) {
-            int a = bytes[0] & 0xff;
-            int b = bytes[1] & 0xff;
-            return a == 0 || a == 10 || a == 127 || (a == 169 && b == 254) ||
-                    (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) ||
-                    (a == 100 && b >= 64 && b <= 127) || a >= 224;
-        }
+        if (address instanceof Inet4Address && bytes.length == 4) return isPrivateIpv4(bytes, 0);
         if (address instanceof Inet6Address && bytes.length == 16) {
             int first = bytes[0] & 0xff;
             int second = bytes[1] & 0xff;
+            boolean mapped = true;
+            for (int i = 0; i < 10; i++) if (bytes[i] != 0) { mapped = false; break; }
+            if (mapped && (bytes[10] & 0xff) == 0xff && (bytes[11] & 0xff) == 0xff)
+                return isPrivateIpv4(bytes, 12);
+            // Deprecated IPv4-compatible literals (::192.168.1.1) are still
+            // accepted by some URL parsers. Treat their embedded IPv4 value
+            // with the same private-range policy as mapped addresses.
+            boolean compatible = true;
+            for (int i = 0; i < 12; i++) if (bytes[i] != 0) { compatible = false; break; }
+            if (compatible) return isPrivateIpv4(bytes, 12);
             return (first & 0xfe) == 0xfc || (first == 0xfe && (second & 0xc0) == 0x80);
         }
         return false;
+    }
+
+    private static boolean isPrivateIpv4(byte[] bytes, int offset) {
+        int a = bytes[offset] & 0xff;
+        int b = bytes[offset + 1] & 0xff;
+        return a == 0 || a == 10 || a == 127 || (a == 169 && b == 254) ||
+                (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) ||
+                (a == 100 && b >= 64 && b <= 127) || a >= 224;
     }
 }

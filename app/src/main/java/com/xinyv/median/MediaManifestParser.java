@@ -144,7 +144,14 @@ final class MediaManifestParser {
 
     private static String attribute(String line, String key) {
         String upper = line.toUpperCase(Locale.US);
-        int at = upper.indexOf(key + '=');
+        int at = -1;
+        int from = 0;
+        String token = key.toUpperCase(Locale.US) + '=';
+        while ((at = upper.indexOf(token, from)) >= 0) {
+            if (at == 0 || upper.charAt(at - 1) == ':' || upper.charAt(at - 1) == ',' ||
+                    Character.isWhitespace(upper.charAt(at - 1))) break;
+            from = at + 1;
+        }
         if (at < 0) return "";
         at += key.length() + 1;
         if (at < line.length() && line.charAt(at) == '"') {

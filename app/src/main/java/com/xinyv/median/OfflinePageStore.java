@@ -154,6 +154,6 @@ final class OfflinePageStore {
 
     private static String safe(String value, int max) {
         String result = value == null ? "" : value.trim();
-        return result.length() > max ? result.substring(0, max) : result;
+        return UiText.truncate(result, max);
     }
 }

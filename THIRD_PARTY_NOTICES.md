@@ -1,21 +1,24 @@
-# Third-party notices
+# 第三方组件声明
 
-Median Browser 1.4.0 的生产 APK 不再打包 AndroidX、Kotlin 或第三方运行时库。
+Median Browser 的网页渲染由 Android 系统提供的 Android System WebView 完成。项目还包含用于 WebView document-start 能力的兼容接口，以及相应的 Chromium support-library boundary 接口。
 
-项目内包含 AndroidX WebKit document-start API 的聚焦兼容源码，以及 Android System WebView support-library boundary 协议所需接口。AndroidX 部分适用 Apache License 2.0；Chromium boundary 部分适用 Chromium BSD-style license。
+## 运行时所含组件
 
-测试和构建工具：
+- AndroidX WebKit document-start 兼容代码：基于 Apache License 2.0。
+- Chromium support-library boundary 接口：适用 Chromium BSD-style license。
 
-- JUnit 4.13.2（仅测试）— Eclipse Public License 1.0。
-- Android Gradle Plugin 与 Gradle（仅构建工具）— 各自许可证适用。
-- Android SDK Build Tools / R8 / AAPT2（仅构建工具）— Android SDK 相关许可证适用。
+这些兼容接口只覆盖项目所需的边界，不代表应用打包了完整 AndroidX WebKit 库或 Chromium 内核。其余网页渲染组件由 Android System WebView 提供。
 
-应用运行时依赖设备提供的 Android framework 和 Android System WebView。正式发布时应从最终 AAB 重新生成依赖与许可证报告。
+## 测试与构建工具
 
-## Focused AndroidX WebKit compatibility slice
+以下组件用于测试或构建，不随正式应用作为运行时依赖提供：
 
-Median vendors only the source-compatible document-start WebKit facade and the
-Chromium support-library boundary interfaces required by that API. The code is
-based on AndroidX WebKit (Apache License 2.0) and Chromium support-library
-boundary sources (BSD-style license). Unrelated AndroidX APIs and transitive
-runtime libraries are intentionally not packaged.
+- JUnit 4.13.2：Eclipse Public License 1.0。
+- AndroidX Test Core 1.7.0、Runner 1.7.0、Ext JUnit 1.3.0：Apache License 2.0。
+- Gradle、Android Gradle Plugin、Android SDK Build Tools、R8 与 AAPT2：适用各自项目及 Android SDK 许可证。
+
+- [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+- [Eclipse Public License 1.0](https://www.eclipse.org/legal/epl-v10.html)
+- [Chromium license](https://source.chromium.org/chromium/chromium/src/+/main:LICENSE)
+
+需要为特定分发版本核对组件时，请以对应源码、构建配置和最终 APK 为准。

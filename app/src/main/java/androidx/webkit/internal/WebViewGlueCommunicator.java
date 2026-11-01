@@ -35,6 +35,16 @@ public final class WebViewGlueCommunicator {
         return DOCUMENT_START.equals(feature) && has("DOCUMENT_START_SCRIPT");
     }
 
+    /** Reads completed discovery only; never initializes or waits for the provider. */
+    public static boolean isFeatureSupportedIfLoaded(String feature) {
+        return features != null && has(feature);
+    }
+
+    /** A non-blocking optional path for startup connection hints. */
+    public static WebViewProviderFactoryBoundaryInterface getFactoryIfLoaded() {
+        return features == null ? null : factory;
+    }
+
     public static ScriptHandler addDocumentStartJavaScript(
             WebView webView, String script, String[] originRules) {
         if (Looper.myLooper() != Looper.getMainLooper())
@@ -101,6 +111,18 @@ public final class WebViewGlueCommunicator {
         }
     }
 
+    /**
+     * Loads the optional support boundary after framework provider initialization on a worker.
+     * A framework initialization failure must reach the startup failure callback; missing glue
+     * can safely leave the caller on the framework's normal synchronous WebView path.
+     */
+    public static WebViewProviderFactoryBoundaryInterface getFactoryForStartup() {
+        if (Build.VERSION.SDK_INT < 28) return null;
+        ClassLoader loader = WebView.getWebViewClassLoader();
+        load(loader);
+        return factory;
+    }
+
     private static boolean has(String feature) {
         String[] values = features;
         if (values == null) return false;
@@ -112,13 +134,18 @@ public final class WebViewGlueCommunicator {
     }
 
     private static void load() {
+        load(null);
+    }
+
+    private static void load(ClassLoader startupLoader) {
         if (features != null) return;
         synchronized (WebViewGlueCommunicator.class) {
             if (features != null) return;
-            features = new String[0];
+            String[] loadedFeatures = new String[0];
             try {
                 ClassLoader loader;
-                if (Build.VERSION.SDK_INT >= 28) loader = WebView.getWebViewClassLoader();
+                if (startupLoader != null) loader = startupLoader;
+                else if (Build.VERSION.SDK_INT >= 28) loader = WebView.getWebViewClassLoader();
                 else {
                     Method getFactory = WebView.class.getDeclaredMethod("getFactory");
                     getFactory.setAccessible(true);
@@ -132,12 +159,16 @@ public final class WebViewGlueCommunicator {
                 factory = BoundaryInterfaceReflectionUtil.castToSuppLibClass(
                         WebViewProviderFactoryBoundaryInterface.class, handler);
                 String[] advertised = factory == null ? null : factory.getSupportedFeatures();
-                if (advertised != null) features = advertised;
+                if (advertised != null) loadedFeatures = advertised;
                 state = factory == null ? "factory unavailable" : "ok";
             } catch (Exception error) {
                 state = error.getClass().getSimpleName();
             } catch (LinkageError error) {
                 state = error.getClass().getSimpleName();
+            } finally {
+                // Publish readiness only after factory and feature discovery finish. A concurrent
+                // feature query must not observe a half-initialized factory as unsupported.
+                features = loadedFeatures;
             }
         }
     }

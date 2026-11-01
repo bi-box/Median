@@ -42,13 +42,27 @@ final class MediaResourceSniffer {
     private static final String[] SEGMENT_HINTS = { ".m4s", ".cmfv", ".cmfa", ".fmp4", ".ts", ".mp2t", ".aacp" };
     private static final String[] ISO_SEGMENT_HINTS = { ".m4s", ".cmfv", ".fmp4" };
     private static final String[] SEGMENT_PATHS = { "/segment/", "/segments/", "segmentnumber=" };
+    // Header reads cross the WebView provider boundary. Keep the probe limited to endpoint
+    // shapes that commonly carry opaque media, while the strict marker gate remains unchanged.
+    private static final String[] MEDIA_ENDPOINT_HINTS = {
+            "/play", "/stream", "/media", "/video", "/audio", "/manifest", "/playlist",
+            "/segment", "/chunk", "/download"
+    };
+    private static final String[] MEDIA_QUERY_HINTS = {
+            "mime=", "mime_type=", "content_type=", "format=", "media=", "stream=",
+            "video=", "audio=", "playback=", "playback_url=", "video_url=", "audio_url="
+    };
+    private static final String[] LOAD_RESOURCE_HINTS = collectLoadResourceHints();
+    private static final String[][] LOAD_RESOURCE_HINTS_BY_FIRST = indexHints(LOAD_RESOURCE_HINTS);
+    private static final String[] REQUEST_HINTS = requestHints();
+    private static final String[][] REQUEST_HINTS_BY_FIRST = indexHints(REQUEST_HINTS);
     private static final String[] STATIC_SUFFIXES = { ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".css", ".js", ".mjs", ".json", ".woff", ".woff2", ".ttf", ".otf", ".ico", ".avif", ".pdf", ".zip", ".rar", ".7z", ".apk", ".doc", ".docx", ".xls", ".xlsx" };
     private final LinkedHashMap<String, Resource> items = new LinkedHashMap<String, Resource>();
     private String pageUrl = "";
     private int opaqueMediaCount;
 
     synchronized void beginPage(String url) {
-        String next = value(url);
+        String next = normalizePageKey(url);
         if (next.equals(pageUrl)) return;
         pageUrl = next;
         items.clear();
@@ -88,28 +102,104 @@ final class MediaResourceSniffer {
 
     /** Cheap UI-thread gate for WebView's redundant onLoadResource callback. */
     static boolean isObviousLoadResource(String url) {
-        return isHttpUrl(url) && (containsAnyIgnoreCase(url, HLS_HINTS) || containsAnyIgnoreCase(url, HLS_PATHS) ||
-                containsAnyIgnoreCase(url, DASH_HINTS) || containsAnyIgnoreCase(url, DASH_PATHS) ||
-                containsAnyIgnoreCase(url, SMOOTH_HINTS) || containsAnyIgnoreCase(url, SMOOTH_PATHS) ||
-                containsAnyIgnoreCase(url, VIDEO_HINTS) || containsAnyIgnoreCase(url, VIDEO_PATHS) ||
-                containsAnyIgnoreCase(url, AUDIO_HINTS) || containsAnyIgnoreCase(url, AUDIO_PATHS) ||
-                containsAnyIgnoreCase(url, SEGMENT_HINTS) || containsAnyIgnoreCase(url, SEGMENT_PATHS));
+        if (!isHttpUrl(url)) return false;
+        return containsIndexedHint(url, LOAD_RESOURCE_HINTS_BY_FIRST, LOAD_RESOURCE_HINTS);
+    }
+
+    private static boolean containsIndexedHint(String value, String[][] byFirst, String[] all) {
+        for (int at = 0; at < value.length(); at++) {
+            char first = value.charAt(at);
+            if (first >= 'A' && first <= 'Z') first = (char) (first + ('a' - 'A'));
+            // Non-ASCII characters can match ASCII under Java's Unicode ignore-case rules.
+            String[] candidates = first < byFirst.length ? byFirst[first] : all;
+            if (candidates == null) continue;
+            for (String token : candidates)
+                if (value.regionMatches(true, at, token, 0, token.length())) return true;
+        }
+        return false;
+    }
+
+    private static String[] collectLoadResourceHints() {
+        String[][] groups = { HLS_HINTS, HLS_PATHS, DASH_HINTS, DASH_PATHS, SMOOTH_HINTS, SMOOTH_PATHS,
+                VIDEO_HINTS, VIDEO_PATHS, AUDIO_HINTS, AUDIO_PATHS, SEGMENT_HINTS, SEGMENT_PATHS };
+        int count = 0;
+        for (String[] group : groups) count += group.length;
+        String[] tokens = new String[count];
+        int at = 0;
+        for (String[] group : groups) {
+            System.arraycopy(group, 0, tokens, at, group.length);
+            at += group.length;
+        }
+        return tokens;
+    }
+
+    private static String[] requestHints() {
+        String[] result = new String[LOAD_RESOURCE_HINTS.length + 2];
+        System.arraycopy(LOAD_RESOURCE_HINTS, 0, result, 0, LOAD_RESOURCE_HINTS.length);
+        result[result.length - 2] = "manifest";
+        result[result.length - 1] = "playlist";
+        return result;
+    }
+
+    private static String[][] indexHints(String[] hints) {
+        String[][] buckets = new String[128][];
+        int[] counts = new int[buckets.length];
+        for (String token : hints) {
+            char first = Character.toLowerCase(Character.toUpperCase(token.charAt(0)));
+            if (first < counts.length) counts[first]++;
+        }
+        for (int first = 0; first < counts.length; first++) {
+            if (counts[first] > 0) buckets[first] = new String[counts[first]];
+            counts[first] = 0;
+        }
+        for (String token : hints) {
+            char first = Character.toLowerCase(Character.toUpperCase(token.charAt(0)));
+            if (first < counts.length) buckets[first][counts[first]++] = token;
+        }
+        return buckets;
+    }
+
+    /** Fast shared filter used by legacy callers and regression tests. */
+    static boolean shouldInspectRequest(String encodedPath, String encodedQuery, String declaredMime) {
+        String rawMime = value(declaredMime);
+        if (rawMime.length() > 0 && isMediaMime(cleanMime(rawMime))) return true;
+        String path = value(encodedPath);
+        String query = value(encodedQuery);
+        if (hasPotentialMediaMarker(path) || hasPotentialMediaMarker(query)) return true;
+        if (path.indexOf('%') >= 0 || query.indexOf('%') >= 0 || path.indexOf("&amp;") >= 0 ||
+                query.indexOf("&amp;") >= 0) return true;
+        return !endsWithAnyIgnoreCase(path, STATIC_SUFFIXES);
+    }
+
+    /** Strict gate for the WebView interception hot path; opaque media is recovered after load. */
+    static boolean isLikelyMediaRequest(String encodedPath, String encodedQuery, String declaredMime) {
+        if (isMediaMimeHint(declaredMime)) return true;
+        return hasPotentialMediaMarker(value(encodedPath)) || hasPotentialMediaMarker(value(encodedQuery));
+    }
+
+    /** MIME-only continuation after the caller has already classified this URL's markers. */
+    static boolean isMediaMimeHint(String declaredMime) {
+        String rawMime = value(declaredMime);
+        return rawMime.length() > 0 && isMediaMime(cleanMime(rawMime));
     }
 
     /**
-     * Allocation-free negative gate for WebView's per-request hot path. It only rejects a known
-     * static extension when neither its path nor query can match the full classifier. Ambiguous,
-     * encoded and extensionless URLs always continue to the complete detector.
+     * Returns true for extensionless endpoints worth one request-header probe. This is
+     * intentionally narrower than shouldInspectRequest(), which must stay broad for URL-only
+     * discovery and would cause an IPC read for most JSON/XHR requests.
      */
-    static boolean shouldInspectRequest(String encodedPath, String encodedQuery, String declaredMime) {
-        String mime = cleanMime(declaredMime);
-        if (isMediaMime(mime)) return true;
+    static boolean shouldProbeMediaHeaders(String encodedPath, String encodedQuery) {
+        return shouldProbeMediaHeaders(encodedPath, encodedQuery,
+                isLikelyMediaRequest(encodedPath, encodedQuery, ""));
+    }
+
+    /** Reuses the exact URL-marker result when interception already computed it. */
+    static boolean shouldProbeMediaHeaders(String encodedPath, String encodedQuery, boolean likelyMedia) {
+        if (likelyMedia) return true;
         String path = value(encodedPath);
-        if (!endsWithAnyIgnoreCase(path, STATIC_SUFFIXES)) return true;
         String query = value(encodedQuery);
-        if (path.indexOf('%') >= 0 || query.indexOf('%') >= 0 || path.indexOf("&amp;") >= 0 || query.indexOf("&amp;") >= 0)
-            return true;
-        return hasPotentialMediaMarker(path) || hasPotentialMediaMarker(query);
+        return containsAnyIgnoreCase(path, MEDIA_ENDPOINT_HINTS) ||
+                containsAnyIgnoreCase(query, MEDIA_QUERY_HINTS);
     }
 
     synchronized List<Resource> getAll() {
@@ -241,13 +331,7 @@ final class MediaResourceSniffer {
     }
 
     private static boolean hasPotentialMediaMarker(String value) {
-        return containsAnyIgnoreCase(value, HLS_HINTS) || containsAnyIgnoreCase(value, HLS_PATHS) ||
-                containsAnyIgnoreCase(value, DASH_HINTS) || containsAnyIgnoreCase(value, DASH_PATHS) ||
-                containsAnyIgnoreCase(value, SMOOTH_HINTS) || containsAnyIgnoreCase(value, SMOOTH_PATHS) ||
-                containsAnyIgnoreCase(value, VIDEO_HINTS) || containsAnyIgnoreCase(value, VIDEO_PATHS) ||
-                containsAnyIgnoreCase(value, AUDIO_HINTS) || containsAnyIgnoreCase(value, AUDIO_PATHS) ||
-                containsAnyIgnoreCase(value, SEGMENT_HINTS) || containsAnyIgnoreCase(value, SEGMENT_PATHS) ||
-                containsIgnoreCase(value, "manifest") || containsIgnoreCase(value, "playlist");
+        return containsIndexedHint(value, REQUEST_HINTS_BY_FIRST, REQUEST_HINTS);
     }
 
     private static boolean containsAnyIgnoreCase(String value, String... tokens) {
@@ -299,7 +383,14 @@ final class MediaResourceSniffer {
     }
 
     private static boolean isHttpUrl(String url) {
-        return url != null && url.length() <= 8192 && (url.startsWith("https://") || url.startsWith("http://"));
+        return url != null && url.length() <= 8192 &&
+                (url.regionMatches(true, 0, "https://", 0, 8) || url.regionMatches(true, 0, "http://", 0, 7));
+    }
+
+    private static String normalizePageKey(String url) {
+        String key = value(url);
+        int fragment = key.indexOf('#');
+        return fragment < 0 ? key : key.substring(0, fragment);
     }
 
     private static String normalizeKey(String url) {

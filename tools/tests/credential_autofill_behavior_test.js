@@ -1,11 +1,13 @@
 'use strict';
 const fs = require('fs');
 const vm = require('vm');
-const [detectPath, fillPath, capturePath] = process.argv.slice(2);
+const [detectPath, fillPath, capturePath, overwritePath, saveFieldsPath] = process.argv.slice(2);
 if (!capturePath) throw new Error('expected detect, fill and capture scripts');
 const detect = fs.readFileSync(detectPath, 'utf8');
 const fill = fs.readFileSync(fillPath, 'utf8');
 const capture = fs.readFileSync(capturePath, 'utf8');
+const overwrite = overwritePath ? fs.readFileSync(overwritePath, 'utf8') : '';
+const saveFields = saveFieldsPath ? fs.readFileSync(saveFieldsPath, 'utf8') : '';
 
 class FakeEvent {
   constructor(type, options) { this.type = type; Object.assign(this, options || {}); }
@@ -39,7 +41,12 @@ function environment(inputs, path) {
   const storage = new Map();
   const document = {
     querySelectorAll(selector) { return selector === 'input' ? inputs : []; },
-    addEventListener(type, listener) { (handlers[type] || (handlers[type] = [])).push(listener); }
+    addEventListener(type, listener) { (handlers[type] || (handlers[type] = [])).push(listener); },
+    removeEventListener(type, listener) {
+      const list = handlers[type] || [];
+      const index = list.indexOf(listener);
+      if (index >= 0) list.splice(index, 1);
+    }
   };
   const context = {
     document,
@@ -95,22 +102,71 @@ username.value = 'person-typed';
 password.value = 'person-secret';
 state = JSON.parse(run(fill, env));
 assert(!state.filled && username.value === 'person-typed' && password.value === 'person-secret', 'existing user input was overwritten');
+if (overwrite) {
+  state = JSON.parse(run(overwrite, env));
+  assert(state.filled && username.value === 'chosen@example.com' && password.value === 'chosen-secret', 'explicit account choice did not overwrite stale fields');
+}
+
+// A global page scan must not choose an unrelated subscription/search email field.
+const subscribe = new FakeInput('email', '', 'newsletter_email');
+const unrelatedPassword = new FakeInput('password', '', 'password');
+env = environment([subscribe, unrelatedPassword], '/checkout');
+state = JSON.parse(run(fill, env));
+assert(state.filled && !state.username && subscribe.value === '', 'unrelated page email field was selected as username');
+
+// A username field explicitly associated with the password form wins over other forms.
+const loginForm = {};
+const subscribeForm = {};
+const otherSubscribe = new FakeInput('email', 'email', 'subscribe_email');
+otherSubscribe.form = subscribeForm;
+const loginName = new FakeInput('text', 'username', 'login_name');
+loginName.form = loginForm;
+const formPassword = new FakeInput('password', 'current-password', 'password');
+formPassword.form = loginForm;
+env = environment([otherSubscribe, loginName, formPassword]);
+state = JSON.parse(run(fill, env));
+assert(state.filled && state.username && loginName.value === 'a"b@example.com' && otherSubscribe.value === '', 'username selection escaped the password form');
+
+// Username-only pages may be detected, but a stored password fill must never write into them.
+const genericEmail = new FakeInput('email', '', 'email');
+env = environment([genericEmail], '/signin/identifier');
+state = JSON.parse(run(fill, env));
+assert(!state.filled && !state.username && genericEmail.value === '', 'password fill wrote username without a password field');
+
+if (saveFields) {
+  const otpOnly = new FakeInput('password', 'one-time-code', 'otp');
+  const otpEmail = new FakeInput('email', '', 'email');
+  env = environment([otpEmail, otpOnly], '/verify');
+  const capturedOtp = JSON.parse(run(saveFields, env));
+  assert(capturedOtp[0] === '' && capturedOtp[1] === '', 'save-field probe captured an OTP-only page');
+
+  const newPassword = new FakeInput('password', 'new-password', 'new_password');
+  const confirmPassword = new FakeInput('password', '', 'confirm_password');
+  const repeatPassword = new FakeInput('password', '', 'repeat_password');
+  const verification = new FakeInput('text', '', 'verification_code');
+  env = environment([verification, newPassword, confirmPassword, repeatPassword], '/register');
+  const capturedRegistration = JSON.parse(run(saveFields, env));
+  assert(capturedRegistration[0] === '' && capturedRegistration[1] === '', 'save-field probe captured a new/confirm/repeat password or verification code');
+
+  const loginPassword = new FakeInput('password', 'current-password', 'password');
+  loginPassword.value = 'login-secret';
+  const otpPassword = new FakeInput('password', 'one-time-code', 'otp');
+  otpPassword.value = '123456';
+  env = environment([otpPassword, loginPassword]);
+  const capturedLogin = JSON.parse(run(saveFields, env));
+  assert(capturedLogin[1] === 'login-secret' && capturedLogin[1] !== '123456', 'save-field probe selected an OTP over a login password');
+}
 
 username.value = 'saved@example.com';
 password.value = 'secret-one';
 env = environment([username, password]);
 run(capture, env);
+assert(!capture.includes('prompt'), 'page credential flow must not use window.prompt');
+assert(!capture.includes('0123456789abcdef0123456789abcdef'), 'capture script must not embed a page-visible token');
 const listenerCount = Object.values(env.handlers).reduce((sum, list) => sum + list.length, 0);
+assert(listenerCount === 0, 'disabled capture script must not install page listeners');
 fire(env, 'focusin', password);
 fire(env, 'submit', password);
-assert(env.prompts.some(value => value.startsWith('__MEDIAN_AUTOFILL__')), 'late autofill signal missing');
-assert(env.prompts.some(value => value.startsWith('__MEDIAN_CREDENTIAL__')), 'trusted login capture missing');
-
-const updatedCapture = capture.replace('0123456789abcdef0123456789abcdef', 'fedcba9876543210fedcba9876543210');
-run(updatedCapture, env);
-assert(Object.values(env.handlers).reduce((sum, list) => sum + list.length, 0) === listenerCount, 'capture listeners duplicated');
-password.value = 'secret-two';
-fire(env, 'submit', password);
-const lastCapture = env.prompts.filter(value => value.startsWith('__MEDIAN_CREDENTIAL__')).pop();
-assert(lastCapture.includes('fedcba9876543210fedcba9876543210'), 'reinstalled capture did not rotate its token');
+assert(env.prompts.length === 0, 'page events must not trigger native credential prompts');
+assert(!env.context.__medianCredentialCapture, 'page-visible credential state must not be created');
 console.log('Credential autofill behavior passed');

@@ -38,6 +38,7 @@ final class InitialNavigationGuard {
     boolean isAcknowledged() { return acknowledged; }
 
     private static boolean isNetworkUrl(String url) {
-        return url != null && (url.startsWith("https://") || url.startsWith("http://"));
+        return url != null && (url.regionMatches(true, 0, "https://", 0, 8) ||
+                url.regionMatches(true, 0, "http://", 0, 7));
     }
 }

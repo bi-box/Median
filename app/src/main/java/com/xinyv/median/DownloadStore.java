@@ -142,6 +142,17 @@ final class DownloadStore {
         }
     }
 
+    /** Clear only the rolled-back destination, without replaying a stale task status. */
+    void clearAdaptiveLocalUri(long id, String expectedUri) {
+        synchronized (LOCK) {
+            Item item = findLocked(id);
+            if (item == null || !item.isAdaptive() || !value(expectedUri).equals(value(item.localUri))) return;
+            item.localUri = "";
+            item.updatedAt = System.currentTimeMillis();
+            persistLocked();
+        }
+    }
+
     void updateMetadata(long id, String filename, String mime) {
         synchronized (LOCK) {
             Item item = findLocked(id);

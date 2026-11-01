@@ -9,7 +9,6 @@ final class ErrorText {
         String message = error.getMessage();
         if (message == null || (message = message.trim()).length() == 0)
             message = error.getClass().getSimpleName();
-        return maxLength > 0 && message.length() > maxLength
-                ? message.substring(0, maxLength) : message;
+        return maxLength > 0 ? UiText.ellipsize(message, maxLength) : message;
     }
 }

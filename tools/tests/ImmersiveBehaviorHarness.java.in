@@ -1,0 +1,420 @@
+import java.util.ArrayList;
+import java.util.List;
+
+/** Host fixture. Every gesture/state transition method below is injected from production. */
+public final class ImmersiveBehaviorSelfTest {
+    private final WebView webView = new WebView();
+    private final View rootFrame = new View();
+    private final View webContainer = new View();
+    private final View topBar = new View();
+    private final View bottomBar = new View();
+    private final ProgressBar progressBar = new ProgressBar();
+    private final View statusBarBackground = new View();
+    private final View navigationBarBackground = new View();
+    private View activeOverlay, customView;
+    private boolean activityDestroyed, chromeHiddenByScroll;
+    private boolean immersivePageLayout = true, immersiveScrollChrome = true;
+    private boolean immersiveGestureActive, immersiveGestureDirectionLocked, immersiveGestureVertical;
+    private boolean immersiveGestureStartHidden;
+    private float immersiveGestureDownX, immersiveGestureDownY, immersiveGestureX, immersiveGestureY;
+    private float immersiveGestureStartOffset, immersiveGestureOffset;
+    private boolean keyboardVisible, pictureInPicture, reduced, systemBarsHidden;
+    private int systemInsetTop = 24, systemInsetBottom = 16, renderedProgress = 35;
+    private int pendingProgress;
+    private boolean progressUpdatePending;
+    private String currentPageUrl = "https://example.test/article";
+    private static int checks;
+    private static final List<String> failures = new ArrayList<String>();
+
+    private int dp(int value) { return value; }
+    private boolean reduceMotion() { return reduced; }
+    private boolean isInPictureInPictureMode() { return pictureInPicture; }
+    private boolean isNetworkPage(String value) { return value != null && value.startsWith("https://"); }
+    private int progressStep() { return 8; }
+    private void setImmersiveSystemBars(boolean hidden) { systemBarsHidden = hidden; }
+    private void updateChromeInsets() { updateSystemBarBackgrounds(); updatePageMargins(); }
+    private void applyPageInsets() { updateChromeInsets(); }
+
+    /* @IMMERSIVETOUCH@ */
+    /* @HIDECHROME@ */
+    /* @SHOWCHROME@ */
+    /* @SETTLECHROME@ */
+    /* @CHROMEOFFSET@ */
+    /* @CANCELCHROME@ */
+    /* @APPLYCHROME@ */
+    /* @SYNCPROGRESS@ */
+    /* @RESETCHROME@ */
+    /* @CLAMP@ */
+    /* @UPDATELAYOUT@ */
+    /* @PAGEMARGINS@ */
+    /* @SYSTEMBACKGROUNDS@ */
+    /* @PROGRESS@ */
+
+    private static final class Motion {
+        /* @DRAWABLE@ */
+    }
+
+    private static final class MotionEvent {
+        static final int ACTION_DOWN = 0, ACTION_UP = 1, ACTION_MOVE = 2, ACTION_CANCEL = 3;
+        private final int action, pointers;
+        private final float rawX, rawY;
+        MotionEvent(int action, float rawX, float rawY, int pointers) {
+            this.action = action; this.rawX = rawX; this.rawY = rawY; this.pointers = pointers;
+        }
+        int getActionMasked() { return action; }
+        float getRawX() { return rawX; }
+        float getRawY() { return rawY; }
+        int getPointerCount() { return pointers; }
+    }
+    private static final class ViewConfiguration {
+        static ViewConfiguration get(Object ignored) { return new ViewConfiguration(); }
+        int getScaledTouchSlop() { return 8; }
+    }
+    private static final class FrameLayout {
+        static final class LayoutParams { int topMargin, bottomMargin, height; }
+    }
+    private static class View {
+        static final int VISIBLE = 0, INVISIBLE = 4, GONE = 8;
+        float translationY, alpha = 1f;
+        int height = 62, visibility = VISIBLE, insetRequests, layoutWrites;
+        final FrameLayout.LayoutParams params = new FrameLayout.LayoutParams();
+        final Animator animator = new Animator(this);
+        final List<Runnable> frames = new ArrayList<Runnable>();
+        int getHeight() { return height; }
+        float getTranslationY() { return translationY; }
+        void setTranslationY(float value) { translationY = value; }
+        float getAlpha() { return alpha; }
+        void setAlpha(float value) { alpha = value; }
+        int getVisibility() { return visibility; }
+        void setVisibility(int value) { visibility = value; }
+        Object getContext() { return this; }
+        Object getLayoutParams() { return params; }
+        void setLayoutParams(Object value) { layoutWrites++; }
+        void requestApplyInsets() { insetRequests++; }
+        Animator animate() { return animator; }
+        void postOnAnimation(Runnable runnable) { frames.add(runnable); }
+        void frame() {
+            List<Runnable> work = new ArrayList<Runnable>(frames);
+            frames.clear();
+            for (Runnable runnable : work) runnable.run();
+        }
+    }
+    private static final class WebView extends View { }
+    private static final class ProgressBar extends View {
+        int progress;
+        void setProgress(int value) { progress = value; }
+        void setProgress(int value, boolean animated) { progress = value; }
+    }
+    private static final class Animator {
+        final View view;
+        Float targetAlpha, targetTranslation;
+        Runnable end;
+        long duration;
+        Animation running;
+        int starts, cancels;
+        Animator(View view) { this.view = view; }
+        Animator alpha(float value) { targetAlpha = value; return this; }
+        Animator translationY(float value) { targetTranslation = value; return this; }
+        Animator setDuration(long value) { duration = value; return this; }
+        Animator withEndAction(Runnable value) { end = value; return this; }
+        void start() {
+            running = new Animation(this, targetAlpha, targetTranslation, end);
+            starts++; targetAlpha = null; targetTranslation = null; end = null;
+        }
+        void cancel() {
+            cancels++;
+            if (running != null) running.cancelled = true;
+            running = null; targetAlpha = null; targetTranslation = null; end = null;
+        }
+    }
+    private static final class Animation {
+        final Animator animator;
+        final Float alpha, translation;
+        final float startAlpha, startTranslation;
+        final Runnable end;
+        boolean cancelled, finished;
+        Animation(Animator animator, Float alpha, Float translation, Runnable end) {
+            this.animator = animator; this.alpha = alpha; this.translation = translation; this.end = end;
+            startAlpha = animator.view.alpha; startTranslation = animator.view.translationY;
+        }
+        void sample(float fraction) {
+            if (cancelled || finished || animator.running != this) return;
+            if (alpha != null) animator.view.alpha = startAlpha + (alpha - startAlpha) * fraction;
+            if (translation != null) animator.view.translationY = startTranslation + (translation - startTranslation) * fraction;
+        }
+        void finish() {
+            if (cancelled || finished || animator.running != this) return;
+            sample(1f); finished = true; animator.running = null;
+            if (end != null) end.run();
+        }
+    }
+
+    private void event(int action, float x, float y) {
+        observeImmersiveTouch(webView, new MotionEvent(action, x, y, 1));
+    }
+    private void finishAnimations() {
+        for (View view : new View[] { topBar, bottomBar, progressBar }) {
+            if (view.animator.running != null) view.animator.running.finish();
+        }
+    }
+    private void idleFrames() {
+        for (int i = 0; i < 12; i++) {
+            rootFrame.frame(); webView.frame(); topBar.frame(); bottomBar.frame(); progressBar.frame();
+            finishAnimations();
+        }
+    }
+    private static ImmersiveBehaviorSelfTest shown() {
+        ImmersiveBehaviorSelfTest host = new ImmersiveBehaviorSelfTest();
+        host.progressBar.progress = 35;
+        host.updatePageMargins();
+        return host;
+    }
+    private static void check(boolean condition, String message) {
+        checks++;
+        if (!condition) throw new AssertionError(message);
+    }
+    private static void near(float actual, float expected, String message) {
+        check(Math.abs(actual - expected) < .001f, message + ": expected " + expected + ", got " + actual);
+    }
+    private static void shownBars(ImmersiveBehaviorSelfTest host, String reason) {
+        check(!host.chromeHiddenByScroll, reason + ": logical chrome state is shown");
+        check(host.topBar.visibility == View.VISIBLE && host.bottomBar.visibility == View.VISIBLE,
+                reason + ": both bars are visible");
+        near(host.topBar.translationY, 0, reason + ": top is at rest");
+        near(host.bottomBar.translationY, 0, reason + ": bottom is at rest");
+        near(host.topBar.alpha, 1, reason + ": top is opaque");
+        near(host.bottomBar.alpha, 1, reason + ": bottom is opaque");
+    }
+    private static void activeProgress(ImmersiveBehaviorSelfTest host, String reason) {
+        check(host.progressBar.visibility == View.VISIBLE, reason + ": active loading progress is visible");
+        check(host.progressBar.progress == host.renderedProgress, reason + ": loading progress value is restored");
+        near(host.progressBar.alpha, 1, reason + ": loading progress is opaque");
+        near(host.progressBar.translationY, 0, reason + ": progress has no residual translation");
+    }
+    private static void run(String name, Runnable test) {
+        try { test.run(); System.out.println("PASS " + name); }
+        catch (Throwable error) { failures.add(name + ": " + error); System.out.println("FAIL " + name + ": " + error); }
+    }
+
+    private static void beforeSlopIsUnchanged() {
+        ImmersiveBehaviorSelfTest host = shown();
+        int topStarts = host.topBar.animator.starts, bottomStarts = host.bottomBar.animator.starts;
+        int layoutWrites = host.webContainer.layoutWrites;
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 101, 397);
+        host.event(MotionEvent.ACTION_MOVE, 100, 393);
+        host.idleFrames();
+        shownBars(host, "before touch slop");
+        activeProgress(host, "before touch slop");
+        check(host.topBar.animator.starts == topStarts && host.bottomBar.animator.starts == bottomStarts,
+                "pre-slop movement starts no bar animations");
+        check(host.webContainer.layoutWrites == layoutWrites, "pre-slop movement preserves the page viewport");
+        host.event(MotionEvent.ACTION_UP, 100, 393);
+        host.finishAnimations();
+        shownBars(host, "tap release");
+    }
+
+    private static void verticalLockKeepsFollowing() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        float top = host.topBar.translationY, bottom = host.bottomBar.translationY;
+        check(top < 0 && bottom > 0, "vertical movement begins hiding both bars");
+        host.event(MotionEvent.ACTION_MOVE, 104, 375);
+        near(host.topBar.translationY, top - 1, "micro horizontal jitter preserves vertical lock");
+        near(host.bottomBar.translationY, bottom + 1, "bottom bar follows the same one-pixel move");
+        host.event(MotionEvent.ACTION_MOVE, 180, 374);
+        near(host.topBar.translationY, top - 2, "direction remains locked after later horizontal travel");
+        check(host.webContainer.params.topMargin == 86 && host.webContainer.params.bottomMargin == 78,
+                "dragging bars keeps the WebView viewport stable");
+    }
+
+    private static void clampReversalIsImmediate() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 200);
+        near(host.topBar.translationY, -62, "large upward movement reaches the top bound");
+        near(host.bottomBar.translationY, 62, "large upward movement reaches the bottom bound");
+        host.event(MotionEvent.ACTION_MOVE, 100, 199);
+        host.event(MotionEvent.ACTION_MOVE, 100, 200);
+        near(host.topBar.translationY, -61, "one pixel reversal responds immediately after clamping");
+        near(host.bottomBar.translationY, 61, "both bars reverse without a boundary dead zone");
+        check(host.topBar.alpha > 0 && host.bottomBar.alpha > 0, "the reverse move starts revealing the bars");
+    }
+
+    private static void holdingFingerDoesNotContinue() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        float top = host.topBar.translationY, bottom = host.bottomBar.translationY, alpha = host.topBar.alpha;
+        int starts = host.topBar.animator.starts + host.bottomBar.animator.starts;
+        for (int i = 0; i < 8; i++) {
+            host.event(MotionEvent.ACTION_MOVE, 100, 376);
+            host.idleFrames();
+        }
+        near(host.topBar.translationY, top, "stationary touch does not keep moving top chrome");
+        near(host.bottomBar.translationY, bottom, "stationary touch does not keep moving bottom chrome");
+        near(host.topBar.alpha, alpha, "stationary touch does not keep fading chrome");
+        check(host.topBar.animator.starts + host.bottomBar.animator.starts == starts,
+                "active drag does not enqueue independent settle animations");
+    }
+
+    private static void touchingMidAnimationDoesNotJump() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.hideBrowserChrome();
+        Animation oldTop = host.topBar.animator.running, oldBottom = host.bottomBar.animator.running;
+        check(oldTop != null && oldBottom != null, "test starts an asynchronous hide");
+        oldTop.sample(.4f); oldBottom.sample(.4f);
+        float top = host.topBar.translationY, bottom = host.bottomBar.translationY;
+        float alpha = host.topBar.alpha;
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        check(oldTop.cancelled && oldBottom.cancelled, "DOWN cancels the running toolbar animations");
+        near(host.topBar.translationY, top, "DOWN captures the visible hide offset instead of the target state");
+        near(host.bottomBar.translationY, bottom, "DOWN preserves the bottom bar's current offset");
+        near(host.topBar.alpha, alpha, "DOWN preserves intermediate alpha");
+        host.event(MotionEvent.ACTION_MOVE, 100, 391);
+        near(host.topBar.translationY, top - 1, "first locked movement consumes only travel beyond slop");
+        oldTop.finish(); oldBottom.finish(); host.idleFrames();
+        near(host.topBar.translationY, top - 1, "cancelled animation cannot overwrite active finger tracking");
+
+        host = shown();
+        host.hideBrowserChrome(); host.finishAnimations();
+        host.showBrowserChrome(true);
+        oldTop = host.topBar.animator.running; oldBottom = host.bottomBar.animator.running;
+        check(oldTop != null && oldBottom != null, "test starts an asynchronous reveal");
+        oldTop.sample(.6f); oldBottom.sample(.6f);
+        top = host.topBar.translationY; alpha = host.topBar.alpha;
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        near(host.topBar.translationY, top, "DOWN also captures an unfinished reveal");
+        near(host.topBar.alpha, alpha, "unfinished reveal alpha does not jump");
+    }
+
+    private static void loadingUpdatesKeepGestureGeometry() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        float top = host.topBar.translationY, alpha = host.topBar.alpha;
+        host.scheduleProgressUpdate(60); host.rootFrame.frame();
+        check(host.renderedProgress == 60 && host.progressBar.progress == 60,
+                "a load update during a gesture renders its new value");
+        near(host.progressBar.translationY, top, "load update preserves the toolbar's drag translation");
+        near(host.progressBar.alpha, alpha, "load update preserves the toolbar's drag alpha");
+        check(host.progressBar.visibility == View.VISIBLE, "partially visible chrome retains active progress");
+        host.event(MotionEvent.ACTION_CANCEL, 100, 376); host.idleFrames();
+        activeProgress(host, "cancel after a load update");
+    }
+
+    private static void cancellationRestoresShownAndProgress() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        check(host.topBar.translationY < 0, "test reaches an intermediate drag state");
+        host.event(MotionEvent.ACTION_CANCEL, 100, 376);
+        host.idleFrames();
+        check(!host.immersiveGestureActive, "cancel clears gesture ownership");
+        shownBars(host, "cancel from shown");
+        activeProgress(host, "cancel from shown");
+
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        host.activeOverlay = new View();
+        host.event(MotionEvent.ACTION_CANCEL, 100, 376);
+        host.idleFrames();
+        check(!host.immersiveGestureActive, "overlay appearing before CANCEL does not retain gesture state");
+        shownBars(host, "overlay cancellation");
+        activeProgress(host, "overlay cancellation");
+    }
+
+    private static void cancellationRestoresHidden() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.hideBrowserChrome(); host.finishAnimations();
+        check(host.chromeHiddenByScroll && host.topBar.visibility == View.INVISIBLE, "test starts from hidden chrome");
+        host.event(MotionEvent.ACTION_DOWN, 100, 200);
+        host.event(MotionEvent.ACTION_MOVE, 100, 224);
+        check(host.topBar.alpha > 0, "test reveals some initially hidden chrome");
+        host.event(MotionEvent.ACTION_CANCEL, 100, 224);
+        host.idleFrames();
+        check(host.chromeHiddenByScroll && host.topBar.visibility == View.INVISIBLE && host.bottomBar.visibility == View.INVISIBLE,
+                "cancel from hidden restores the initial hidden state");
+        check(host.progressBar.visibility == View.GONE, "hidden cancellation keeps loading progress hidden");
+        check(!host.immersiveGestureActive, "hidden cancellation releases gesture ownership");
+    }
+
+    private static void repeatedShowRepairsIntermediateState() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        host.showBrowserChrome(false);
+        host.idleFrames();
+        shownBars(host, "show during an intermediate drag");
+        activeProgress(host, "show during an intermediate drag");
+        host.showBrowserChrome(false); host.idleFrames();
+        shownBars(host, "repeated show");
+
+        host.hideBrowserChrome(); host.finishAnimations();
+        host.showBrowserChrome(true);
+        Animation oldTop = host.topBar.animator.running, oldBottom = host.bottomBar.animator.running;
+        if (oldTop != null) oldTop.sample(.4f);
+        if (oldBottom != null) oldBottom.sample(.4f);
+        host.showBrowserChrome(false); host.idleFrames();
+        if (oldTop != null) oldTop.finish();
+        if (oldBottom != null) oldBottom.finish();
+        shownBars(host, "show interrupting an unfinished reveal");
+    }
+
+    private static void exitingImmersiveRestoresOrdinaryChrome() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.hideBrowserChrome(); host.finishAnimations();
+        host.immersiveScrollChrome = false;
+        host.updateImmersivePageLayout(); host.idleFrames();
+        check(!host.immersivePageLayout && !host.immersiveGestureActive, "disabling immersive mode clears its layout and gesture state");
+        shownBars(host, "leaving immersive mode");
+        activeProgress(host, "leaving immersive mode");
+        check(!host.systemBarsHidden, "leaving immersive mode restores system bars");
+        check(host.webContainer.params.topMargin == 62 && host.webContainer.params.bottomMargin == 62,
+                "ordinary layout reserves normal space for both toolbars");
+
+        host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        host.currentPageUrl = "about:blank";
+        host.updateImmersivePageLayout(); host.idleFrames();
+        shownBars(host, "navigating from a drag to a non-network page");
+        activeProgress(host, "navigating from a drag to a non-network page");
+    }
+
+    private static void pipExitRepairsChrome() {
+        ImmersiveBehaviorSelfTest host = shown();
+        host.event(MotionEvent.ACTION_DOWN, 100, 400);
+        host.event(MotionEvent.ACTION_MOVE, 100, 376);
+        host.pictureInPicture = true;
+        host.topBar.visibility = View.INVISIBLE;
+        host.bottomBar.visibility = View.INVISIBLE;
+        host.progressBar.visibility = View.GONE;
+        host.event(MotionEvent.ACTION_CANCEL, 100, 376);
+        check(!host.immersiveGestureActive, "PiP cancellation clears the gesture");
+        check(host.topBar.visibility == View.INVISIBLE && host.bottomBar.visibility == View.INVISIBLE,
+                "cancellation during PiP keeps chrome out of the PiP window");
+        host.pictureInPicture = false;
+        host.showBrowserChrome(false); host.idleFrames();
+        shownBars(host, "PiP exit");
+        activeProgress(host, "PiP exit");
+        check(!host.systemBarsHidden, "PiP exit restores ordinary system bar state");
+    }
+
+    public static void main(String[] args) {
+        run("touch slop preserves chrome, loading progress, and viewport", () -> beforeSlopIsUnchanged());
+        run("vertical direction stays locked despite later horizontal jitter", () -> verticalLockKeepsFollowing());
+        run("clamped chrome reverses on the very next pixel", () -> clampReversalIsImmediate());
+        run("stationary finger has no autonomous toolbar motion", () -> holdingFingerDoesNotContinue());
+        run("DOWN captures unfinished toolbar animations without jumping", () -> touchingMidAnimationDoesNotJump());
+        run("loading progress keeps gesture translation and alpha", () -> loadingUpdatesKeepGestureGeometry());
+        run("CANCEL restores shown chrome and active progress", () -> cancellationRestoresShownAndProgress());
+        run("CANCEL restores initially hidden chrome", () -> cancellationRestoresHidden());
+        run("repeated show repairs drag and animation intermediate states", () -> repeatedShowRepairsIntermediateState());
+        run("exiting immersive mode restores ordinary chrome and page space", () -> exitingImmersiveRestoresOrdinaryChrome());
+        run("PiP cancellation and exit restore chrome and active progress", () -> pipExitRepairsChrome());
+        System.out.println("ImmersiveBehaviorSelfTest: " + checks + " assertions, " + failures.size() + " failed cases");
+        if (!failures.isEmpty()) throw new AssertionError(failures.toString());
+    }
+}

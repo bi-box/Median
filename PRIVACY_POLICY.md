@@ -1,48 +1,37 @@
-# Median Browser Privacy Policy / 隐私政策
+# 隐私政策
 
-Last updated / 最后更新：2026-08-10
+**适用版本：** Median Browser 2.4.0  
+**更新日期：** 2026-10-18
 
-Median Browser is a local-first Android browser. The application developer does not operate a Median account, synchronization server, advertising network, analytics service, or telemetry backend in this release.
+Median Browser 是一款本地优先的 Android 浏览器。应用没有开发者运营的账号或同步服务器，也未集成广告、分析或崩溃遥测 SDK。此说明解释应用本地数据的保存方式，以及使用网页和其他网络功能时会发生什么。
 
-Median Browser 是一款本地优先的 Android 浏览器。本版本不提供 Median 账户或同步服务器，也不集成广告、分析或遥测后台。
+## 保存在设备上的数据
 
-## Data stored on the device / 设备本地数据
+书签、历史记录、标签会话、网站设置、密码、用户脚本、下载记录、过滤规则和离线页面默认保存在你的设备上。Median 不会通过自有同步服务收集这些数据。
 
-The app may store bookmarks, browsing history, open-tab sessions, site preferences, cookies, website storage, downloads and download records, offline pages, filter lists, user scripts, saved passwords, and settings on the user's device. Saved passwords are protected with Android Keystore and AES-GCM. User-created full backups are encrypted with the password chosen by the user.
+密码库使用 Android Keystore 与 AES-GCM 保护本地凭据。通过应用导出的备份由你设置密码；请妥善保存备份文件和密码。卸载应用、清除应用数据、设备损坏或重置可能导致本地数据丢失。
 
-应用可在设备上保存书签、浏览历史、标签会话、网站设置、Cookie、网站存储、下载文件及记录、离线页面、过滤规则、用户脚本、密码和偏好。密码库由 Android Keystore 与 AES-GCM 保护；完整备份使用用户设置的密码加密。
+## 使用网络功能时
 
-## Network requests / 网络请求
+浏览器需要连接互联网才能访问网页。你打开的网站会收到相应请求，并可能按其自己的政策处理访问数据。搜索会将查询发送给你选择的搜索服务；翻译、过滤订阅更新、脚本安装或更新、下载和其他在线功能会连接相应服务。
 
-When the user visits a page, searches, translates content, updates a filter subscription, installs a user script, or downloads a file, the relevant website or service receives a normal network request and may receive the IP address, user agent, request URL, cookies, form data, or other information necessary for that action. Those third parties process data under their own policies. Median does not proxy browser traffic through a developer-operated server.
+这些请求由你所使用的网站或服务处理，不代表它们由 Median 运营。具体数据处理方式请查看相应服务的隐私说明。
 
-当用户访问网页、搜索、翻译、更新过滤订阅、安装用户脚本或下载文件时，对应网站或服务会收到正常网络请求，并可能接收 IP 地址、用户代理、请求网址、Cookie、表单内容或完成操作所需的其他信息。第三方按其自身政策处理数据。Median 不通过开发者运营的服务器中转浏览流量。
+## 隐私窗口
 
-## Permissions / 权限
+隐私窗口使用独立的本地浏览会话，并在退出时清理该会话数据。它用于减少浏览数据留在本机，不会隐藏访问网站产生的网络流量，也不替代 VPN 或其他网络匿名服务。
 
-- Camera and microphone: provided only after a secure webpage requests them and the user grants Android permission.
-- Location: provided only after a secure webpage requests it and the user grants permission.
-- Notifications and foreground service: used to display and control active downloads.
-- Network state and wake lock: used only to enforce download constraints and keep an active file transfer complete. Normal browsing does not hold a Wi-Fi performance lock.
+## 权限与文件
 
-摄像头、麦克风和位置仅在 HTTPS 页面主动请求、页面来源匹配且用户授权后提供。通知与前台服务用于显示和控制下载；网络状态与唤醒锁只用于执行下载约束并保证正在传输的文件完整结束，普通浏览不会持有 Wi-Fi 性能锁。
+摄像头、麦克风、定位、通知及安装下载文件等能力，会在相应功能需要时由 Android 或浏览器请求。只授予你理解且确实需要的权限。下载、离线页面和导出的备份可能保存在浏览器数据目录之外；删除应用不一定会删除这些文件。
 
-## User scripts / 用户脚本
+## 用户脚本
 
-User scripts are third-party code. A script may modify pages and, when explicitly granted, request cross-origin resources, use the clipboard, start downloads, or open tabs. Median limits declared permissions and connection targets, but users should install scripts only from trusted sources.
+用户脚本是你主动安装的第三方代码，可能读取其匹配网页中的内容，并按其权限连接其他服务。请检查脚本来源、匹配网站和请求权限；网站或脚本服务的隐私规则由其提供方决定。
 
-用户脚本属于第三方代码。脚本在明确获得权限后可修改网页、跨域请求、使用剪贴板、发起下载或打开标签页。Median 会限制声明权限和连接目标，但用户仍应只安装可信脚本。
+## 联系维护者
 
-## Sharing, retention, and deletion / 分享、保留与删除
+隐私问题或数据处理疑问，请通过[项目 GitHub 页面](https://github.com/bi-box/Median)联系维护者。请勿在公开问题中发布密码、Cookie、完整浏览记录或其他敏感个人信息。
 
-The developer does not sell personal data. The app itself does not send local browser records to the developer. Local data remains until the user clears it, removes individual items, deletes exported files, or uninstalls the app. Data sent directly to user-selected websites and services is governed by those services.
+项目的完整数据说明以本文件为准。操作系统、System WebView、你访问的网站和主动选择的第三方服务，分别适用各自的隐私政策。
 
-开发者不出售个人数据，应用本身不会把本地浏览记录发送给开发者。本地数据会保留至用户清除、删除对应项目或导出文件，或卸载应用。直接发送给用户选择的网站和服务的数据由对应服务管理。
-
-## Children / 儿童
-
-Median Browser is a general-purpose browser and is not specifically directed to children. Website content and third-party services are outside the developer's control. Guardians should use Android and website parental controls where appropriate.
-
-## Contact / 联系方式
-
-For privacy requests, use the developer contact address shown on the Google Play listing. For a GitHub build, use the repository's Security or Issues section, as appropriate. The public policy URL and contact channel must be verified before each release.

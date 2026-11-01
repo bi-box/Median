@@ -12,19 +12,38 @@ for p in Path('app/src/main').rglob('*.xml'):
 print('Android XML parse passed')
 PY
 
+node tools/tests/startup_script_registration_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/startup_compat_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/webview_startup_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/startup_data_loader_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/adblock_startup_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/main_connection_hints_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/home_customization_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/home_history_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/userscript_network_behavior_test.js --jdk "${JAVA_HOME:-}"
+node tools/tests/release_performance_behavior_test.js --jdk "${JAVA_HOME:-}"
+
 if rg -n 'addJavascriptInterface|MIXED_CONTENT_ALWAYS_ALLOW|setAllowFileAccess\(true\)|setAllowUniversalAccessFromFileURLs\(true\)|setInstanceFollowRedirects\(true\)' app/src/main; then
   echo 'Unsafe WebView or redirect surface found.' >&2
   exit 1
 fi
-if rg -n 'median-debug|STOREPASS:-android|versionName=.1\.3\.|Median Browser 1\.2' --glob '!CHANGELOG.md' --glob '!UPGRADE_NOTES.md' --glob '!tools/static_checks.sh' .; then
+if rg -n 'median-debug|STOREPASS:-android|versionName=.1\.3\.|Median Browser 1\.2' --glob '!CHANGELOG.md' --glob '!UPGRADE_NOTES.md' --glob '!tools/static_checks.sh' --glob '!out/**' --glob '!_oldsource/**' .; then
   echo 'Stale release/debug metadata found.' >&2
   exit 1
 fi
-rg -q "medianVersionCode = 92" app/build.gradle
-rg -q "medianVersionName = '2.3.0'" app/build.gradle
-rg -Fq 'VERSION_CODE="${VERSION_CODE:-92}"' tools/build_500kb_apk.sh
-rg -Fq 'export VERSION_CODE="${VERSION_CODE:-92}"' tools/build_signed_update.sh
-rg -q "applicationId 'com.xinyv.median.compat'" app/build.gradle
+if [[ -e gradle.local.properties ]] || find . -path './out' -prune -o -path './_oldsource' -prune -o -name '*.p12' -print | grep -q .; then
+  echo 'Release signing material must stay outside the source delivery tree.' >&2
+  exit 1
+fi
+if rg -n '^[[:space:]]*MEDIAN_(KEYSTORE|STOREPASS|KEY_ALIAS|KEYPASS)=' gradle.properties gradle.local.properties 2>/dev/null; then
+  echo 'Signing secrets must be supplied through the environment or an external private file.' >&2
+  exit 1
+fi
+rg -q "medianVersionCode = 103" app/build.gradle
+rg -q "medianVersionName = '2.4.0'" app/build.gradle
+rg -Fq 'VERSION_CODE="${VERSION_CODE:-103}"' tools/build_500kb_apk.sh
+rg -Fq 'export VERSION_CODE="${VERSION_CODE:-103}"' tools/build_signed_update.sh
+rg -Fq "getOrElse('com.xinyv.median.compat')" app/build.gradle
 rg -q 'targetSdk 36' app/build.gradle
 if rg -n '^[[:space:]]*implementation[[:space:]]' app/build.gradle; then
   echo 'Unexpected production runtime dependency found; the focused WebKit slice must remain self-contained.' >&2
@@ -32,23 +51,63 @@ if rg -n '^[[:space:]]*implementation[[:space:]]' app/build.gradle; then
 fi
 rg -Fq 'WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'WebViewCompat.addDocumentStartJavaScript' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq 'applyDarkMode(target);' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq 'WebSettingsCompat.setAlgorithmicDarkeningAllowed(target.getSettings(), enabled)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'applyDarkMode(target, settings);' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, enabled)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'public static final String ALGORITHMIC_DARKENING = "ALGORITHMIC_DARKENING"' app/src/main/java/androidx/webkit/WebViewFeature.java
 rg -Fq 'InvocationHandler getWebkitToCompatConverter()' app/src/main/java/org/chromium/support_lib_boundary/WebViewProviderFactoryBoundaryInterface.java
 rg -Fq 'InvocationHandler convertSettings(WebSettings webSettings)' app/src/main/java/org/chromium/support_lib_boundary/WebkitToCompatConverterBoundaryInterface.java
 rg -Fq 'void setAlgorithmicDarkeningAllowed(boolean allow)' app/src/main/java/org/chromium/support_lib_boundary/WebSettingsBoundaryInterface.java
 rg -Fq '<style name="AppThemeDark"' app/src/main/res/values/styles.xml
-rg -Fq '<item name="android:isLightTheme">true</item>' app/src/main/res/values/styles.xml
-rg -Fq '<item name="android:isLightTheme">false</item>' app/src/main/res/values/styles.xml
+rg -Fq '<item name="android:isLightTheme">true</item>' app/src/main/res/values-v29/styles.xml
+rg -Fq '<item name="android:isLightTheme">false</item>' app/src/main/res/values-v29/styles.xml
 rg -Fq 'refreshActiveSheetTheme();' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, false)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'source.evaluateJavascript(AdPickerScript.hide(selector, requirePickedIdentity), new ValueCallback<String>()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'uiHandler.postDelayed(vaultLock, VAULT_UNLOCK_WINDOW_MS)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'void lock()' app/src/main/java/com/xinyv/median/PasswordVault.java
+rg -Fq 'action == MotionEvent.ACTION_POINTER_DOWN' app/src/main/java/com/xinyv/median/EdgeNavigationController.java
 rg -Fq '.search input{border:0;outline:0;font-size:17px;flex:1;min-width:0;background:transparent' app/src/main/java/com/xinyv/median/HomePage.java
 rg -Fq 'InternalNavigationPolicy.canHandleCommand' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'InternalNavigationPolicy.shouldClearHomeTrust' app/src/main/java/com/xinyv/median/MainActivity.java
-if rg -n '网页无权调用浏览器内部功能|MutationObserver|getComputedStyle|proceduralScriptForHost|AggressivePerformanceController|PerformanceHintManager|preferredRefreshRate|THREAD_PRIORITY_DISPLAY' app/src/main/java/com/xinyv/median; then
+if rg -n '网页无权调用浏览器内部功能|proceduralScriptForHost|AggressivePerformanceController|PerformanceHintManager|preferredRefreshRate|THREAD_PRIORITY_DISPLAY' app/src/main/java/com/xinyv/median; then
   echo 'Intrusive internal-command errors or continuous/aggressive page work returned.' >&2
   exit 1
 fi
+if rg -n 'MutationObserver' app/src/main/java/com/xinyv/median --glob '!ConnectionPreconnectScript.java'; then
+  echo 'Page mutation observers are limited to the bounded document-head connection hint.' >&2
+  exit 1
+fi
+python3 - <<'PY'
+from pathlib import Path
+import json
+import re
+
+source = Path('app/src/main/java/com/xinyv/median/ConnectionPreconnectScript.java').read_text(encoding='utf-8')
+literals = re.findall(r'"(?:\\.|[^"\\])*"', source)
+script = ''.join(json.loads(value) for value in literals)
+# Lock the entire observer callback and teardown, not just the observer's file location.
+# It can only await document.head, disconnects before adding at most four hints,
+# and always expires after two seconds even if the head never appears.
+bounded_suffix = (
+    '],m=null,t=0;function stop(){if(m)m.disconnect();if(t)clearTimeout(t);}'
+    'function add(){var h=document.head;if(!h)return false;stop();'
+    "for(var i=0;i<a.length;i++){if(s.length>=4||s.indexOf(a[i])>=0)continue;s.push(a[i]);var p=document.createElement('link');"
+    "p.rel='preconnect';p.href=a[i];p.setAttribute('data-median-connection','');h.appendChild(p);"
+    "var d=document.createElement('link');d.rel='dns-prefetch';d.href=a[i];h.appendChild(d);}return true;}"
+    'if(!add()){m=new MutationObserver(add);m.observe(document,{childList:true,subtree:true});'
+    't=setTimeout(stop,2000);}}catch(_){}})();'
+)
+assert script.endswith(bounded_suffix), 'Connection hints must retain the bounded head-only observer and complete teardown'
+assert source.count('MutationObserver') == 1 and script.count('.observe(') == 1, 'Only one document-head observer is allowed'
+assert script.count('setTimeout(') == 1 and script.count('document.head') == 1, 'Connection hints must have only their single head wait and two-second timeout'
+print('Bounded document-head connection observer constraints passed')
+PY
+# Manual picking has bounded style reads (32 normally, 132 for explicit tile groups); background scans stay banned.
+if rg -n 'getComputedStyle' app/src/main/java/com/xinyv/median --glob '!AdPickerScript.java'; then
+  echo 'Computed styles must only be read by the bounded manual element picker.' >&2
+  exit 1
+fi
+rg -Fq 'styleReads.length>=(limit||32)' app/src/main/java/com/xinyv/median/AdPickerScript.java
 if [ -e app/src/main/java/com/xinyv/median/PageDarkening.java ] ||
    rg -n 'PageDarkening|darkScriptHandlers|installDocumentStartDarkMode|applyPageDarkFallback|getComputedStyle' \
       app/src/main/java/com/xinyv/median/MainActivity.java; then
@@ -62,7 +121,10 @@ on_create = text.index('protected void onCreate(Bundle state)')
 on_create_end = text.index('private void initializeInitialWebView()', on_create)
 startup = text[on_create:on_create_end]
 assert startup.index('setTheme(') < startup.index('super.onCreate(state)'), 'Dark theme must be selected before Activity creation'
-assert 'WebViewCompat.startUpWebView' not in startup, 'First navigation must not wait for an optional OEM startup callback'
+assert startup.index('beginStartupLoad(state, getIntent())') < startup.index('buildUi()'), 'Disk decoding must overlap UI and WebView construction'
+assert startup.index('postAfterUiTransition(new Runnable()') < startup.index('initializeInitialWebView();'), 'WebView creation must follow the native first-frame post'
+assert startup.index('beginWebViewStartup();') < startup.index('buildUi()'), 'Provider preparation must overlap native UI construction'
+assert 'WebViewStartupCompat.startUpWebView(webViewStartupExecutor' in startup, 'Provider startup must use its dedicated executor'
 initial_start = text.index('private void initializeInitialWebView()')
 initial_end = text.index('private void beginStartupLoad(', initial_start)
 initial = text[initial_start:initial_end]
@@ -76,18 +138,45 @@ gate_end = text.index('private void completeStartup(', gate_start)
 gate = text[gate_start:gate_end]
 assert 'startupReadiness.claimPost()' in gate and 'postAfterUiTransition' in gate and 'startupReadiness.begin()' in gate, 'Cold start must wait for resumed first-frame dispatch'
 transition_start = text.index('private void postAfterUiTransition(')
-transition_end = text.index('private static String settingPreview(', transition_start)
+transition_end = text.index('private void showSearchEngineDialog()', transition_start)
 transition = text[transition_start:transition_end]
 assert 'addOnAttachStateChangeListener' in transition and 'postOnAnimation' in transition, 'Cold start must cross view attachment and a real frame'
 prepare_start = text.index('private void prepareNetworkDestination(')
 prepare_end = text.index('private void loadNetworkUrl(', prepare_start)
 prepare = text[prepare_start:prepare_end]
 assert prepare.index('applyPageAccessPolicy') < prepare.index('applySiteSettings'), 'Destination network access must be restored before site policy'
+legacy_start = text.index('public boolean shouldOverrideUrlLoading(WebView view, String url)')
+modern_start = text.index('public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request)', legacy_start)
+intercept_start = text.index('public WebResourceResponse shouldInterceptRequest', modern_start)
+for callback in (text[legacy_start:modern_start], text[modern_start:intercept_start]):
+    assert callback.index('shouldBlockPageNavigation(') < callback.index('if (view != webView)') < callback.index('prepareNetworkDestination('), 'Navigation rules must use the source host and also protect background tabs'
+    assert callback.index('rememberMainFrameNavigation(') < callback.index('prepareNetworkDestination('), 'The accepted main-frame request must retain its source before destination settings change'
+modern = text[modern_start:intercept_start]
+assert modern.index('!request.isForMainFrame()') < modern.index('shouldBlockPageNavigation('), 'Subframes must not enter main-frame navigation protection'
+navigation_start = text.index('private boolean shouldBlockPageNavigation(')
+navigation_end = text.index('private boolean handleNavigation(', navigation_start)
+navigation = text[navigation_start:navigation_end]
+assert 'adBlock.shouldBlock(target, sourceHost, "text/html", true)' in navigation, 'Navigation rules must use document type and the initiating host'
+assert navigation.index('guard.shouldBlockNavigation(') < navigation.index('adBlock.isExplicitlyAllowed(target, sourceHost, "text/html", true)'), 'The drag heuristic must honor scoped document allow rules without checking them on every normal navigation'
+history_start = text.index('public void doUpdateVisitedHistory(')
+history_end = text.index('public boolean onRenderProcessGone(', history_start)
+assert 'rememberNavigationSourceDocument(view, url)' in text[history_start:history_end], 'SPA URL updates must preserve the gesture on the same document'
+request_start = text.index('private WebResourceResponse interceptRequest(WebView source, WebResourceRequest request)')
+request_end = text.index('private boolean cachedAdBlockActive(', request_start)
+request = text[request_start:request_end]
+assert 'boolean mainFrame = request.isForMainFrame();' in request, 'Request policy must use the actual main-frame flag'
+assert 'MainFrameNavigationContext.Snapshot initiating = mainFrame &&' in request and 'navigationContext != null && requestUri != null' in request and '? navigationContext.take(requestUri.toString(), true) : null;' in request, 'Only an exact matching modern main frame may consume initiating policy'
+assert 'initiating.sourceHost' in request and 'initiating.protectionEnabled && adBlockEnabled' in request, 'Main-frame rules must retain both source domain and source filtering state'
+assert 'adBlock.shouldBlock(requestUri, ruleHost, accept, mainFrame)' in request, 'Request rules must use the retained initiating host and actual main-frame flag'
+assert 'source.getUrl(' not in request and 'source.evaluateJavascript(' not in request, 'Request-thread fallback must use cached state without calling WebView UI methods'
+assert 'gestureGuard.shouldBlockNavigation(' in request and 'adBlock.isExplicitlyAllowed(requestUri, ruleHost, "text/html", true)' in request, 'Main-frame requests missing override callbacks must apply touch protection and document exceptions'
+assert text.count('target.reload();') == 1 and text.count('target.goBack();') == 1 and text.count('target.goForward();') == 1, 'Native reload/history must clear pending main-frame source context through their wrappers'
 assert 'watchInitialNetworkNavigation(target, url);' in text and '.acknowledge(url)' in text, 'First network navigation must have progress-qualified recovery'
 page_start = text[text.index('public void onPageStarted(WebView view, String url'):text.index('public void onPageCommitVisible(WebView view, String url')]
+assert page_start.index('gestureGuard.hasRecentDrag(') < page_start.index('gestureGuard.onNavigationAccepted(') < page_start.index('gestureGuard.onPageStarted(') < page_start.index('rememberNavigationSourceDocument(view, url)'), 'A verified drag must survive providers starting POST before the request callback'
 assert 'acknowledgeInitialNavigation' not in page_start, 'onPageStarted may fire at the stuck 10-percent state'
 assert 'newProgress > 10' in text and 'onPageCommitVisible' in text, 'Initial navigation may retire only after real progress or commit'
-assert 'HOME_TOKEN.equals(message)' in text, 'Homepage commands must use a token-authenticated prompt channel'
+assert 'homeToken != null && homeToken.equals(message)' in text, 'Homepage commands must use an already-issued token-authenticated prompt channel'
 prompt_start = text.index('public boolean onJsPrompt(')
 prompt_end = text.index('public void onShowCustomView(', prompt_start)
 prompt = text[prompt_start:prompt_end]
@@ -105,6 +194,7 @@ home_start = text.index('private void prepareHomeDestination(')
 home_end = offline_start
 home = text[home_start:home_end]
 assert 'setJavaScriptEnabled(true)' in home and 'setBlockNetworkImage(false)' in home, 'Homepage state must recover from restrictive page settings'
+assert 'setAlgorithmicDarkeningAllowed(settings, false)' in home, 'Internal pages must explicitly clear native page darkening'
 performance_start = text.index('private void applyPerformanceMode(WebView target)')
 performance_end = text.index('private void applyDesktopMode()', performance_start)
 assert 'setBlockNetworkLoads' not in text[performance_start:performance_end], 'Performance tuning must not mutate page access policy'
@@ -129,7 +219,7 @@ rg -Fq 'android:authorities="${applicationId}.downloads"' app/src/main/AndroidMa
 rg -q 'EXPECTED_SHA256=20f1b1176237254a6fc204d8434196fa11a4cfb387567519c61556e8710aed78' gradlew
 rg -Fq 'BuildConfig.APPLICATION_ID + ".offline"' app/src/main/java/com/xinyv/median/OfflineContentProvider.java
 rg -Fq 'android:taskAffinity="${applicationId}.private"' app/src/main/AndroidManifest.xml
-rg -Fq 'NetworkSecurity.isCredentialHeader(name)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'NetworkSecurity.isCredentialHeader(name)' app/src/main/java/com/xinyv/median/UserScriptNetwork.java
 rg -Fq 'NetworkSecurity.isCredentialHeader(name)' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
 rg -Fq 'parseContentRange(connection.getHeaderField("Content-Range"))' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
 rg -Fq 'sameSecureOrigin(pendingPermissionOrigin, webView.getUrl())' app/src/main/java/com/xinyv/median/MainActivity.java
@@ -149,18 +239,37 @@ rg -Fq 'bookmarkSnapshot = new ArrayList<Bookmark>(bookmarks)' app/src/main/java
 rg -Fq 'sameNormalizedUrl(item.url, normalized)' app/src/main/java/com/xinyv/median/BrowserDataStore.java
 rg -Fq 'io.postDelayed(writer, WRITE_RETRY_MS)' app/src/main/java/com/xinyv/median/BrowserDataStore.java
 rg -Fq 'matchCache.put(url, stable)' app/src/main/java/com/xinyv/median/UserScriptStore.java
-rg -Fq 'HashMap<String, JSONObject> cache' app/src/main/java/com/xinyv/median/ScriptValueStore.java
+rg -Fq 'LinkedHashMap<String, JSONObject> cache' app/src/main/java/com/xinyv/median/ScriptValueStore.java
 rg -Fq 'OmniboxInput.looksLikeWebAddress(text)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'OmniboxInput.looksLikeWebAddress(value)' app/src/main/java/com/xinyv/median/PrivateActivity.java
-rg -Fq 'row.setBackgroundResource(selectableBounded())' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq 'resolveAttribute(android.R.attr.selectableItemBackground, out, true)' app/src/main/java/com/xinyv/median/MainActivity.java
-if rg -n 'row\.setBackgroundResource\(selectableBorderless\(\)\)' app/src/main/java/com/xinyv/median; then
-  echo 'Full-width rows must use a bounded ripple.' >&2
+rg -Fq 'row.setForeground(null)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'int rowHeight = detailText.length() == 0 ? 48 : 60;' app/src/main/java/com/xinyv/median/MainActivity.java
+if rg -n 'sheetCard|row\.setBackground\(roundRect' app/src/main/java/com/xinyv/median/MainActivity.java; then
+  echo 'Action-sheet rows must stay flat, compact and theme-safe.' >&2
+  exit 1
+fi
+rg -Fq 'button.setBackground(null)' app/src/main/java/com/xinyv/median/MainActivity.java
+if rg -n 'selectableItemBackground|selectableBorderless' app/src/main/java/com/xinyv/median/MainActivity.java; then
+  echo 'Theme-bound selectable drawables must stay out of runtime chrome.' >&2
   exit 1
 fi
 rg -Fq 'showHomeCustomization()' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq 'sections[0] = "隐私与安全"' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq '返回键只关闭设置' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private void showBrowsingSettings()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private void showExtensionSettings()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private void showPrivacyDataSettings()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq '"深色模式\n浏览器界面与网页"' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private void toggleNightMode()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private void startAdPicker()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq "listen('touchstart',touchStart)" app/src/main/java/com/xinyv/median/AdPickerScript.java
+rg -Fq "listen('touchend',touchEnd)" app/src/main/java/com/xinyv/median/AdPickerScript.java
+rg -Fq 'AdPickerScript.validate(selector, requirePickedIdentity)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'confirmButton.onclick' app/src/main/java/com/xinyv/median/AdPickerScript.java
+rg -Fq '手动输入' app/src/main/java/com/xinyv/median/AdPickerScript.java
+rg -Fq 'private void startQrScan()' app/src/main/java/com/xinyv/median/MainActivity.java
+if rg -n 'int riskScore|String riskSummary|analyzeRisk|boolean quarantined|String disabledReason' app/src/main/java/com/xinyv/median; then
+  echo 'Obsolete userscript risk scoring or quarantine code found.' >&2
+  exit 1
+fi
 rg -Fq 'private void navigateOverlayBack()' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'private void dismissOverlayForNavigation()' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'SHEET_ROW_TOGGLE_ON' app/src/main/java/com/xinyv/median/MainActivity.java
@@ -173,19 +282,26 @@ rg -Fq 'new ThreadPoolExecutor.DiscardOldestPolicy()' app/src/main/java/com/xiny
 rg -Fq 'private boolean executeTask(ExecutorService executor, Runnable task)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'private void beginStartupLoad' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'startupExecutor = BackgroundExecutor.create(2, 8, "median-startup", false)' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq 'final AtomicInteger remaining = new AtomicInteger(2)' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq 'startupScriptSource = load.scriptSource' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private int remaining = 2;' app/src/main/java/com/xinyv/median/StartupDataLoader.java
+rg -Fq 'startupDataLoader = new StartupDataLoader(' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'startupDataLoader.close();' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'startupScriptPayloads = load.scriptPayloads' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'initializeInitialWebView();' app/src/main/java/com/xinyv/median/MainActivity.java
-if rg -n 'webViewStartupFallback|webViewStartupComplete|startUpWebView\(scriptExecutor' app/src/main/java/com/xinyv/median/MainActivity.java; then
-  echo 'Main browsing startup must not wait on optional asynchronous WebView startup.' >&2
+if rg -n 'startUpWebView\((scriptExecutor|startupExecutor)' app/src/main/java/com/xinyv/median/MainActivity.java; then
+  echo 'Provider startup must not share the script queue or the short-lived disk decoder.' >&2
   exit 1
 fi
-rg -Fq 'services.warmLocalIndexes()' app/src/main/java/com/xinyv/median/MainActivity.java
+if rg -n 'warmLocalIndexes' app/src/main/java/com/xinyv/median; then
+  echo 'Optional download/offline indexes must remain lazy.' >&2
+  exit 1
+fi
 if rg -n 'webViewStartupFallback|webViewStartupComplete|WebViewCompat.startUpWebView' app/src/main/java/com/xinyv/median/PrivateActivity.java; then
   echo 'Private browsing startup must not wait on optional asynchronous WebView startup.' >&2
   exit 1
 fi
-rg -Fq 'startupExecutor = BackgroundExecutor.create(2, 4, "median-private-startup", false)' app/src/main/java/com/xinyv/median/PrivateActivity.java
+rg -Fq 'startupExecutor = BackgroundExecutor.create(1, 4, "median-private-startup", false)' app/src/main/java/com/xinyv/median/PrivateActivity.java
+rg -Fq '@Override public void run() { initializePrivateWebView(); }' app/src/main/java/com/xinyv/median/PrivateActivity.java
+rg -Fq 'completedExecutor.shutdown();' app/src/main/java/com/xinyv/median/PrivateActivity.java
 rg -Fq '!cookieResetComplete || !filterRulesReady' app/src/main/java/com/xinyv/median/PrivateActivity.java
 rg -Fq 'startupReadiness.claimPost()' app/src/main/java/com/xinyv/median/PrivateActivity.java
 rg -Fq 'postAfterAttachedFrame(complete)' app/src/main/java/com/xinyv/median/PrivateActivity.java
@@ -197,20 +313,17 @@ if rg -n 'filterCompileThread|new Thread\(' app/src/main/java/com/xinyv/median/P
   echo 'Private startup work must stay behind its single bounded-executor ThreadFactory.' >&2
   exit 1
 fi
-if rg -n 'ASYNC_WEBVIEW_STARTUP|startUpWebView' \
-    app/src/main/java/androidx/webkit app/src/main/java/org/chromium/support_lib_boundary; then
-  echo 'Unused asynchronous WebView startup glue must stay out of the release.' >&2
-  exit 1
-fi
+rg -Fq 'ASYNC_WEBVIEW_STARTUP_V2' app/src/main/java/androidx/webkit/WebViewStartupCompat.java
 rg -Fq 'renderedHomeKeys.put(webView, renderKey)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'registerPredictiveBack()' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'private boolean isCurrentPageCallback(WebView source, long sequence)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'requestGeneration != speechGeneration' app/src/main/java/com/xinyv/median/PageAssistant.java
-rg -Fq 'io.postDelayed(writer, WRITE_DELAY_MS)' app/src/main/java/com/xinyv/median/UserScriptStore.java
+rg -Fq 'handler.postDelayed(writer, WRITE_DELAY_MS)' app/src/main/java/com/xinyv/median/UserScriptStore.java
 test "$(rg -l 'LocalDataIo.acquire\(\)' app/src/main/java/com/xinyv/median/{BrowserDataStore,SiteSettingsStore,UserScriptStore}.java | wc -l)" -eq 3
 ! rg -q 'HandlerThread' app/src/main/java/com/xinyv/median/{BrowserDataStore,SiteSettingsStore,UserScriptStore}.java
-rg -Fq 'new ArrayBlockingQueue<Runnable>(1)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
-rg -Fq 'new ArrayBlockingQueue<Runnable>(32)' app/src/main/java/com/xinyv/median/PasswordVault.java
+rg -Fq 'BackgroundExecutor.create(1, 1, "median-filter", false)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
+rg -Fq 'BackgroundExecutor.create(1, 32, "median-vault", false)' app/src/main/java/com/xinyv/median/PasswordVault.java
+rg -Fq 'THREAD_STACK_BYTES = 512L * 1024L' app/src/main/java/com/xinyv/median/BackgroundExecutor.java
 if rg -n 'Executors\.newFixedThreadPool|Executors\.newCachedThreadPool' \
     app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java \
     app/src/main/java/com/xinyv/median/PasswordVault.java; then
@@ -221,9 +334,10 @@ if rg -n 'WifiManager|WifiLock|ACCESS_WIFI_STATE' app/src/main/java/com/xinyv/me
   echo 'Foreground browsing must not hold a Wi-Fi performance lock.' >&2
   exit 1
 fi
-rg -Fq 'io.postDelayed(writer, WRITE_DELAY_MS)' app/src/main/java/com/xinyv/median/SiteSettingsStore.java
+rg -Fq 'handler.postDelayed(writer, WRITE_DELAY_MS)' app/src/main/java/com/xinyv/median/SiteSettingsStore.java
 rg -Fq 'bar.setProgress(to, true)' app/src/main/java/com/xinyv/median/Motion.java
-rg -Fq 'showHomeCustomizationPanel()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'homeCustomization().show(backAction)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'showHomeCustomizationPanel()' app/src/main/java/com/xinyv/median/HomeCustomizationController.java
 if rg -Fq 'if (!isHomeUrl(currentPageUrl)) showHome();' app/src/main/java/com/xinyv/median/MainActivity.java; then
   echo 'Opening homepage settings must not replace the current browsing page.' >&2
   exit 1
@@ -236,10 +350,15 @@ rg -Fq 'android:strokeColor="#7D8590"' app/src/main/res/drawable/ic_launcher_for
 rg -Fq 'android:pathData="M31,28L84,43L41,81Z"' app/src/main/res/drawable/ic_launcher_foreground.xml
 rg -Fq 'android:pathData="M31,28L62.5,62"' app/src/main/res/drawable/ic_launcher_foreground.xml
 rg -Fq '<monochrome android:drawable="@drawable/ic_launcher_foreground" />' app/src/main/res/mipmap-anydpi-v33/ic_launcher.xml
-rg -Fq 'String source = scriptStore.buildDocumentStartScript(token);' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'scriptStore.buildDocumentStartPayloads(token)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'MAX_LINES = 1100000' app/src/main/java/com/xinyv/median/AdBlockEngine.java
+rg -Fq 'MAX_PACKED_DOMAIN_RULES = 1000000' app/src/main/java/com/xinyv/median/AdBlockEngine.java
+rg -Fq 'class PackedDomainSet' app/src/main/java/com/xinyv/median/AdBlockEngine.java
 rg -Fq 'for compression_level in range(6, 10)' tools/deflate_raw.py
 rg -Fq 'for memory_level in range(5, 10)' tools/deflate_raw.py
 rg -Fq 'for compression_level in range(10, 13)' tools/deflate_raw.py
+rg -Fq 'zopfli_candidate(payload, consider)' tools/deflate_raw.py
+rg -Fq -- '--verity-enabled false' tools/build_500kb_apk.sh
 if rg -n 'buildDocumentStartScripts|recordExecutionResult|lastCostMs|__mreport' app/src/main/java/com/xinyv/median; then
   echo 'Per-script document registration or execution telemetry returned.' >&2
   exit 1
@@ -251,10 +370,10 @@ fi
 rg -Fq 'interceptHomeAsset(source, requestUri)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'HomeOpenPolicy.restoresLast' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'tab.url = configuredHomeUrl()' app/src/main/java/com/xinyv/median/MainActivity.java
-rg -Fq '"/home-custom".equals(uri.getPath())' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'home-custom' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq "sandbox='allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-top-navigation-by-user-activation'" app/src/main/java/com/xinyv/median/HomePage.java
 rg -Fq "connect-src 'none'" app/src/main/java/com/xinyv/median/CustomHomeHtml.java
-rg -Fq 'customHomeViews.contains(source) && !request.isForMainFrame()' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'customHomeViews.contains(source) && !mainFrame && requestUri != null' app/src/main/java/com/xinyv/median/MainActivity.java
 if rg -n 'allow-same-origin' app/src/main/java/com/xinyv/median/HomePage.java; then
   echo 'Custom homepage scripts must remain isolated from the trusted home origin.' >&2
   exit 1
@@ -265,7 +384,7 @@ rg -Fq 'MAX_VISIBLE_CODE_POINTS = 48' app/src/main/java/com/xinyv/median/LogoMar
 rg -Fq 'options.logoLetterSpacing' app/src/main/java/com/xinyv/median/HomePage.java
 rg -Fq 'home_logo_gradient_angle' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src 'self' data:" app/src/main/java/com/xinyv/median/HomePage.java
-rg -Fq 'CustomHomeCss.error(raw)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'CustomHomeCss.error(raw)' app/src/main/java/com/xinyv/median/HomeCustomizationController.java
 rg -Fq "class='logo-space'" app/src/main/java/com/xinyv/median/LogoMarkup.java
 if rg -n 'data:image/|Base64.*home.wallpaper|home.wallpaper.*Base64' app/src/main/java/com/xinyv/median; then
   echo 'Home images must be streamed locally instead of embedded into every HTML page.' >&2
@@ -273,6 +392,22 @@ if rg -n 'data:image/|Base64.*home.wallpaper|home.wallpaper.*Base64' app/src/mai
 fi
 rg -Fq 'if (rule.thirdParty || rule.firstParty)' app/src/main/java/com/xinyv/median/AdBlockEngine.java
 rg -Fq 'RULE_MATCH_SCRATCH' app/src/main/java/com/xinyv/median/AdBlockEngine.java
+rg -Fq 'Set<String> includeDomains;' app/src/main/java/com/xinyv/median/AdBlockEngine.java
+rg -Fq 'rule.includeDomains != null' app/src/main/java/com/xinyv/median/AdBlockEngine.java
+rg -Fq 'private final ScriptTabStateStore scriptTabValues' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'scriptTabIds.put(view, scriptTabId(tab));' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'scriptTabValues.removeTab(tab.scriptTabId);' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'singleRendererSwap' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private void makeRoomForRenderer()' app/src/main/java/com/xinyv/median/MainActivity.java
+python3 - <<'PY'
+from pathlib import Path
+text = Path('app/src/main/java/com/xinyv/median/MainActivity.java').read_text(encoding='utf-8')
+start = text.index('private void activateTab(int index)')
+end = text.index('private void closeCurrentTab()', start)
+switch = text[start:end]
+assert switch.index('makeRoomForRenderer();') < switch.index('acquireWebView()'), 'Cold tab allocation must release an older renderer before creating a new one'
+PY
+rg -Fq 'releaseInactiveTabStates();' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'seen.add(selector)' app/src/main/java/com/xinyv/median/AdBlockEngine.java
 if rg -n 'target\.contains\(selector\)' app/src/main/java/com/xinyv/median/AdBlockEngine.java; then
   echo 'Cosmetic selector de-duplication must remain hash-based.' >&2
@@ -281,9 +416,10 @@ fi
 rg -Fq 'updateInFlight.compareAndSet(false, true)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
 rg -Fq 'manualUpdatePending.set(true)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
 rg -Fq 'collectUpdateTargets(runAutomatic)' app/src/main/java/com/xinyv/median/FilterSubscriptionStore.java
-rg -Fq 'cosmeticInjected.putIfAbsent(source, Boolean.TRUE)' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'cosmeticInjected.putIfAbsent(source, ticket)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'services = new BrowserServices(this)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'class BookmarkFolderStore' app/src/main/java/com/xinyv/median/BookmarkFolderStore.java
+rg -Fq 'return UrlStoragePolicy.normalize(value);' app/src/main/java/com/xinyv/median/BookmarkFolderStore.java
 rg -Fq 'bookmarkFolders.path(folderId)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'showBookmarkEditor(null, "", "", folderId)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq "median://folder?id=" app/src/main/java/com/xinyv/median/HomePage.java
@@ -300,6 +436,8 @@ rg -Fq 'TASK_EXECUTOR.allowCoreThreadTimeOut(true)' app/src/main/java/com/xinyv/
 rg -Fq 'new LinkedBlockingQueue<Runnable>(48)' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
 rg -Fq 'wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS)' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
 rg -Fq 'locks.renewIfDue(now)' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
+rg -Fq 'new AtomicFile(file).openRead()' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
+rg -Fq 'atomic = new AtomicFile(file)' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java
 if rg -n 'wakeLock\.acquire\(\)' app/src/main/java/com/xinyv/median/AdaptiveDownloadService.java; then
   echo 'Download wake locks must always have a bounded timeout.' >&2
   exit 1
@@ -354,7 +492,12 @@ fi
 rg -Fq 'loadInput(query);' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'loadInput(uri.getQueryParameter("url"));' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'prompt(t,u)' app/src/main/java/com/xinyv/median/HomePage.java
-rg -Fq 'HOME_TOKEN = UrlCleaner.randomToken()' app/src/main/java/com/xinyv/median/PrivateActivity.java
+rg -Fq 'private String homeToken()' app/src/main/java/com/xinyv/median/PrivateActivity.java
+if rg -n 'HOME_TOKEN = UrlCleaner\.randomToken\(\)' app/src/main/java/com/xinyv/median/{MainActivity,PrivateActivity}.java; then
+  echo 'Homepage entropy initialization must stay outside Activity class loading.' >&2
+  exit 1
+fi
+rg -Fq 'private static final class SecureRandomHolder' app/src/main/java/com/xinyv/median/UrlCleaner.java
 python3 - <<'PY'
 from pathlib import Path
 text = Path('app/src/main/java/com/xinyv/median/PrivateActivity.java').read_text(encoding='utf-8')
@@ -364,9 +507,28 @@ prompt = text[start:end]
 assert 'isHome(view.getUrl())' in prompt and 'view.post(new Runnable()' in prompt
 assert prompt.index('result.confirm("")') < prompt.index('view.post(new Runnable()')
 PY
-rg -Fq 'private static final long INITIAL_NAVIGATION_ACK_MS = 450L' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'private static final long INITIAL_NAVIGATION_ACK_MS = 1400L' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'private static final long INITIAL_NAVIGATION_ACK_MS = 450L' app/src/main/java/com/xinyv/median/PrivateActivity.java
 rg -Fq 'applyPerformanceMode(webView);' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'if (webView.isAttachedToWindow()) launch.run();' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'prepareNetworkDestination(target, url, host);' app/src/main/java/com/xinyv/median/MainActivity.java
+rg -Fq 'currentPageHost = startedHost;' app/src/main/java/com/xinyv/median/MainActivity.java
+python3 - <<'PY'
+from pathlib import Path
+
+root = Path('app/src/main/java/com/xinyv/median')
+for name in ('BrowserDataStore', 'SiteSettingsStore', 'UserScriptStore'):
+    text = (root / f'{name}.java').read_text(encoding='utf-8')
+    start = text.index(f'{name}(Context context)')
+    end = text.index('\n    }', start)
+    assert 'LocalDataIo.acquire()' not in text[start:end], f'{name} recreated startup I/O acquisition'
+    assert 'private Handler io;' in text and 'private Handler ioLocked()' in text
+
+main = (root / 'MainActivity.java').read_text(encoding='utf-8')
+start = main.index('private void watchInitialNetworkNavigation(')
+end = main.index('private void scheduleInitialNavigationRetry(', start)
+assert 'NetworkSecurity.parseHttpUrl' not in main[start:end], 'first navigation URL is parsed twice'
+PY
 if rg -n 'acknowledgeProgress' app/src/main/java/com/xinyv/median tools/tests; then
   echo 'A queued progress value must not acknowledge the initial HTTP(S) main-frame load.' >&2
   exit 1
@@ -376,7 +538,7 @@ rg -Fq '删除当前文件夹' app/src/main/java/com/xinyv/median/MainActivity.j
 rg -Fq 'confirmDeleteBookmarkFolder(current, false)' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq '粘贴链接或脚本代码安装' app/src/main/java/com/xinyv/median/MainActivity.java
 rg -Fq 'UserScriptInstallPolicy.MAX_FETCH_ATTEMPTS' app/src/main/java/com/xinyv/median/MainActivity.java
-if rg -n 'STOREPASS.*android|KEYPASS.*android|median-debug\.p12|keytool.*-storepass android' --glob '!CHANGELOG.md' --glob '!UPGRADE_NOTES.md' --glob '!tools/static_checks.sh' .; then
+if rg -n 'STOREPASS.*android|KEYPASS.*android|median-debug\.p12|keytool.*-storepass android' --glob '!CHANGELOG.md' --glob '!UPGRADE_NOTES.md' --glob '!tools/static_checks.sh' --glob '!out/**' --glob '!_oldsource/**' .; then
   echo 'Weak or auto-generated release signing material found.' >&2
   exit 1
 fi
@@ -386,27 +548,55 @@ sh -n gradlew
 
 TMP="$(mktemp -d)"
 trap 'find "$TMP" -depth -delete' EXIT
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/UiText.java \
+  tools/tests/UiTextSelfTest.java
+java -cp "$TMP" com.xinyv.median.UiTextSelfTest
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/SessionIndexPolicy.java \
+  tools/tests/SessionIndexPolicySelfTest.java
+java -cp "$TMP" com.xinyv.median.SessionIndexPolicySelfTest
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/UrlStoragePolicy.java \
+  tools/tests/UrlStoragePolicySelfTest.java
+java -cp "$TMP" com.xinyv.median.UrlStoragePolicySelfTest
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/InternalNavigationPolicy.java \
   tools/tests/InternalNavigationPolicySelfTest.java
 java -cp "$TMP" com.xinyv.median.InternalNavigationPolicySelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/StartupNavigationPolicy.java \
   tools/tests/StartupNavigationPolicySelfTest.java
 java -cp "$TMP" com.xinyv.median.StartupNavigationPolicySelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/EdgeNavigationPolicy.java \
+  tools/tests/EdgeNavigationPolicySelfTest.java
+java -cp "$TMP" com.xinyv.median.EdgeNavigationPolicySelfTest
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/NavigationGestureGuard.java \
+  tools/tests/NavigationGestureGuardSelfTest.java
+java -cp "$TMP" com.xinyv.median.NavigationGestureGuardSelfTest
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/MainFrameNavigationContext.java \
+  tools/tests/MainFrameNavigationContextSelfTest.java
+java -cp "$TMP" com.xinyv.median.MainFrameNavigationContextSelfTest
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/StartupReadiness.java \
   tools/tests/StartupReadinessSelfTest.java
 java -cp "$TMP" com.xinyv.median.StartupReadinessSelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/InitialNavigationGuard.java \
   tools/tests/InitialNavigationGuardSelfTest.java
 java -cp "$TMP" com.xinyv.median.InitialNavigationGuardSelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/ScriptTabStateStore.java \
+  tools/tests/ScriptTabStateStoreSelfTest.java
+java -cp "$TMP" com.xinyv.median.ScriptTabStateStoreSelfTest
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/MediaResourceSniffer.java \
   tools/tests/MediaResourceSnifferSelfTest.java
 java -cp "$TMP" com.xinyv.median.MediaResourceSnifferSelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/MediaProbeScript.java \
   tools/tests/MediaProbeScriptSelfTest.java
 java -cp "$TMP" com.xinyv.median.MediaProbeScriptSelfTest
@@ -416,52 +606,75 @@ node --check "$TMP/media-install.js" >/dev/null
 node --check "$TMP/media-probe.js" >/dev/null
 node tools/tests/media_probe_behavior_test.js "$TMP/media-install.js" "$TMP/media-probe.js"
 echo 'Generated media probe JavaScript syntax passed'
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
+  app/src/main/java/com/xinyv/median/AdPickerScript.java \
+  app/src/main/java/com/xinyv/median/QrScannerPage.java \
+  tools/tests/UiScriptSelfTest.java
+java -cp "$TMP" com.xinyv.median.UiScriptSelfTest ad > "$TMP/ad-picker.js"
+java -cp "$TMP" com.xinyv.median.UiScriptSelfTest ad-hide > "$TMP/ad-hide.js"
+java -cp "$TMP" com.xinyv.median.UiScriptSelfTest ad-validate > "$TMP/ad-validate.js"
+java -cp "$TMP" com.xinyv.median.UiScriptSelfTest ad-validate-picked > "$TMP/ad-validate-picked.js"
+java -cp "$TMP" com.xinyv.median.UiScriptSelfTest ad-hide-picked > "$TMP/ad-hide-picked.js"
+java -cp "$TMP" com.xinyv.median.UiScriptSelfTest qr > "$TMP/qr-scanner.js"
+node --check "$TMP/ad-picker.js" >/dev/null
+node --check "$TMP/ad-hide.js" >/dev/null
+node --check "$TMP/ad-validate.js" >/dev/null
+node --check "$TMP/ad-validate-picked.js" >/dev/null
+node --check "$TMP/ad-hide-picked.js" >/dev/null
+node tools/tests/ad_picker_behavior_test.js "$TMP/ad-picker.js" "$TMP/ad-hide.js" "$TMP/ad-validate-picked.js" "$TMP/ad-hide-picked.js"
+node --check "$TMP/qr-scanner.js" >/dev/null
+echo 'Generated ad picker and QR scanner JavaScript syntax passed'
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/CredentialAutofill.java \
   tools/tests/CredentialAutofillSelfTest.java
 java -cp "$TMP" com.xinyv.median.CredentialAutofillSelfTest
 java -cp "$TMP" com.xinyv.median.CredentialAutofillSelfTest detect > "$TMP/credential-detect.js"
 java -cp "$TMP" com.xinyv.median.CredentialAutofillSelfTest fill > "$TMP/credential-fill.js"
+java -cp "$TMP" com.xinyv.median.CredentialAutofillSelfTest fill-overwrite > "$TMP/credential-overwrite.js"
 java -cp "$TMP" com.xinyv.median.CredentialAutofillSelfTest capture > "$TMP/credential-capture.js"
+java -cp "$TMP" com.xinyv.median.CredentialAutofillSelfTest fields > "$TMP/credential-fields.js"
 node --check "$TMP/credential-detect.js" >/dev/null
 node --check "$TMP/credential-fill.js" >/dev/null
+node --check "$TMP/credential-overwrite.js" >/dev/null
 node --check "$TMP/credential-capture.js" >/dev/null
+node --check "$TMP/credential-fields.js" >/dev/null
 node tools/tests/credential_autofill_behavior_test.js \
-  "$TMP/credential-detect.js" "$TMP/credential-fill.js" "$TMP/credential-capture.js"
-javac --release 17 -d "$TMP" \
+  "$TMP/credential-detect.js" "$TMP/credential-fill.js" "$TMP/credential-capture.js" \
+  "$TMP/credential-overwrite.js" "$TMP/credential-fields.js"
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/NetworkSecurity.java \
   app/src/main/java/com/xinyv/median/MediaManifestParser.java \
   tools/tests/MediaManifestParserSelfTest.java
 java -cp "$TMP" com.xinyv.median.MediaManifestParserSelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/UserScriptInstallPolicy.java \
   tools/tests/UserScriptInstallPolicySelfTest.java
 java -cp "$TMP" com.xinyv.median.UserScriptInstallPolicySelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/NetworkSecurity.java \
   tools/tests/NetworkSecuritySelfTest.java
 java -cp "$TMP" com.xinyv.median.NetworkSecuritySelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/DownloadRetryPolicy.java \
   tools/tests/DownloadRetryPolicySelfTest.java
 java -cp "$TMP" com.xinyv.median.DownloadRetryPolicySelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/OmniboxInput.java \
   tools/tests/OmniboxInputSelfTest.java
 java -cp "$TMP" com.xinyv.median.OmniboxInputSelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/HomeOpenPolicy.java \
   tools/tests/HomeOpenPolicySelfTest.java
 java -cp "$TMP" com.xinyv.median.HomeOpenPolicySelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/CustomHomeCss.java \
   tools/tests/CustomHomeCssSelfTest.java
 java -cp "$TMP" com.xinyv.median.CustomHomeCssSelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/CustomHomeHtml.java \
   tools/tests/CustomHomeHtmlSelfTest.java
 java -cp "$TMP" com.xinyv.median.CustomHomeHtmlSelfTest
-javac --release 17 -d "$TMP" \
+javac -encoding UTF-8 --release 17 -d "$TMP" \
   app/src/main/java/com/xinyv/median/LogoMarkup.java \
   app/src/main/java/com/xinyv/median/CustomHomeCss.java \
   app/src/main/java/com/xinyv/median/HomePageConfig.java \

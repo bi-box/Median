@@ -6,6 +6,10 @@ command -v node >/dev/null 2>&1 || { echo 'node is required for userscript synta
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/src/android/content" "$TMP/src/android/os" "$TMP/src/android/util" "$TMP/src/org/json" "$TMP/src/com/xinyv/median" "$TMP/classes"
+cat > "$TMP/src/com/xinyv/median/BuildConfig.java" <<'JAVA'
+package com.xinyv.median;
+public final class BuildConfig { public static final String VERSION_NAME = "2.4.0"; }
+JAVA
 cat > "$TMP/src/android/content/Context.java" <<'JAVA'
 package android.content;
 import java.io.File;
@@ -52,9 +56,10 @@ JAVA
 cat > "$TMP/src/android/os/HandlerThread.java" <<'JAVA'
 package android.os;
 public final class HandlerThread {
+    public static int starts;
     private final Looper looper = new Looper();
     public HandlerThread(String name, int priority) {}
-    public void start() {}
+    public void start() { starts++; }
     public Looper getLooper() { return looper; }
     public boolean quitSafely() { return true; }
 }
@@ -128,8 +133,12 @@ cat > "$TMP/src/com/xinyv/median/UserScriptGeneratedJsSelfTest.java" <<'JAVA'
 package com.xinyv.median;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.os.HandlerThread;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 public final class UserScriptGeneratedJsSelfTest {
@@ -148,6 +157,8 @@ public final class UserScriptGeneratedJsSelfTest {
     @SuppressWarnings("unchecked")
     public static void main(String[] args) throws Exception {
         UserScriptStore store = new UserScriptStore(new MemoryContext());
+        if (HandlerThread.starts != 0)
+            throw new AssertionError("reading scripts during cold start must not create the local I/O thread");
         UserScriptStore.Script script = new UserScriptStore.Script();
         script.id = "syntax-test";
         script.name = "Generated JS syntax test";
@@ -159,6 +170,7 @@ public final class UserScriptGeneratedJsSelfTest {
         script.runAt = "document-start";
         script.code = "window.__medianRunCount=(window.__medianRunCount||0)+1; window.__medianTestGM=GM;\n" +
                 "GM_registerMenuCommand('Test', function(){ GM_setValue('x', 1); });\n" +
+                "GM_saveTab({ready:true}); GM_getTab(function(tab){ window.__medianTabReady=!!tab; });\n" +
                 "GM_xmlhttpRequest({url:'https://example.com/data',responseType:'arraybuffer',onload:function(r){console.log(r.status);}});";
         script.requireCode = "const requiredValue = 1;";
         script.enabled = true;
@@ -170,6 +182,9 @@ public final class UserScriptGeneratedJsSelfTest {
         script.grants.add("GM_xmlhttpRequest");
         script.grants.add("GM_download");
         script.grants.add("GM_cookie");
+        script.grants.add("GM_getTab");
+        script.grants.add("GM_saveTab");
+        script.grants.add("GM_getTabs");
         script.connects.add("example.com");
         UserScriptStore.Script.Resource resource = new UserScriptStore.Script.Resource();
         resource.name = "sample";
@@ -187,6 +202,9 @@ public final class UserScriptGeneratedJsSelfTest {
             throw new AssertionError("GM_cookie grant was not recognized");
         if (!store.allowsApi(script.id, "getValue") || !store.allowsApi(script.id, "listValues"))
             throw new AssertionError("bulk value grants must authorize their primitive bridge operations");
+        if (!store.allowsApi(script.id, "getTab") || !store.allowsApi(script.id, "saveTab") ||
+                !store.allowsApi(script.id, "getTabs"))
+            throw new AssertionError("tab compatibility grants were not recognized");
         script.grants.add("GM_notDownloadButContainsTheWord");
         script.grants.remove("GM_download");
         if (store.allowsApi(script.id, "download"))
@@ -204,18 +222,36 @@ public final class UserScriptGeneratedJsSelfTest {
         ((ArrayList<UserScriptStore.Script>) field.get(store)).add(second);
         String payload = store.buildDocumentStartScript("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         if (payload.length() == 0) throw new AssertionError("expected one combined userscript registration");
+        List<UserScriptStore.DocumentStartPayload> scopedPayloads = store.buildDocumentStartPayloads(
+                "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        if (scopedPayloads.size() != 1 ||
+                !scopedPayloads.get(0).allowedOriginRules.equals(Collections.singleton("https://example.com")) ||
+                !scopedPayloads.get(0).source.contains("syntax-test") ||
+                !scopedPayloads.get(0).source.contains("syntax-test-2"))
+            throw new AssertionError("same-origin scripts must share one scoped registration");
+        Set<String> wildcardOrigins = UserScriptStore.scopedOriginRules(
+                Collections.singletonList("*://*.Example.COM/*"));
+        if (wildcardOrigins == null || wildcardOrigins.size() != 2 ||
+                !wildcardOrigins.contains("http://*.example.com") ||
+                !wildcardOrigins.contains("https://*.example.com"))
+            throw new AssertionError("wildcard scheme/host origin expansion failed");
+        if (UserScriptStore.scopedOriginRules(Collections.singletonList("<all_urls>")) != null ||
+                UserScriptStore.scopedOriginRules(Collections.singletonList("/https?:\\/\\/example/")) != null)
+            throw new AssertionError("broad and regex metadata must retain wildcard fallback");
         if (!payload.contains("location.hostname||'').toLowerCase()==='median.invalid'"))
             throw new AssertionError("internal home-page guard missing");
-        if (!payload.contains("if(window.top!==window.self)return;"))
-            throw new AssertionError("native-grant scripts must be top-frame only");
-        for (String api : new String[] { "GM_getValues", "GM_setValues", "GM_deleteValues", "GM_getResourceUrl", "GM_cookie", "xmlHttpRequest" })
+        if (payload.contains("if(window.top!==window.self)return;"))
+            throw new AssertionError("native bridge grants must not silently disable iframe scripts");
+        for (String api : new String[] { "GM_getValues", "GM_setValues", "GM_deleteValues", "GM_getTab", "GM_saveTab", "GM_getTabs", "GM_getResourceUrl", "GM_cookie", "xmlHttpRequest" })
             if (!payload.contains(api)) throw new AssertionError("missing compatibility API: " + api);
         String runtimeMarker = "var __medianApiFactory=";
         if (payload.indexOf(runtimeMarker) < 0 || payload.indexOf(runtimeMarker) != payload.lastIndexOf(runtimeMarker))
             throw new AssertionError("multiple scripts must share exactly one compatibility runtime");
         if (!payload.contains("p.abort=function") || !payload.contains("ontimeout:function") || !payload.contains("onabort:function"))
             throw new AssertionError("modern GM.xmlHttpRequest must expose abort and reject terminal failures");
-        if (!payload.contains("downloadURL:") || !payload.contains("updateURL:") || !payload.contains("isIncognito:false"))
+        if (!payload.contains("downloadURL:") || !payload.contains("updateURL:") ||
+                !payload.contains("scriptMetaStr:") || !payload.contains("matches:") ||
+                !payload.contains("isIncognito:false"))
             throw new AssertionError("common GM_info compatibility metadata is missing");
         if (!payload.contains("var __mpr=") || !payload.contains("var __msoon=") ||
                 !payload.contains("var z=function(n)"))
@@ -236,6 +272,8 @@ public final class UserScriptGeneratedJsSelfTest {
         if (!"中文名".equals(localized.name) || !"中文描述".equals(localized.description))
             throw new AssertionError("localized metadata selection failed");
         store.save(localized);
+        if (HandlerThread.starts != 1)
+            throw new AssertionError("the first script write must acquire exactly one shared I/O thread");
         if (!store.matchesUrl(localized.id, "https://example.com/path"))
             throw new AssertionError("@match wildcard host should include the bare host case-insensitively");
         UserScriptStore.Script body = store.parseUserScript("// ==UserScript==\n// @name Body\n// @match https://Example.COM/Path/*\n// @run-at document-body\n// @grant none\n// ==/UserScript==\n", "https://example.com/body.user.js");
@@ -247,18 +285,33 @@ public final class UserScriptGeneratedJsSelfTest {
         store.save(regex);
         if (!store.matchesUrl(regex.id, "https://example.com/case"))
             throw new AssertionError("explicit regular-expression flags were ignored");
+        boolean foundWildcardFallback = false;
+        for (UserScriptStore.DocumentStartPayload item : store.buildDocumentStartPayloads(
+                "2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))
+            if (item.allowedOriginRules.equals(Collections.singleton("*"))) foundWildcardFallback = true;
+        if (!foundWildcardFallback)
+            throw new AssertionError("regex scripts must be grouped into one safe wildcard fallback");
         UserScriptStore localStore = new UserScriptStore(new MemoryContext());
+        if (HandlerThread.starts != 1)
+            throw new AssertionError("constructing another read-only script store must not start a new thread");
         UserScriptStore.Script localOnly = localStore.parseUserScript("// ==UserScript==\n// @name Frame style\n// @match https://example.com/*\n// @grant GM_addStyle\n// ==/UserScript==\nGM_addStyle('body{}');", "https://example.com/style.user.js");
         localStore.save(localOnly);
+        if (HandlerThread.starts != 1)
+            throw new AssertionError("script stores must share the single local I/O thread");
         String localPayload = localStore.buildDocumentStartScript("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
         if (localPayload.contains("if(window.top!==window.self)return;"))
             throw new AssertionError("local-only grants should retain default frame compatibility");
+        localOnly.noFrames = true;
+        localStore.save(localOnly);
+        String noFramesPayload = localStore.buildDocumentStartScript("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        if (!noFramesPayload.contains("if(window.top!==window.self)return;"))
+            throw new AssertionError("@noframes must still suppress iframe execution");
         System.out.print(payload);
     }
 }
 JAVA
 
-javac --release 17 -d "$TMP/classes" \
+javac -encoding UTF-8 --release 17 -d "$TMP/classes" \
   "$TMP/src/android/content/Context.java" \
   "$TMP/src/android/content/SharedPreferences.java" \
   "$TMP/src/android/util/AtomicFile.java" \
@@ -274,6 +327,7 @@ javac --release 17 -d "$TMP/classes" \
   app/src/main/java/com/xinyv/median/LocalDataIo.java \
   app/src/main/java/com/xinyv/median/AtomicTextFile.java \
   app/src/main/java/com/xinyv/median/NetworkSecurity.java \
+  "$TMP/src/com/xinyv/median/BuildConfig.java" \
   app/src/main/java/com/xinyv/median/UserScriptStore.java \
   "$TMP/src/com/xinyv/median/UserScriptGeneratedJsSelfTest.java"
 java -cp "$TMP/classes" com.xinyv.median.UserScriptGeneratedJsSelfTest > "$TMP/generated-userscript.js"

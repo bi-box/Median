@@ -6,6 +6,7 @@ import android.webkit.MimeTypeMap;
 import android.webkit.URLUtil;
 
 import java.io.File;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.zip.ZipFile;
 
@@ -140,14 +141,28 @@ final class DownloadFileTypes {
     static String sanitize(String raw) {
         String value = value(raw).trim();
         StringBuilder out = new StringBuilder(Math.min(value.length(), 180));
-        for (int i = 0; i < value.length() && out.length() < 180; i++) {
-            char c = value.charAt(i);
-            boolean unsafeControl = c < 0x20 || (c >= 0x7f && c <= 0x9f);
-            boolean bidiControl = (c >= '\u202a' && c <= '\u202e') || (c >= '\u2066' && c <= '\u2069');
-            if (unsafeControl || bidiControl || "\\/:*?\"<>|".indexOf(c) >= 0) out.append('_'); else out.append(c);
+        int utf8Bytes = 0;
+        for (int i = 0; i < value.length();) {
+            int codePoint = value.codePointAt(i);
+            i += Character.charCount(codePoint);
+            int type = Character.getType(codePoint);
+            boolean unsafeControl = codePoint < 0x20 || (codePoint >= 0x7f && codePoint <= 0x9f) ||
+                    type == Character.LINE_SEPARATOR || type == Character.PARAGRAPH_SEPARATOR;
+            boolean bidiControl = codePoint == 0x061c || codePoint == 0x200e || codePoint == 0x200f ||
+                    (codePoint >= 0x202a && codePoint <= 0x202e) ||
+                    (codePoint >= 0x2066 && codePoint <= 0x206f);
+            int safe = unsafeControl || bidiControl ||
+                    (codePoint < 128 && "\\/:*?\"<>|".indexOf(codePoint) >= 0) ? '_' : codePoint;
+            String piece = new String(Character.toChars(safe));
+            int pieceBytes = piece.getBytes(StandardCharsets.UTF_8).length;
+            if (utf8Bytes + pieceBytes > 180) break;
+            out.append(piece);
+            utf8Bytes += pieceBytes;
         }
         while (out.length() > 0 && (out.charAt(0) == '.' || Character.isWhitespace(out.charAt(0)))) out.deleteCharAt(0);
-        return out.toString().trim();
+        while (out.length() > 0 && (out.charAt(out.length() - 1) == '.' ||
+                Character.isWhitespace(out.charAt(out.length() - 1)))) out.deleteCharAt(out.length() - 1);
+        return out.toString();
     }
 
     private static String cleanMime(String mime) {

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Fresh, bright color scheme -->
+
+    <!-- Splash screen backgrounds -->
+    <color name="splash_background_light">#FFFFFF</color>
+    <color name="splash_background_dark">#1C1C1E</color>
+
+    <!-- Modern accent colors - vibrant and eye-friendly -->
+    <color name="accent_primary">#0A84FF</color>
+    <color name="accent_secondary">#30D158</color>
+
+    <!-- Surface colors - light theme (bright and clean) -->
+    <color name="surface_0_light">#FFFFFF</color>
+    <color name="surface_1_light">#F2F2F7</color>
+    <color name="surface_2_light">#E5E5EA</color>
+    <color name="surface_3_light">#D1D1D6</color>
+
+    <!-- Surface colors - dark theme (warm gray, not cold blue) -->
+    <color name="surface_0_dark">#1C1C1E</color>
+    <color name="surface_1_dark">#2C2C2E</color>
+    <color name="surface_2_dark">#3A3A3C</color>
+    <color name="surface_3_dark">#48484A</color>
+
+    <!-- Text colors -->
+    <color name="text_primary_light">#000000</color>
+    <color name="text_secondary_light">#6C6C70</color>
+    <color name="text_primary_dark">#FFFFFF</color>
+    <color name="text_secondary_dark">#EBEBF5</color>
+</resources>

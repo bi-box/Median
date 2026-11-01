@@ -3,6 +3,8 @@ package com.xinyv.median;
 public final class InitialNavigationGuardSelfTest {
     public static void main(String[] args) {
         InitialNavigationGuard guard = new InitialNavigationGuard();
+        expect(guard.arm("HTTP://example.com/upper") != 0L, "uppercase HTTP URL is accepted");
+        guard = new InitialNavigationGuard();
         reject(guard.arm("https://median.invalid/") == 0L, "network URL arms guard");
         long first = guard.pendingGeneration();
         expect(first > 0L, "pending generation");

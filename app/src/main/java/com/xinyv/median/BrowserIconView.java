@@ -15,7 +15,8 @@ final class BrowserIconView extends View {
             SHIELD = 7, SEARCH = 8, CLOSE = 9, PLUS = 10, KEY = 11, SPEED = 12,
             STORAGE = 13, DESKTOP = 14, SHARE = 15, INFO = 16, SCRIPT = 17,
             DOWNLOAD = 18, SETTINGS = 19, BOOKMARK = 20, HISTORY = 21,
-            APPEARANCE = 22, COOKIE = 23, STARTUP = 24, DELETE = 25, CLEAN = 26;
+            APPEARANCE = 22, COOKIE = 23, STARTUP = 24, DELETE = 25, CLEAN = 26,
+            QR = 27;
 
     private static final String ALPHABET =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
@@ -47,7 +48,8 @@ final class BrowserIconView extends View {
         "MgICtI4T4gC4tt4g4CT4ItIgCITTIgIMYYLZZMppLqqMVqLWr",
         "M0SCoFPKKeCFxb7txC2r5g0SMgELgi",
         "MQTLwTLw5LQ5ZMKLL2LMZELnEMabLawMmbLmw",
-        "MO0LtMMJrLY4MNkLf0M0LL1MM4YL5Z"
+        "MO0LtMMJrLY4MNkLf0M0LL1MM4YL5Z",
+        null
     };
     private static final Path[] PATHS = new Path[DATA.length];
     private static final Typeface BOLD = Typeface.create("sans", Typeface.BOLD);
@@ -89,6 +91,11 @@ final class BrowserIconView extends View {
     @Override protected void onDraw(Canvas canvas) {
         float width = getWidth(), height = getHeight(), size = Math.min(width, height);
         float cx = width * .5f, cy = height * .5f;
+        if (isPressed()) {
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(active ? 0x263b7bd5 : 0x1f5f6368);
+            canvas.drawCircle(cx, cy, size * .38f, paint);
+        }
         paint.setColor(active ? Color.rgb(26, 115, 232) : tintColor);
         paint.setStyle(Paint.Style.STROKE);
         paint.setStrokeWidth(Math.max(minimumStrokeWidth, size * .044f));
@@ -100,6 +107,34 @@ final class BrowserIconView extends View {
             paint.setTypeface(BOLD);
             paint.setTextSize(count > 9 ? size * .22f : size * .27f);
             canvas.drawText(countText, cx, cy - (paint.ascent() + paint.descent()) * .5f, paint);
+            return;
+        }
+        if (icon == QR) {
+            float outer = size * .18f;
+            float inner = size * .075f;
+            float left = cx - size * .23f, top = cy - size * .23f;
+            paint.setStyle(Paint.Style.STROKE);
+            paint.setStrokeWidth(Math.max(minimumStrokeWidth, size * .042f));
+            rect.set(left, top, left + outer, top + outer);
+            canvas.drawRect(rect, paint);
+            rect.offset(size * .28f, 0);
+            canvas.drawRect(rect, paint);
+            rect.offset(-size * .28f, size * .28f);
+            canvas.drawRect(rect, paint);
+            paint.setStyle(Paint.Style.FILL);
+            canvas.drawRect(left + size * .053f, top + size * .053f,
+                    left + size * .053f + inner, top + size * .053f + inner, paint);
+            canvas.drawRect(left + size * .333f, top + size * .053f,
+                    left + size * .333f + inner, top + size * .053f + inner, paint);
+            canvas.drawRect(left + size * .053f, top + size * .333f,
+                    left + size * .053f + inner, top + size * .333f + inner, paint);
+            float module = size * .058f;
+            canvas.drawRect(cx + size * .06f, cy + size * .05f,
+                    cx + size * .06f + module, cy + size * .05f + module, paint);
+            canvas.drawRect(cx + size * .15f, cy + size * .14f,
+                    cx + size * .15f + module, cy + size * .14f + module, paint);
+            canvas.drawRect(cx + size * .06f, cy + size * .19f,
+                    cx + size * .06f + module, cy + size * .19f + module, paint);
             return;
         }
         Path path = path(icon);

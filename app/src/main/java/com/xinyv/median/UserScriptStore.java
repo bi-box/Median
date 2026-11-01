@@ -13,12 +13,50 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 final class UserScriptStore {
+    /**
+     * A document-start registration plus the origins where WebView should inject it. Keeping
+     * origin-scoped scripts out of unrelated pages avoids parsing an entire script library on
+     * every navigation.
+     */
+    static final class DocumentStartPayload {
+        final String source;
+        final Set<String> allowedOriginRules;
+
+        DocumentStartPayload(String source, Set<String> allowedOriginRules) {
+            this.source = source == null ? "" : source;
+            this.allowedOriginRules = allowedOriginRules == null
+                    ? Collections.<String>emptySet()
+                    : Collections.unmodifiableSet(new LinkedHashSet<String>(allowedOriginRules));
+        }
+    }
+
+    private static final class DocumentStartTemplate {
+        final String source;
+        final Set<String> allowedOriginRules;
+
+        DocumentStartTemplate(String source, Set<String> allowedOriginRules) {
+            this.source = source;
+            this.allowedOriginRules = allowedOriginRules;
+        }
+    }
+
+    private static final class DocumentStartGroup {
+        final Set<String> allowedOriginRules;
+        final ArrayList<Script> scripts = new ArrayList<Script>();
+
+        DocumentStartGroup(Set<String> allowedOriginRules) {
+            this.allowedOriginRules = allowedOriginRules;
+        }
+    }
+
     static final class Script {
         static final class Resource {
             String name = "";
@@ -42,10 +80,6 @@ final class UserScriptStore {
         String requireCode = "";
         boolean noFrames;
         boolean enabled = true;
-        boolean quarantined;
-        String disabledReason = "";
-        int riskScore;
-        String riskSummary = "低风险";
         long installedAt;
         long updatedAt;
         long lastUpdateCheck;
@@ -63,6 +97,12 @@ final class UserScriptStore {
     private static final String KEY = "scripts";
     private static final String FILE = "userscripts-v3.json";
     private static final long WRITE_DELAY_MS = 280L;
+    private static final int MAX_SCOPED_DOCUMENT_START_PAYLOADS = 24;
+    static final int MAX_DEPENDENCIES = 8;
+    static final int MAX_RESOURCES = 8;
+    static final int MAX_METADATA_ENTRIES = 64;
+    static final int MAX_METADATA_VALUE_LENGTH = 8192;
+    static final int MAX_RESOLVED_DEPENDENCY_CODE_LENGTH = 32 * 1024 * 1024;
     private final SharedPreferences prefs;
     private final AtomicFile file;
     private final AtomicFile backup;
@@ -70,11 +110,12 @@ final class UserScriptStore {
     private final LinkedHashMap<String, List<Script>> matchCache = new LinkedHashMap<String, List<Script>>(32, .75f, true) {
         @Override protected boolean removeEldestEntry(Map.Entry<String, List<Script>> eldest) { return size() > 32; }
     };
-    private final Handler io;
+    private Handler io;
     private boolean dirty;
     private boolean closed;
     private long generation;
     private String documentStartTemplate;
+    private ArrayList<DocumentStartTemplate> documentStartTemplates;
     private String templateMarker;
     private final Runnable writer = new Runnable() {
         @Override public void run() { writeSnapshot(); }
@@ -86,7 +127,6 @@ final class UserScriptStore {
         file = new AtomicFile(new File(directory, FILE));
         backup = new AtomicFile(new File(directory, FILE + ".good"));
         boolean migrate = loadCache();
-        io = LocalDataIo.acquire();
         if (migrate) persist();
     }
 
@@ -96,7 +136,7 @@ final class UserScriptStore {
 
     synchronized boolean hasEnabledScripts() {
         for (Script script : cache) {
-            if (script.enabled && !script.quarantined && script.code.length() > 0) return true;
+            if (script.enabled && script.code.length() > 0) return true;
         }
         return false;
     }
@@ -120,6 +160,7 @@ final class UserScriptStore {
         if (!replaced) {
             cache.add(script);
         }
+        invalidateDocumentStartTemplates();
         persist();
     }
 
@@ -138,11 +179,8 @@ final class UserScriptStore {
             }
             if (!replaced) cache.add(script);
         }
+        invalidateDocumentStartTemplates();
         persist();
-    }
-
-    synchronized void refreshAnalysis(Script script) {
-        if (script != null) prepare(script);
     }
 
     synchronized String exportJson() { return serializeCacheLocked(); }
@@ -157,26 +195,32 @@ final class UserScriptStore {
 
     synchronized void flush() {
         if (closed || !dirty) return;
-        io.removeCallbacks(writer);
-        io.post(writer);
+        Handler handler = ioLocked();
+        handler.removeCallbacks(writer);
+        handler.post(writer);
     }
 
     synchronized void close() {
         if (closed) return;
         closed = true;
-        io.removeCallbacks(writer);
-        if (dirty) io.post(writer);
-        LocalDataIo.release();
+        if (io != null) {
+            io.removeCallbacks(writer);
+            if (dirty) io.post(writer);
+            LocalDataIo.release();
+        }
+    }
+
+    /** Generated payloads can duplicate every installed script; WebView retains its own copy. */
+    synchronized void trimMemory() {
+        matchCache.clear();
+        invalidateDocumentStartTemplates();
     }
 
     synchronized void setEnabled(String id, boolean enabled) {
         Script script = getById(id);
         if (script != null) {
             script.enabled = enabled;
-            if (enabled) {
-                script.quarantined = false;
-                script.disabledReason = "";
-            }
+            invalidateDocumentStartTemplates();
             persist();
         }
     }
@@ -185,6 +229,7 @@ final class UserScriptStore {
         for (int i = cache.size() - 1; i >= 0; i--) {
             if (cache.get(i).id.equals(id)) cache.remove(i);
         }
+        invalidateDocumentStartTemplates();
         persist();
     }
 
@@ -194,7 +239,7 @@ final class UserScriptStore {
         if (remembered != null) return remembered;
         ArrayList<Script> result = new ArrayList<Script>();
         for (Script script : cache) {
-            if (!script.enabled || script.quarantined || script.code.length() == 0) continue;
+            if (!script.enabled || script.code.length() == 0) continue;
             boolean included = script.matches.size() == 0;
             for (Pattern pattern : script.compiledMatches) {
                 if (pattern.matcher(url).find()) {
@@ -246,6 +291,8 @@ final class UserScriptStore {
             if (space < 0) space = meta.indexOf('\t');
             String key = space < 0 ? meta : meta.substring(0, space).trim();
             String value = space < 0 ? "" : meta.substring(space + 1).trim();
+            if (value.length() > MAX_METADATA_VALUE_LENGTH)
+                throw new IllegalArgumentException("用户脚本元数据过长");
             String lowerKey = key.toLowerCase(Locale.US);
             if (lowerKey.equals("name")) fallbackName = value;
             else if (lowerKey.startsWith("name:")) {
@@ -261,12 +308,12 @@ final class UserScriptStore {
                         (lowerKey.equals("description:zh") && localizedDescription.length() == 0)) localizedDescription = value;
             } else if (lowerKey.equals("author")) script.author = value;
             else if (lowerKey.equals("homepage") || lowerKey.equals("homepageurl") || lowerKey.equals("website") || lowerKey.equals("websiteurl")) script.homepage = value;
-            else if (lowerKey.equals("match") || lowerKey.equals("include")) addUnique(script.matches, value);
-            else if (lowerKey.equals("exclude") || lowerKey.equals("exclude-match")) addUnique(script.excludes, value);
+            else if (lowerKey.equals("match") || lowerKey.equals("include")) addUniqueBounded(script.matches, value, MAX_METADATA_ENTRIES);
+            else if (lowerKey.equals("exclude") || lowerKey.equals("exclude-match")) addUniqueBounded(script.excludes, value, MAX_METADATA_ENTRIES);
             else if (lowerKey.equals("run-at")) script.runAt = normalizeRunAt(value);
-            else if (lowerKey.equals("grant")) addUnique(script.grants, value);
-            else if (lowerKey.equals("require")) addUnique(script.requires, value);
-            else if (lowerKey.equals("connect")) addUnique(script.connects, value);
+            else if (lowerKey.equals("grant")) addUniqueBounded(script.grants, value, MAX_METADATA_ENTRIES);
+            else if (lowerKey.equals("require")) addUniqueBounded(script.requires, value, MAX_DEPENDENCIES);
+            else if (lowerKey.equals("connect")) addUniqueBounded(script.connects, value, MAX_METADATA_ENTRIES);
             else if (lowerKey.equals("resource")) parseResource(value, script.resources);
             else if (lowerKey.equals("noframes")) script.noFrames = true;
             else if (lowerKey.equals("downloadurl")) script.downloadUrl = value;
@@ -299,12 +346,17 @@ final class UserScriptStore {
             included = true;
             String key = jsQuote(script.id);
             out.append("(function(){if(window.__medianInstalled[").append(key).append("])return;window.__medianInstalled[").append(key).append("]=1;try{(function(){\n");
-            if (script.noFrames || hasBridgeGrants(script)) out.append("if(window.top!==window.self)return;\n");
+            if (script.noFrames) out.append("if(window.top!==window.self)return;\n");
             appendCompatibilityApi(out, script, bridgeToken, dispatchObjectName(bridgeToken, script.id));
             if (script.requireCode != null && script.requireCode.length() > 0) {
                 out.append("\n/* Median resolved @require */\n").append(script.requireCode).append("\n");
             }
-            if ("document-idle".equalsIgnoreCase(script.runAt)) {
+            if ("document-body".equalsIgnoreCase(script.runAt)) {
+                out.append("\nvar __medianBodyRun=function(){try{(function(){\n").append(script.code)
+                        .append("\n}).call(window);}catch(e){console.error('Median userscript body ")
+                        .append(escapeForSingle(script.name))
+                        .append("',e);}};if(document.body)__medianBodyRun();else document.addEventListener('DOMContentLoaded',__medianBodyRun,{once:true});\n");
+            } else if ("document-idle".equalsIgnoreCase(script.runAt)) {
                 out.append("\nsetTimeout(function(){try{(function(){\n").append(script.code)
                         .append("\n}).call(window);}catch(e){console.error('Median userscript idle ")
                         .append(escapeForSingle(script.name)).append("',e);}},0);\n");
@@ -319,30 +371,151 @@ final class UserScriptStore {
     }
 
     /**
-     * Combines every enabled userscript into one document-start registration per WebView. Each
-     * script remains isolated in its own closure while provider reflection and origin registration
-     * happen only once.
+     * Legacy one-payload builder retained for old-provider fallback and source-level tests.
+     * New document-start registrations use {@link #buildDocumentStartPayloads(String)} so a
+     * script scoped to one site is never parsed on unrelated pages.
      */
     synchronized String buildDocumentStartScript(String bridgeToken) {
         if (bridgeToken == null || bridgeToken.length() < 32) return "";
         if (documentStartTemplate != null) return documentStartTemplate.replace(templateMarker, bridgeToken);
-        templateMarker = UrlCleaner.randomToken();
+        if (templateMarker == null || templateMarker.length() < 32) templateMarker = UrlCleaner.randomToken();
+        documentStartTemplate = buildDocumentStartSource(cache, templateMarker);
+        return documentStartTemplate.replace(templateMarker, bridgeToken);
+    }
+
+    /**
+     * Produces a small number of origin-scoped registrations. Unknown, regex, or unrestricted
+     * match patterns deliberately stay in the wildcard group so optimization can never narrow a
+     * script's declared scope.
+     */
+    synchronized List<DocumentStartPayload> buildDocumentStartPayloads(String bridgeToken) {
+        if (bridgeToken == null || bridgeToken.length() < 32 || !hasEnabledScripts())
+            return Collections.emptyList();
+        if (documentStartTemplates == null) buildDocumentStartTemplates();
+        ArrayList<DocumentStartPayload> payloads = new ArrayList<DocumentStartPayload>(documentStartTemplates.size());
+        for (DocumentStartTemplate template : documentStartTemplates) {
+            String source = template.source.replace(templateMarker, bridgeToken);
+            if (source.length() > 0 && !template.allowedOriginRules.isEmpty())
+                payloads.add(new DocumentStartPayload(source, template.allowedOriginRules));
+        }
+        return payloads;
+    }
+
+    private void buildDocumentStartTemplates() {
+        if (templateMarker == null || templateMarker.length() < 32) templateMarker = UrlCleaner.randomToken();
+        LinkedHashMap<String, DocumentStartGroup> scoped = new LinkedHashMap<String, DocumentStartGroup>();
+        ArrayList<Script> fallback = new ArrayList<Script>();
+        for (Script script : cache) {
+            if (!script.enabled || script.code.length() == 0) continue;
+            Set<String> origins = scopedOriginRules(script.matches);
+            String key = origins == null ? "" : originSignature(origins);
+            DocumentStartGroup group = origins == null ? null : scoped.get(key);
+            if (origins == null || (group == null && scoped.size() >= MAX_SCOPED_DOCUMENT_START_PAYLOADS)) {
+                fallback.add(script);
+                continue;
+            }
+            if (group == null) {
+                group = new DocumentStartGroup(origins);
+                scoped.put(key, group);
+            }
+            group.scripts.add(script);
+        }
+
+        ArrayList<DocumentStartTemplate> result = new ArrayList<DocumentStartTemplate>(
+                scoped.size() + (fallback.isEmpty() ? 0 : 1));
+        for (DocumentStartGroup group : scoped.values()) {
+            String source = buildDocumentStartSource(group.scripts, templateMarker);
+            if (source.length() > 0) result.add(new DocumentStartTemplate(source, group.allowedOriginRules));
+        }
+        if (!fallback.isEmpty()) {
+            String source = buildDocumentStartSource(fallback, templateMarker);
+            if (source.length() > 0) result.add(new DocumentStartTemplate(source,
+                    Collections.singleton("*")));
+        }
+        documentStartTemplates = result;
+    }
+
+    private static String originSignature(Set<String> origins) {
+        StringBuilder key = new StringBuilder(origins.size() * 28);
+        for (String origin : origins) key.append(origin).append('\n');
+        return key.toString();
+    }
+
+    /** Returns a safe origin superset for ordinary @match/@include glob patterns, or null. */
+    static Set<String> scopedOriginRules(List<String> matches) {
+        if (matches == null || matches.isEmpty()) return null;
+        LinkedHashSet<String> result = new LinkedHashSet<String>();
+        for (String raw : matches) {
+            Set<String> parsed = originRulesForMatch(raw);
+            if (parsed == null) return null;
+            result.addAll(parsed);
+            // Very broad metadata creates more provider work than the scoped optimization saves.
+            if (result.size() > 12) return null;
+        }
+        return result.isEmpty() ? null : Collections.unmodifiableSet(result);
+    }
+
+    private static Set<String> originRulesForMatch(String raw) {
+        String pattern = raw == null ? "" : raw.trim().toLowerCase(Locale.US);
+        if (pattern.length() == 0 || pattern.equals("<all_urls>") || pattern.startsWith("/")) return null;
+        int schemeAt = pattern.indexOf("://");
+        if (schemeAt <= 0) return null;
+        String scheme = pattern.substring(0, schemeAt);
+        String remainder = pattern.substring(schemeAt + 3);
+        int slash = remainder.indexOf('/');
+        if (slash < 0) return null;
+        String authority = remainder.substring(0, slash);
+        if (!validOriginAuthority(authority)) return null;
+        LinkedHashSet<String> result = new LinkedHashSet<String>();
+        if ("*".equals(scheme)) {
+            result.add("http://" + authority);
+            result.add("https://" + authority);
+        } else if ("http".equals(scheme) || "https".equals(scheme)) {
+            result.add(scheme + "://" + authority);
+        } else return null;
+        return result;
+    }
+
+    private static boolean validOriginAuthority(String value) {
+        if (value == null || value.length() == 0 || value.length() > 253 || value.indexOf('@') >= 0 ||
+                value.indexOf('?') >= 0 || value.indexOf('#') >= 0 || value.indexOf('[') >= 0 ||
+                value.indexOf(']') >= 0) return false;
+        String host = value;
+        int colon = value.lastIndexOf(':');
+        if (colon >= 0) {
+            host = value.substring(0, colon);
+            String port = value.substring(colon + 1);
+            if (port.length() == 0 || port.length() > 5) return false;
+            for (int i = 0; i < port.length(); i++) if (!Character.isDigit(port.charAt(i))) return false;
+        }
+        if (host.length() == 0 || host.equals("*") || host.startsWith("*.") && host.length() <= 2) return false;
+        for (int i = 0; i < host.length(); i++) {
+            char c = host.charAt(i);
+            if (!(Character.isLetterOrDigit(c) || c == '.' || c == '-' || (c == '*' && i == 0 && host.startsWith("*."))))
+                return false;
+        }
+        return true;
+    }
+
+    private static String buildDocumentStartSource(List<Script> scripts, String marker) {
+        if (scripts == null || scripts.isEmpty()) return "";
         StringBuilder out = new StringBuilder(8192);
         out.append("(function(){'use strict';if((location.protocol!=='http:'&&location.protocol!=='https:')||String(location.hostname||'').toLowerCase()==='median.invalid')return;var __mu=String(location.href||'');window.__medianInstalled=window.__medianInstalled||{};");
-        for (Script script : cache) if (script.enabled && !script.quarantined &&
-                script.code.length() > 0 && hasNativeGrants(script)) {
+        for (Script script : scripts) if (script.enabled && script.code.length() > 0 && hasNativeGrants(script)) {
             appendCompatibilityRuntime(out);
             break;
         }
-        for (Script script : cache) {
-            if (!script.enabled || script.quarantined || script.code.length() == 0) continue;
+        boolean included = false;
+        for (Script script : scripts) {
+            if (!script.enabled || script.code.length() == 0) continue;
+            included = true;
             out.append("(function(){if(!(")
                     .append(jsPatternTest(script.compiledMatches, "__mu"))
                     .append(")||(").append(jsPatternTest(script.compiledExcludes, "__mu"))
                     .append("))return;var __medianKey=").append(jsQuote(script.id))
                     .append(";if(window.__medianInstalled[__medianKey])return;window.__medianInstalled[__medianKey]=1;var __medianRun=function(){try{(function(){\n");
-            if (script.noFrames || hasBridgeGrants(script)) out.append("if(window.top!==window.self)return;\n");
-            appendCompatibilityApi(out, script, templateMarker, dispatchObjectName(templateMarker, script.id));
+            if (script.noFrames) out.append("if(window.top!==window.self)return;\n");
+            appendCompatibilityApi(out, script, marker, dispatchObjectName(marker, script.id));
             if (script.requireCode != null && script.requireCode.length() > 0) {
                 out.append("\n/* Median resolved @require */\n").append(script.requireCode).append("\n");
             }
@@ -360,13 +533,18 @@ final class UserScriptStore {
             }
             out.append("})();");
         }
-        documentStartTemplate = out.append("})();").toString();
-        return documentStartTemplate.replace(templateMarker, bridgeToken);
+        return included ? out.append("})();").toString() : "";
+    }
+
+    private void invalidateDocumentStartTemplates() {
+        documentStartTemplate = null;
+        documentStartTemplates = null;
+        templateMarker = null;
     }
 
     synchronized boolean matchesUrl(String scriptId, String url) {
         Script script = getById(scriptId);
-        if (script == null || !script.enabled || script.quarantined || !isEligiblePageUrl(url)) return false;
+        if (script == null || !script.enabled || !isEligiblePageUrl(url)) return false;
         boolean included = false;
         for (Pattern pattern : script.compiledMatches) if (pattern.matcher(url).find()) { included = true; break; }
         if (!included) return false;
@@ -392,7 +570,8 @@ final class UserScriptStore {
                     grant.equals("gm_setvalue") || grant.equals("gm_setvalues") || grant.equals("gm_deletevalue") ||
                     grant.equals("gm_deletevalues") || grant.equals("gm_listvalues") || grant.equals("gm_openintab") ||
                     grant.equals("gm_setclipboard") || grant.equals("gm_notification") || grant.equals("gm_download") ||
-                    grant.equals("gm_xmlhttprequest") || grant.equals("gm_registermenucommand")) return true;
+                    grant.equals("gm_xmlhttprequest") || grant.equals("gm_registermenucommand") ||
+                    grant.equals("gm_gettab") || grant.equals("gm_savetab") || grant.equals("gm_gettabs")) return true;
         }
         return false;
     }
@@ -412,15 +591,28 @@ final class UserScriptStore {
         for (Pattern pattern : patterns) {
             if (out.length() > 0) out.append("||");
             String flags = (pattern.flags() & Pattern.CASE_INSENSITIVE) != 0 ? "i" : "";
-            out.append("(new RegExp(").append(jsQuote(pattern.pattern())).append(',').append(jsQuote(flags))
-                    .append(").test(").append(valueExpression).append("))");
+            String source = pattern.pattern();
+            // Java's glob compiler wraps the scheme and authority in an inline
+            // case-insensitive group (for example ^(?i:https?)://example.com/.*$).
+            // JavaScript RegExp does not implement the (?i:...) syntax; passing it
+            // through makes the entire document-start payload throw before any
+            // userscript can run. Normalize the URL's scheme/authority instead and
+            // use a regular non-capturing group in the generated JavaScript regex.
+            boolean inlineCase = source.indexOf("(?i:") >= 0;
+            if (inlineCase) source = source.replace("(?i:", "(?:");
+            String expression = valueExpression;
+            if (inlineCase) {
+                expression = "(function(v){try{var u=new URL(v);return u.protocol.toLowerCase()+'//'+u.host.toLowerCase()+u.pathname+u.search+u.hash;}catch(_){return String(v);}})(" + valueExpression + ")";
+            }
+            out.append("(new RegExp(").append(jsQuote(source)).append(',').append(jsQuote(flags))
+                    .append(").test(").append(expression).append("))");
         }
         return out.toString();
     }
 
     synchronized boolean canConnect(String scriptId, String targetUrl, String pageUrl) {
         Script script = getById(scriptId);
-        if (script == null || !script.enabled || script.quarantined || !matchesUrl(scriptId, pageUrl)) return false;
+        if (script == null || !script.enabled || !matchesUrl(scriptId, pageUrl)) return false;
         try {
             java.net.URL target = NetworkSecurity.parseHttpUrl(targetUrl);
             java.net.URL page = NetworkSecurity.parseHttpUrl(pageUrl);
@@ -455,12 +647,12 @@ final class UserScriptStore {
 
     synchronized boolean isRunnable(String scriptId) {
         Script script = getById(scriptId);
-        return script != null && script.enabled && !script.quarantined;
+        return script != null && script.enabled;
     }
 
     synchronized boolean allowsApi(String scriptId, String action) {
         Script script = getById(scriptId);
-        if (script == null || !script.enabled || script.quarantined) return false;
+        if (script == null || !script.enabled) return false;
         if (script.grants.size() == 0) return false; // Missing @grant is treated as least privilege.
         for (String raw : script.grants) {
             String grant = normalizeGrant(raw);
@@ -473,6 +665,9 @@ final class UserScriptStore {
                     (action.equals("clipboard") && "gm_setclipboard".equals(grant)) ||
                     (action.equals("notification") && "gm_notification".equals(grant)) ||
                     (action.equals("download") && "gm_download".equals(grant)) ||
+                    (action.equals("getTab") && ("gm_gettab".equals(grant) || "gm_gettabs".equals(grant))) ||
+                    (action.equals("saveTab") && "gm_savetab".equals(grant)) ||
+                    (action.equals("getTabs") && "gm_gettabs".equals(grant)) ||
                     (action.equals("cookie") && grant.startsWith("gm_cookie")) ||
                     ((action.equals("xhr") || action.equals("xhrAbort")) && "gm_xmlhttprequest".equals(grant))) return true;
         }
@@ -503,8 +698,7 @@ final class UserScriptStore {
     private boolean decodeCache(String raw) {
         cache.clear();
         matchCache.clear();
-        documentStartTemplate = null;
-        templateMarker = null;
+        invalidateDocumentStartTemplates();
         if (raw == null) return false;
         try {
             JSONArray array = new JSONArray(raw);
@@ -525,12 +719,12 @@ final class UserScriptStore {
                 script.runAt = normalizeRunAt(object.optString("runAt", "document-end"));
                 script.code = object.optString("code", "");
                 script.requireCode = object.optString("requireCode", "");
+                if (script.requireCode.length() > MAX_RESOLVED_DEPENDENCY_CODE_LENGTH) continue;
                 script.noFrames = object.optBoolean("noFrames", false);
                 script.enabled = object.optBoolean("enabled", true);
-                boolean previouslyQuarantined = object.optBoolean("quarantined", false);
-                script.quarantined = false;
-                script.disabledReason = "";
-                if (previouslyQuarantined) script.enabled = true;
+                // Risk scoring and automatic quarantine were removed in 2.4. Existing backups
+                // that were disabled only by the old automatic quarantine are re-enabled once.
+                if (object.optBoolean("quarantined", false)) script.enabled = true;
                 script.installedAt = object.optLong("installedAt", 0L);
                 script.updatedAt = object.optLong("updatedAt", script.installedAt);
                 script.lastUpdateCheck = object.optLong("lastUpdateCheck", 0L);
@@ -553,13 +747,18 @@ final class UserScriptStore {
 
     private synchronized void persist() {
         matchCache.clear();
-        documentStartTemplate = null;
-        templateMarker = null;
+        invalidateDocumentStartTemplates();
         if (closed) return;
         generation++;
         dirty = true;
-        io.removeCallbacks(writer);
-        io.postDelayed(writer, WRITE_DELAY_MS);
+        Handler handler = ioLocked();
+        handler.removeCallbacks(writer);
+        handler.postDelayed(writer, WRITE_DELAY_MS);
+    }
+
+    private Handler ioLocked() {
+        if (io == null) io = LocalDataIo.acquire();
+        return io;
     }
 
     private String serializeCacheLocked() {
@@ -582,8 +781,6 @@ final class UserScriptStore {
                 object.put("requireCode", script.requireCode);
                 object.put("noFrames", script.noFrames);
                 object.put("enabled", script.enabled);
-                object.put("quarantined", script.quarantined);
-                object.put("disabledReason", script.disabledReason);
                 object.put("installedAt", script.installedAt);
                 object.put("updatedAt", script.updatedAt);
                 object.put("lastUpdateCheck", script.lastUpdateCheck);
@@ -635,7 +832,6 @@ final class UserScriptStore {
     private static void prepare(Script script) {
         script.runAt = normalizeRunAt(script.runAt);
         preparePatterns(script);
-        analyzeRisk(script);
     }
 
     private static String normalizeRunAt(String value) {
@@ -645,49 +841,9 @@ final class UserScriptStore {
         return "document-end";
     }
 
-    private static void analyzeRisk(Script script) {
-        String combined = (script.requireCode == null ? "" : script.requireCode) + "\n" + (script.code == null ? "" : script.code);
-        String lower = combined.toLowerCase(Locale.US);
-        int score = 0;
-        ArrayList<String> reasons = new ArrayList<String>();
-        if (script.matches.contains("*://*/*") || script.matches.contains("http*://*/*")) { score += 2; reasons.add("全站运行"); }
-        if (script.requires.size() > 0) { score += Math.min(4, script.requires.size() * 2); reasons.add("外部依赖"); }
-        if (script.resources.size() > 0) { score += Math.min(2, script.resources.size()); reasons.add("外部资源"); }
-        if (script.connects.contains("*")) { score += 2; reasons.add("任意网络域名"); }
-        for (String grant : script.grants) {
-            if (!"none".equalsIgnoreCase(grant)) score += 1;
-            if (grant.toLowerCase(Locale.US).contains("xmlhttprequest") || grant.toLowerCase(Locale.US).contains("download")) score += 1;
-        }
-        if (lower.contains("unsafewindow")) { score += 2; reasons.add("网页全局访问"); }
-        if (lower.contains("eval(") || lower.contains("new function")) { score += 3; reasons.add("动态代码"); }
-        if (lower.contains("while(true)") || lower.contains("while (true)") || lower.contains("for(;;)")) { score += 5; reasons.add("疑似无限循环"); }
-        if (lower.contains("setinterval(")) { score += 1; reasons.add("高频定时器"); }
-        if (lower.contains("mutationobserver")) { score += 1; reasons.add("持续 DOM 监听"); }
-        if (lower.contains("xmlhttprequest") || lower.contains("fetch(") || lower.contains("websocket")) { score += 2; reasons.add("网络访问"); }
-        if (lower.contains("document.cookie") || lower.contains("localstorage")) { score += 1; reasons.add("网站数据访问"); }
-        if (lower.contains("navigator.clipboard") || lower.contains("execcommand('copy") || lower.contains("execcommand(\"copy")) { score += 1; reasons.add("剪贴板访问"); }
-        if (lower.contains("sendbeacon") || lower.contains("rtcpeerconnection")) { score += 2; reasons.add("后台通信"); }
-        if (script.code != null && script.code.length() > 262144) { score += 2; reasons.add("大型脚本"); }
-        script.riskScore = score;
-        if (score >= 8) script.riskSummary = "高风险 · " + join(reasons);
-        else if (score >= 4) script.riskSummary = "中风险 · " + join(reasons);
-        else if (score > 0) script.riskSummary = "低风险 · " + join(reasons);
-        else script.riskSummary = "低风险 · 未发现明显危险特征";
-    }
-
-    private static String join(List<String> values) {
-        if (values.size() == 0) return "需人工检查";
-        StringBuilder out = new StringBuilder();
-        for (int i = 0; i < values.size() && i < 4; i++) {
-            if (i > 0) out.append("、");
-            out.append(values.get(i));
-        }
-        return out.toString();
-    }
-
     private static void copyArray(JSONArray array, List<String> target) {
         if (array == null) return;
-        for (int i = 0; i < array.length(); i++) addUnique(target, array.optString(i));
+        for (int i = 0; i < array.length() && target.size() < MAX_METADATA_ENTRIES; i++) addUniqueBounded(target, array.optString(i), MAX_METADATA_ENTRIES);
     }
 
     private static void parseResource(String value, List<Script.Resource> target) {
@@ -700,7 +856,8 @@ final class UserScriptStore {
         if (split <= 0) return;
         String name = trimmed.substring(0, split).trim();
         String url = trimmed.substring(split + 1).trim();
-        if (name.length() == 0 || url.length() == 0) return;
+        if (name.length() == 0 || url.length() == 0 || name.length() > 256 || url.length() > MAX_METADATA_VALUE_LENGTH ||
+                target.size() >= MAX_RESOURCES) return;
         for (Script.Resource existing : target) if (existing.name.equals(name)) return;
         Script.Resource resource = new Script.Resource();
         resource.name = name;
@@ -710,7 +867,8 @@ final class UserScriptStore {
 
     private static void copyResources(JSONArray array, List<Script.Resource> target) {
         if (array == null) return;
-        for (int i = 0; i < array.length(); i++) {
+        int totalBytes = 0;
+        for (int i = 0; i < array.length() && target.size() < MAX_RESOURCES; i++) {
             JSONObject object = array.optJSONObject(i);
             if (object == null) continue;
             Script.Resource resource = new Script.Resource();
@@ -718,14 +876,23 @@ final class UserScriptStore {
             resource.url = object.optString("url", "");
             resource.mime = object.optString("mime", "application/octet-stream");
             resource.base64 = object.optString("base64", "");
-            if (resource.name.length() > 0) target.add(resource);
+            if (resource.name.length() > 0 && resource.name.length() <= 256 && resource.url.length() <= MAX_METADATA_VALUE_LENGTH &&
+                    resource.base64.length() <= 16 * 1024 * 1024 &&
+                    totalBytes <= MAX_RESOLVED_DEPENDENCY_CODE_LENGTH - resource.base64.length()) {
+                target.add(resource);
+                totalBytes += resource.base64.length();
+            }
         }
     }
 
     private static void addUnique(List<String> list, String value) {
+        addUniqueBounded(list, value, MAX_METADATA_ENTRIES);
+    }
+
+    private static void addUniqueBounded(List<String> list, String value, int maxEntries) {
         if (value == null) return;
         String v = value.trim();
-        if (v.length() > 0 && !list.contains(v)) list.add(v);
+        if (v.length() > 0 && v.length() <= MAX_METADATA_VALUE_LENGTH && list.size() < maxEntries && !list.contains(v)) list.add(v);
     }
 
     private static void preparePatterns(Script script) {
@@ -786,7 +953,7 @@ final class UserScriptStore {
         out.append("var __medianApiFactory=function(C){var __msid=C.i,__mbt=C.t,__mb=!!C.b,__mp=(typeof window.prompt==='function'?window.prompt.bind(window):null);"
                 + "var __mraw=function(a,p){try{if(!__mb||!__mp||__mbt.length<32)return null;var r=__mp('__MEDIAN_BRIDGE__'+JSON.stringify({t:__mbt,s:__msid,a:a,p:p||{}}),'');return r?JSON.parse(r):null;}catch(e){return null;}};"
                 + "var unsafeWindow=window,__mk=__msid+':',__mcall=__mraw,__mcb=Object.create(null),__mmenu=Object.create(null),__mmc=1;"
-                + "var GM_info={script:{name:C.n,version:C.v,namespace:C.ns,description:C.de,author:C.a,homepage:C.h,homepageURL:C.h,source:C.so,downloadURL:C.du,updateURL:C.uu,runAt:C.ra},scriptHandler:'Median',version:'2.3.0',isIncognito:false,platform:{browserName:'Median',os:'android'}};"
+                + "var GM_info={script:{name:C.n,version:C.v,namespace:C.ns,description:C.de,author:C.a,homepage:C.h,homepageURL:C.h,source:C.so,downloadURL:C.du,updateURL:C.uu,runAt:C.ra,uuid:C.i,matches:C.ma||[],includes:C.ma||[],excludes:C.ex||[],grant:C.gr||[],connects:C.co||[],resources:Object.keys(C.r||{})},scriptMetaStr:C.ms||'',scriptHandler:'Median',version:" + jsQuote(BuildConfig.VERSION_NAME) + ",isIncognito:false,platform:{browserName:'Median',os:'android'}};"
                 + "var __mdecode=function(p,rt){if(!p)return p;rt=String(rt||'').toLowerCase();try{if((rt==='arraybuffer'||rt==='blob')&&typeof p.response==='string'){var b=atob(p.response),a=new Uint8Array(b.length);for(var j=0;j<b.length;j++)a[j]=b.charCodeAt(j);p.response=rt==='blob'&&typeof Blob==='function'?new Blob([a],{type:String(p.contentType||'application/octet-stream')}):a.buffer;}else if(rt==='json'&&typeof p.response==='string'){p.response=p.response.length?JSON.parse(p.response):null;}else if(rt==='document'&&typeof p.response==='string'){p.response=(new DOMParser()).parseFromString(p.response,p.contentType&&p.contentType.indexOf('xml')>=0?'application/xml':'text/html');}}catch(_){if(rt==='json')p.response=null;}return p;};"
                 + "var __mdispatch=function(t,i,e,p){var x=__mcb[i];if(!x||t!==__mbt)return;p=__mdecode(p,x.o.responseType);if(p&&typeof p==='object')p.context=x.o.context;if(e==='progress'){if(x.o.onprogress)x.o.onprogress(p);return;}try{if(p&&typeof p==='object')p.readyState=4;if(x.o.onreadystatechange)x.o.onreadystatechange(p);if(e==='load'&&x.o.onload)x.o.onload(p);else if(e==='error'&&x.o.onerror)x.o.onerror(p);else if(e==='timeout'&&x.o.ontimeout)x.o.ontimeout(p);else if(e==='abort'&&x.o.onabort)x.o.onabort(p);}finally{if(x.o.onloadend)x.o.onloadend(p);delete __mcb[i];}};"
                 + "var __mlist=function(t){if(t!==__mbt)return[];return Object.keys(__mmenu).map(function(i){var x=__mmenu[i];return{id:i,caption:x.c,script:C.n};});};"
@@ -802,12 +969,13 @@ final class UserScriptStore {
                 + "var GM_deleteValue=function(k){var o=GM_getValue(k,undefined),r=__mcall('deleteValue',{k:String(k)});if(!(r&&r.ok))try{localStorage.removeItem(__mk+k);}catch(e){}__mvd(String(k),o,undefined,false);};"
                 + "var GM_listValues=function(){var r=__mcall('listValues',{});if(r&&r.ok)return r.v||[];var a=[];try{for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);if(k&&k.indexOf(__mk)===0)a.push(k.slice(__mk.length));}}catch(e){}return a;};"
                 + "var GM_getValues=function(q){var o={},a;if(Array.isArray(q))a=q;else if(q&&typeof q==='object')a=Object.keys(q);else a=GM_listValues();a.forEach(function(k){o[k]=GM_getValue(k,q&& !Array.isArray(q)?q[k]:undefined);});return o;},GM_setValues=function(o){Object.keys(o||{}).forEach(function(k){GM_setValue(k,o[k]);});},GM_deleteValues=function(a){(a||[]).forEach(GM_deleteValue);};"
+                + "var GM_getTab=function(c){var r=__mcall('getTab',{}),v=r&&r.ok&&r.v&&typeof r.v==='object'?r.v:{};__msoon(c,v);return v;},GM_saveTab=function(v,c){var j;try{j=JSON.stringify(v||{});}catch(e){j='{}';}var r=__mcall('saveTab',{v:j});__msoon(c);return!!(r&&r.ok);},GM_getTabs=function(c){var r=__mcall('getTabs',{}),v=r&&r.ok&&r.v&&typeof r.v==='object'?r.v:{};__msoon(c,v);return v;};"
                 + "var GM_addValueChangeListener=function(k,f){var i=__mvli++;__mvl[i]={k:String(k),f:f};return i;},GM_removeValueChangeListener=function(i){delete __mvl[i];};"
                 + "var GM_addElement=function(a,b,c){var p=document.documentElement,t=a,x=b;if(a&&a.nodeType){p=a;t=b;x=c;}var e=document.createElement(t);x=x||{};Object.keys(x).forEach(function(k){var v=x[k];if(k==='textContent'||k==='innerHTML'||k==='className'||k==='htmlFor')e[k]=v;else if(k==='style'&&v&&typeof v==='object')Object.assign(e.style,v);else if(/^on/.test(k)&&typeof v==='function')e.addEventListener(k.slice(2),v);else if(k in e&&typeof v!=='object')try{e[k]=v;}catch(_){e.setAttribute(k,v);}else e.setAttribute(k,v);});p.appendChild(e);return e;};"
                 + "var __murl=function(u){try{return new URL(String(u||''),location.href).href;}catch(e){return String(u||'');}};var GM_openInTab=function(u,o){u=__murl(u);var r=__mcall('openTab',{u:u,active:!(o&&o.active===false)}),w=null;if(!(r&&r.ok)&&!__mb)try{w=window.open(u,'_blank');}catch(e){}return{close:function(){try{if(w)w.close();}catch(e){}},get closed(){return w?!!w.closed:!(r&&r.ok);}};};"
                 + "var GM_setClipboard=function(v){var r=__mcall('clipboard',{v:String(v)});if(r&&r.ok)return;v=String(v);var t=document.createElement('textarea');t.value=v;document.documentElement.appendChild(t);t.select();try{document.execCommand('copy');}finally{t.remove();}};"
                 + "var GM_notification=function(o){o=typeof o==='string'?{text:o}:(o||{});var r=__mcall('notification',{title:String(o.title||'Median'),text:String(o.text||'')});if(!(r&&r.ok))GM_log(o.text||'');};"
-                + "var GM_registerMenuCommand=function(c,f){if(typeof f!=='function')return'';var i=__msid+'-'+(__mmc++);__mmenu[i]={c:String(c).slice(0,160),f:f};return i;};var GM_unregisterMenuCommand=function(i){delete __mmenu[String(i)];};"
+                + "var GM_registerMenuCommand=function(c,f){if(typeof f!=='function')return'';var i=__msid+'-'+(__mmc++);__mmenu[i]={c:Array.from(String(c)).slice(0,160).join(''),f:f};return i;};var GM_unregisterMenuCommand=function(i){delete __mmenu[String(i)];};"
                 + "var GM_getResourceURL=function(n){var r=__mres[n];return r&&r.b?'data:'+(r.m||'application/octet-stream')+';base64,'+r.b:(r?r.u:undefined);};"
                 + "var GM_getResourceUrl=GM_getResourceURL;"
                 + "var GM_getResourceText=function(n){var r=__mres[n];if(!r||!r.b)return undefined;try{var s=atob(r.b),a=new Uint8Array(s.length);for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);if(typeof TextDecoder==='function')return new TextDecoder('utf-8').decode(a);var q='';for(i=0;i<a.length;i++)q+='%'+('0'+a[i].toString(16)).slice(-2);return decodeURIComponent(q);}catch(e){return undefined;}};"
@@ -815,8 +983,8 @@ final class UserScriptStore {
                 + "var GM_cookie={list:function(d,c){d=d||{};var r=__mcall('cookie',{op:'list',d:d}),a=r&&r.ok?(r.v||[]):[];if(!r&&!__mb)try{a=document.cookie.split(/;\\s*/).filter(Boolean).map(function(x){var i=x.indexOf('=');return{name:i<0?x:x.slice(0,i),value:i<0?'':x.slice(i+1),domain:location.hostname,path:'/',secure:location.protocol==='https:'};}).filter(function(x){return!d.name||x.name===d.name;});}catch(e){}__msoon(c,a);return a;},set:function(d,c){d=d||{};var r=__mcall('cookie',{op:'set',d:d});if(!r&&!__mb)try{document.cookie=encodeURIComponent(d.name)+'='+encodeURIComponent(d.value==null?'':d.value)+'; path='+(d.path||'/')+(d.domain?'; domain='+d.domain:'')+(d.secure?'; secure':'')+(d.expirationDate?'; expires='+new Date(d.expirationDate*1000).toUTCString():'');r={ok:true};}catch(e){}__msoon(c,r&&r.ok?null:{error:'cookie rejected'});return!!(r&&r.ok);},delete:function(d,c){d=d||{};var r=__mcall('cookie',{op:'delete',d:d});if(!r&&!__mb)try{document.cookie=encodeURIComponent(d.name)+'=; Max-Age=0; path='+(d.path||'/')+(d.domain?'; domain='+d.domain:'');r={ok:true};}catch(e){}__msoon(c,r&&r.ok?null:{error:'cookie rejected'});return!!(r&&r.ok);}};"
                 + "var __mpagexhr=function(o){var x=new XMLHttpRequest(),u=String(o.url||''),m=String(o.method||'GET');x.open(m,u,true,o.user||undefined,o.password||undefined);try{x.timeout=Number(o.timeout||0);if(o.responseType)x.responseType=o.responseType;if(o.overrideMimeType)x.overrideMimeType(o.overrideMimeType);x.withCredentials=!o.anonymous;Object.keys(o.headers||{}).forEach(function(k){x.setRequestHeader(k,o.headers[k]);});}catch(e){}var p=function(){var r={readyState:x.readyState,status:x.status,statusText:x.statusText,finalUrl:x.responseURL||u,responseHeaders:x.getAllResponseHeaders(),response:x.response,context:o.context};try{r.responseText=x.responseText;}catch(e){r.responseText='';}return r;};x.onreadystatechange=function(){if(o.onreadystatechange)o.onreadystatechange(p());};x.onloadstart=function(){if(o.onloadstart)o.onloadstart(p());};x.onprogress=function(e){if(o.onprogress){var r=p();r.loaded=e.loaded;r.total=e.total;r.lengthComputable=e.lengthComputable;o.onprogress(r);}};var z=function(n){return function(){var r=p();if(o[n])o[n](r);if(o.onloadend)o.onloadend(r);};};x.onload=z('onload');x.onerror=z('onerror');x.ontimeout=z('ontimeout');x.onabort=z('onabort');x.send(o.data==null?null:o.data);return x;};"
                 + "var GM_xmlhttpRequest=function(o){o=o||{};o.url=__murl(o.url);if(!__mb)return __mpagexhr(o);var i='x'+Date.now().toString(36)+Math.random().toString(36).slice(2),d=o.data,b=false;if(d instanceof ArrayBuffer||ArrayBuffer.isView(d)){var a=d instanceof ArrayBuffer?new Uint8Array(d):new Uint8Array(d.buffer,d.byteOffset,d.byteLength),z='';for(var j=0;j<a.length;j+=8192)z+=String.fromCharCode.apply(null,a.subarray(j,j+8192));d=btoa(z);b=true;}else if(d!=null&&typeof d!=='string'){try{d=typeof URLSearchParams==='function'&&d instanceof URLSearchParams?String(d):JSON.stringify(d);}catch(_){d=String(d);}}var q={i:i,u:o.url,m:String(o.method||'GET'),h:o.headers||{},d:d==null?'':d,b64:b,rt:String(o.responseType||'text'),to:Number(o.timeout||0),anon:!!o.anonymous};__mcb[i]={o:o};try{var st={readyState:1,finalUrl:q.u,context:o.context};if(o.onloadstart)o.onloadstart(st);if(o.onreadystatechange)o.onreadystatechange(st);}catch(_){}var r=__mcall('xhr',q);if(!(r&&r.ok)){delete __mcb[i];setTimeout(function(){var e={error:(r&&r.error)||'request rejected',readyState:4,context:o.context};try{if(o.onreadystatechange)o.onreadystatechange(e);if(o.onerror)o.onerror(e);}finally{if(o.onloadend)o.onloadend(e);}},0);}return{abort:function(){if(!__mcb[i])return;__mcall('xhrAbort',{i:i});}};};"
-                + "var __mpr=function(f){return function(){return Promise.resolve(f.apply(null,arguments));};};var GM={info:GM_info,log:GM_log,addStyle:GM_addStyle,addElement:GM_addElement,getValue:__mpr(GM_getValue),setValue:__mpr(GM_setValue),deleteValue:__mpr(GM_deleteValue),listValues:__mpr(GM_listValues),getValues:__mpr(GM_getValues),setValues:__mpr(GM_setValues),deleteValues:__mpr(GM_deleteValues),addValueChangeListener:GM_addValueChangeListener,removeValueChangeListener:GM_removeValueChangeListener,openInTab:GM_openInTab,setClipboard:__mpr(GM_setClipboard),notification:__mpr(GM_notification),registerMenuCommand:GM_registerMenuCommand,unregisterMenuCommand:GM_unregisterMenuCommand,getResourceText:__mpr(GM_getResourceText),getResourceURL:__mpr(GM_getResourceURL),getResourceUrl:__mpr(GM_getResourceURL),download:GM_download,xmlHttpRequest:function(o){var q=o||{},x,l=q.onload,e=q.onerror,t=q.ontimeout,a=q.onabort,p=new Promise(function(resolve,reject){x=GM_xmlhttpRequest(Object.assign({},q,{onload:function(r){if(l)l(r);resolve(r);},onerror:function(r){if(e)e(r);reject(r);},ontimeout:function(r){if(t)t(r);reject(r);},onabort:function(r){if(a)a(r);reject(r);}}));});p.abort=function(){if(x&&x.abort)x.abort();};return p;},xmlhttpRequest:GM_xmlhttpRequest,cookie:{list:__mpr(GM_cookie.list),set:__mpr(GM_cookie.set),delete:__mpr(GM_cookie.delete)}};\n"
-                + "return{w:unsafeWindow,i:GM_info,l:GM_log,s:GM_addStyle,gv:GM_getValue,sv:GM_setValue,dv:GM_deleteValue,lv:GM_listValues,gvs:GM_getValues,svs:GM_setValues,dvs:GM_deleteValues,av:GM_addValueChangeListener,rv:GM_removeValueChangeListener,ae:GM_addElement,ot:GM_openInTab,sc:GM_setClipboard,no:GM_notification,rm:GM_registerMenuCommand,um:GM_unregisterMenuCommand,ru:GM_getResourceURL,rt:GM_getResourceText,dl:GM_download,ck:GM_cookie,xr:GM_xmlhttpRequest,g:GM};};");
+                + "var __mpr=function(f){return function(){return Promise.resolve(f.apply(null,arguments));};};var GM={info:GM_info,log:GM_log,addStyle:GM_addStyle,addElement:GM_addElement,getValue:__mpr(GM_getValue),setValue:__mpr(GM_setValue),deleteValue:__mpr(GM_deleteValue),listValues:__mpr(GM_listValues),getValues:__mpr(GM_getValues),setValues:__mpr(GM_setValues),deleteValues:__mpr(GM_deleteValues),getTab:__mpr(GM_getTab),saveTab:__mpr(GM_saveTab),getTabs:__mpr(GM_getTabs),addValueChangeListener:GM_addValueChangeListener,removeValueChangeListener:GM_removeValueChangeListener,openInTab:GM_openInTab,setClipboard:__mpr(GM_setClipboard),notification:__mpr(GM_notification),registerMenuCommand:GM_registerMenuCommand,unregisterMenuCommand:GM_unregisterMenuCommand,getResourceText:__mpr(GM_getResourceText),getResourceURL:__mpr(GM_getResourceURL),getResourceUrl:__mpr(GM_getResourceURL),download:GM_download,xmlHttpRequest:function(o){var q=o||{},x,l=q.onload,e=q.onerror,t=q.ontimeout,a=q.onabort,p=new Promise(function(resolve,reject){x=GM_xmlhttpRequest(Object.assign({},q,{onload:function(r){if(l)l(r);resolve(r);},onerror:function(r){if(e)e(r);reject(r);},ontimeout:function(r){if(t)t(r);reject(r);},onabort:function(r){if(a)a(r);reject(r);}}));});p.abort=function(){if(x&&x.abort)x.abort();};return p;},xmlhttpRequest:GM_xmlhttpRequest,cookie:{list:__mpr(GM_cookie.list),set:__mpr(GM_cookie.set),delete:__mpr(GM_cookie.delete)}};\n"
+                + "return{w:unsafeWindow,i:GM_info,l:GM_log,s:GM_addStyle,gv:GM_getValue,sv:GM_setValue,dv:GM_deleteValue,lv:GM_listValues,gvs:GM_getValues,svs:GM_setValues,dvs:GM_deleteValues,gt:GM_getTab,st:GM_saveTab,gts:GM_getTabs,av:GM_addValueChangeListener,rv:GM_removeValueChangeListener,ae:GM_addElement,ot:GM_openInTab,sc:GM_setClipboard,no:GM_notification,rm:GM_registerMenuCommand,um:GM_unregisterMenuCommand,ru:GM_getResourceURL,rt:GM_getResourceText,dl:GM_download,ck:GM_cookie,xr:GM_xmlhttpRequest,g:GM};};");
     }
 
     private static void appendCompatibilityApi(StringBuilder out, Script script, String bridgeToken, String dispatcherName) {
@@ -826,14 +994,19 @@ final class UserScriptStore {
         String description = jsQuote(script.description);
         String author = jsQuote(script.author);
         String homepage = jsQuote(script.homepage);
+        String metadata = jsQuote(metadataBlock(script.code));
         if (!hasNativeGrants(script)) {
             out.append("var GM_info={script:{name:").append(name).append(",version:").append(version)
                     .append(",namespace:").append(namespace).append(",description:").append(description)
                     .append(",author:").append(author).append(",homepage:").append(homepage)
                     .append(",homepageURL:").append(homepage).append(",source:").append(jsQuote(script.sourceUrl))
                     .append(",downloadURL:").append(jsQuote(script.downloadUrl)).append(",updateURL:").append(jsQuote(script.updateUrl))
-                    .append(",runAt:").append(jsQuote(script.runAt))
-                    .append("},scriptHandler:'Median',version:'2.3.0',isIncognito:false,platform:{browserName:'Median',os:'android'}};");
+                    .append(",runAt:").append(jsQuote(script.runAt)).append(",uuid:").append(jsQuote(script.id))
+                    .append(",matches:").append(jsArray(script.matches)).append(",includes:").append(jsArray(script.matches))
+                    .append(",excludes:").append(jsArray(script.excludes)).append(",grant:").append(jsArray(script.grants))
+                    .append(",connects:").append(jsArray(script.connects)).append(",resources:").append(resourceNames(script))
+                    .append("},scriptMetaStr:").append(metadata)
+                    .append(",scriptHandler:'Median',version:").append(jsQuote(BuildConfig.VERSION_NAME)).append(",isIncognito:false,platform:{browserName:'Median',os:'android'}};");
             return;
         }
         boolean bridgeAvailable = hasBridgeGrants(script) && bridgeToken != null && bridgeToken.length() >= 32;
@@ -842,6 +1015,9 @@ final class UserScriptStore {
                 .append(",de:").append(description).append(",a:").append(author).append(",h:").append(homepage)
                 .append(",so:").append(jsQuote(script.sourceUrl)).append(",du:").append(jsQuote(script.downloadUrl))
                 .append(",uu:").append(jsQuote(script.updateUrl)).append(",ra:").append(jsQuote(script.runAt))
+                .append(",ms:").append(metadata).append(",ma:").append(jsArray(script.matches))
+                .append(",ex:").append(jsArray(script.excludes)).append(",gr:").append(jsArray(script.grants))
+                .append(",co:").append(jsArray(script.connects))
                 .append(",t:").append(jsQuote(bridgeToken == null ? "" : bridgeToken))
                 .append(",b:").append(bridgeAvailable ? "true" : "false")
                 .append(",d:").append(jsQuote(dispatcherName)).append(",r:{");
@@ -851,7 +1027,36 @@ final class UserScriptStore {
             out.append(jsQuote(resource.name)).append(":{b:").append(jsQuote(resource.base64))
                     .append(",m:").append(jsQuote(resource.mime)).append(",u:").append(jsQuote(resource.url)).append("}");
         }
-        out.append("}}),unsafeWindow=__ma.w,GM_info=__ma.i,GM_log=__ma.l,GM_addStyle=__ma.s,GM_getValue=__ma.gv,GM_setValue=__ma.sv,GM_deleteValue=__ma.dv,GM_listValues=__ma.lv,GM_getValues=__ma.gvs,GM_setValues=__ma.svs,GM_deleteValues=__ma.dvs,GM_addValueChangeListener=__ma.av,GM_removeValueChangeListener=__ma.rv,GM_addElement=__ma.ae,GM_openInTab=__ma.ot,GM_setClipboard=__ma.sc,GM_notification=__ma.no,GM_registerMenuCommand=__ma.rm,GM_unregisterMenuCommand=__ma.um,GM_getResourceURL=__ma.ru,GM_getResourceUrl=__ma.ru,GM_getResourceText=__ma.rt,GM_download=__ma.dl,GM_cookie=__ma.ck,GM_xmlhttpRequest=__ma.xr,GM=__ma.g;");
+        out.append("}}),unsafeWindow=__ma.w,GM_info=__ma.i,GM_log=__ma.l,GM_addStyle=__ma.s,GM_getValue=__ma.gv,GM_setValue=__ma.sv,GM_deleteValue=__ma.dv,GM_listValues=__ma.lv,GM_getValues=__ma.gvs,GM_setValues=__ma.svs,GM_deleteValues=__ma.dvs,GM_getTab=__ma.gt,GM_saveTab=__ma.st,GM_getTabs=__ma.gts,GM_addValueChangeListener=__ma.av,GM_removeValueChangeListener=__ma.rv,GM_addElement=__ma.ae,GM_openInTab=__ma.ot,GM_setClipboard=__ma.sc,GM_notification=__ma.no,GM_registerMenuCommand=__ma.rm,GM_unregisterMenuCommand=__ma.um,GM_getResourceURL=__ma.ru,GM_getResourceUrl=__ma.ru,GM_getResourceText=__ma.rt,GM_download=__ma.dl,GM_cookie=__ma.ck,GM_xmlhttpRequest=__ma.xr,GM=__ma.g;");
+    }
+
+    private static String metadataBlock(String source) {
+        if (source == null) return "";
+        int start = source.indexOf("==UserScript==");
+        int end = source.indexOf("==/UserScript==", Math.max(0, start));
+        if (start < 0 || end < start) return "";
+        int lineStart = source.lastIndexOf('\n', start);
+        int lineEnd = source.indexOf('\n', end);
+        return source.substring(lineStart < 0 ? 0 : lineStart + 1,
+                lineEnd < 0 ? source.length() : lineEnd);
+    }
+
+    private static String jsArray(List<String> values) {
+        StringBuilder out = new StringBuilder("[");
+        if (values != null) for (int i = 0; i < values.size(); i++) {
+            if (i > 0) out.append(',');
+            out.append(jsQuote(values.get(i)));
+        }
+        return out.append(']').toString();
+    }
+
+    private static String resourceNames(Script script) {
+        StringBuilder out = new StringBuilder("[");
+        for (int i = 0; i < script.resources.size(); i++) {
+            if (i > 0) out.append(',');
+            out.append(jsQuote(script.resources.get(i).name));
+        }
+        return out.append(']').toString();
     }
 
     private static String jsQuote(String value) {

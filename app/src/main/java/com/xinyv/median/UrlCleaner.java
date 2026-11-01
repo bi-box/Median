@@ -13,6 +13,11 @@ import java.util.Set;
 
 /** URL security helpers and conservative removal of high-confidence tracking parameters. */
 final class UrlCleaner {
+    /** One process-wide generator avoids repeatedly initializing the platform entropy provider. */
+    /** Avoids initializing the platform entropy provider when callers only normalize URLs. */
+    private static final class SecureRandomHolder {
+        static final SecureRandom INSTANCE = new SecureRandom();
+    }
     private static final Set<String> TRACKING = new HashSet<String>();
     static {
         String[] names = new String[] {
@@ -111,7 +116,8 @@ final class UrlCleaner {
 
     static String randomToken() {
         byte[] bytes = new byte[16];
-        new SecureRandom().nextBytes(bytes);
+        SecureRandom random = SecureRandomHolder.INSTANCE;
+        synchronized (random) { random.nextBytes(bytes); }
         return HexCodec.encode(bytes, bytes.length, false, false);
     }
 

@@ -32,10 +32,11 @@ if [[ -z "${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}" ]]; then
 fi
 
 # Fast, self-contained signed APK build path. Override VERSION_CODE/NAME only if you know what you are doing.
-export VERSION_CODE="${VERSION_CODE:-92}"
-export VERSION_NAME="${VERSION_NAME:-2.3.0}"
+export VERSION_CODE="${VERSION_CODE:-103}"
+export VERSION_NAME="${VERSION_NAME:-2.4.0}"
 ./tools/build_500kb_apk.sh
 
 echo
-echo "已生成签名更新 APK：out/500kb/MedianBrowser-${VERSION_NAME}.apk"
-echo "SHA-256：$(cat "out/500kb/MedianBrowser-${VERSION_NAME}.apk.sha256")"
+OUTPUT_DIR="${OUT_DIR:-out/500kb}"
+echo "已生成签名更新 APK：${OUTPUT_DIR}/MedianBrowser-${VERSION_NAME}.apk"
+echo "SHA-256：$(cat "${OUTPUT_DIR}/MedianBrowser-${VERSION_NAME}.apk.sha256")"

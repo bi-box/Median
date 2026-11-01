@@ -5,26 +5,37 @@ final class MediaProbeScript {
     private static final String URL_PATTERN =
             "(?:\\.(?:m3u8?|mpd|ism|isml|mp4|webm|mkv|mov|m4v|flv|ogv|3g[p2]|avi|wmv|asf|mpg|mpeg|m2ts|mts|vob|rmvb|m4s|cmfv|cmfa|mp2t|ts|mp3|m4a|aac|ogg|oga|opus|flac|wav|weba|ape|wma|alac|ac3|eac3)(?:[?#&/=;%]|$)|(?:mime|mime_type|content_type|type|format|ext)=(?:video|audio|hls|dash|smooth|mp4|webm|mp3|m3u8|mpd|ism)|(?:playback|play|video|audio|stream|manifest|playlist)(?:_|-)?url=|\\/(?:manifest|playlist|master|video|audio|segment|smooth|hls|dash)(?:[/?#]|$))";
 
-    /** Installs a passive, bounded Resource Timing/media-event collector for dynamic players. */
-    static String install() {
-        return "(function(){if(window.__medianMediaLog)return;var L=[],S={},M=240,R=/" + URL_PATTERN + "/i;" +
-                "function a(u,t,v,w,h,d){u=String(u||'').replace(/&amp;/g,'&');if(!u)return;" +
-                "if(/^blob:/i.test(u)){if(!S['@'+u]){S['@'+u]=1;window.__medianMediaOpaque=Math.min(99,(window.__medianMediaOpaque||0)+1);}return;}" +
-                "try{u=new URL(u,location.href).href;}catch(e){return;}if(!/^https?:/i.test(u)||S[u]||L.length>=M)return;" +
-                "if(!v&&!R.test(u)&&!/^video\\/|^audio\\/|mpegurl|dash\\+xml|vnd\\.ms-sstr/i.test(t||''))return;S[u]=1;L.push({url:u,mime:t||'',source:v||'live',width:w||0,height:h||0,duration:d||0});}" +
+    private static final String INSTALL_SCRIPT =
+                "(function(){if(window.__medianMediaLog)return;var L=[],S={},M=240,R=/" + URL_PATTERN + "/i;" +
+                "function candidate(u,t,f){return f||mediaType(t)||R.test(u)||(!/^(?:[a-z][a-z0-9+.-]*:|\\/\\/)/i.test(u)&&(R.test('/'+u)||R.test(String(location.href||''))));}" +
+                "function a(u,t,src,w,h,d){u=String(u||'').replace(/&amp;/g,'&');if(!u)return;" +
+                "if(/^blob:/i.test(u)){var count=window.__medianMediaOpaque||0;if(count<99&&!S['@'+u]){S['@'+u]=1;window.__medianMediaOpaque=count+1;}return;}" +
+                "if(L.length>=M||!candidate(u,t,src==='video'||src==='audio'))return;" +
+                "try{u=new URL(u,location.href).href;}catch(e){return;}if(!/^https?:/i.test(u)||S[u])return;" +
+                "if(src!=='video'&&src!=='audio'&&!R.test(u)&&!mediaType(t))return;S[u]=1;L.push({url:u,mime:t||'',source:src||'live',width:w||0,height:h||0,duration:d||0});}" +
                 "try{Object.defineProperty(window,'__medianMediaLog',{value:L,configurable:false,enumerable:false});}catch(e){window.__medianMediaLog=L;}" +
                 "function m(e){var x=e&&e.target;if(!x)return;a(x.currentSrc||x.src,x.type||'',x.tagName==='VIDEO'?'video':'audio',x.videoWidth||0,x.videoHeight||0,isFinite(x.duration)?x.duration:0);}" +
                 "document.addEventListener('loadedmetadata',m,true);document.addEventListener('play',m,true);" +
                 "try{if(typeof PerformanceObserver==='function'){var p=new PerformanceObserver(function(x){var q=x.getEntries(),i,e,v;for(i=0;i<q.length;i++){e=q[i];v=e.initiatorType==='video'||e.initiatorType==='audio';a(e.name,v?e.initiatorType+'/*':'',v?e.initiatorType:'performance');}});p.observe({entryTypes:['resource']});}}catch(e){}" +
                 "try{var q=performance.getEntriesByType('resource'),i,e,v;for(i=0;i<q.length;i++){e=q[i];v=e.initiatorType==='video'||e.initiatorType==='audio';a(e.name,v?e.initiatorType+'/*':'',v?e.initiatorType:'performance');}}catch(e){}" +
+                // Some players fetch extensionless media URLs and expose the type only in
+                // response headers. Observe headers without consuming or cloning bodies.
+                "function ct(r){try{return r&&r.headers&&String(r.headers.get('content-type')||'');}catch(e){return '';}}" +
+                "function mediaType(t){return /^(?:video|audio)\\//i.test(t)||/mpegurl|dash\\+xml|vnd\\.ms-sstr/i.test(t);}" +
+                "try{if(typeof window.fetch==='function'&&!window.__medianFetchProbe){var F=window.fetch;window.__medianFetchProbe=1;window.fetch=function(){var q=arguments,u=q[0],url=u&&u.url?u.url:u;return F.apply(this,q).then(function(r){var t=ct(r);if(mediaType(t))a(url,t,'fetch');return r;},function(e){throw e;});};}}catch(e){}" +
+                "try{if(window.XMLHttpRequest&&!window.__medianXhrProbe){var X=window.XMLHttpRequest.prototype,O=X.open,SN=X.send,W=new WeakMap();window.__medianXhrProbe=1;X.open=function(m,u){var r=O.apply(this,arguments),s=W.get(this);if(s)s.url=u;else W.set(this,{url:u,listening:false});return r;};X.send=function(){var x=this,s=W.get(x);if(!s){s={url:'',listening:false};W.set(x,s);}if(!s.listening){x.addEventListener('load',function(){var t='';try{t=x.getResponseHeader('content-type')||'';}catch(e){}if(mediaType(t))a(x.responseURL||s.url,t,'xhr');},false);s.listening=true;}return SN.apply(this,arguments);};}}catch(e){}" +
                 "})();";
+
+    /** Installs a passive, bounded Resource Timing/media-event collector for dynamic players. */
+    static String install() {
+        return INSTALL_SCRIPT;
     }
 
     static String build() {
         return "(function(){var o=[],s={},B={},n=0,v=0,opaque=Number(window.__medianMediaOpaque||0),R=/" + URL_PATTERN + "/i;" +
                 "function a(u,t,f,src,w,h,d){u=String(u||'').replace(/&amp;/g,'&').replace(/\\\\u002[fF]/g,'/').replace(/\\\\\\//g,'/');if(!u)return;" +
-                "if(/^blob:/i.test(u)){if(!B[u]){B[u]=1;opaque++;}return;}try{u=new URL(u,location.href).href;}catch(e){return;}" +
-                "if(!/^https?:/i.test(u)||s[u]||o.length>=240||(!f&&!R.test(u)&&!/^video\\/|^audio\\/|mpegurl|dash\\+xml|vnd\\.ms-sstr/i.test(t||'')))return;" +
+                "if(/^blob:/i.test(u)){if(opaque<99&&!B[u]){B[u]=1;opaque++;}return;}if(o.length>=240||(!f&&!/^video\\/|^audio\\/|mpegurl|dash\\+xml|vnd\\.ms-sstr/i.test(t||'')&&!R.test(u)&&(/^(?:[a-z][a-z0-9+.-]*:|\\/\\/)/i.test(u)||(!R.test('/'+u)&&!R.test(String(location.href||''))))))return;try{u=new URL(u,location.href).href;}catch(e){return;}" +
+                "if(!/^https?:/i.test(u)||s[u]||(!f&&!R.test(u)&&!/^video\\/|^audio\\/|mpegurl|dash\\+xml|vnd\\.ms-sstr/i.test(t||'')))return;" +
                 "s[u]=1;o.push({url:u,mime:t||'',source:src||'',width:Number(w||0),height:Number(h||0),duration:Number(d||0)});}" +
                 "function scan(r,depth){if(!r||depth>3||o.length>=240)return;var E,i,e,t,f,z,A=['data-src','data-url','data-video-url','data-audio-url','data-stream-url','data-play-url','data-playback-url','data-hls','data-m3u8','data-mpd','data-manifest'];" +
                 "try{E=r.querySelectorAll('video,audio,source,track,link[rel=preload],a[href],[data-src],[data-url],[data-video-url],[data-audio-url],[data-stream-url],[data-play-url],[data-playback-url],[data-hls],[data-m3u8],[data-mpd],[data-manifest]');}catch(x){E=[];}" +

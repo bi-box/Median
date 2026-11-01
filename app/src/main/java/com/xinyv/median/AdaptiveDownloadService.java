@@ -15,6 +15,7 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.database.Cursor;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -28,6 +29,8 @@ import android.os.PowerManager;
 import android.os.Process;
 import android.os.SystemClock;
 import android.provider.MediaStore;
+import android.provider.DocumentsContract;
+import android.util.AtomicFile;
 import android.webkit.CookieManager;
 
 import org.json.JSONArray;
@@ -85,12 +88,21 @@ public final class AdaptiveDownloadService extends Service {
     private static final int RETRIES = 4;
     private static final int CONNECT_TIMEOUT_MS = 20000;
     private static final int READ_TIMEOUT_MS = 45000;
+    // A server-controlled Content-Length must never make the app preallocate an
+    // unbounded sparse file. Four GiB is large enough for normal mobile downloads
+    // while keeping a hostile response from exhausting storage in one task.
+    private static final long MAX_DOWNLOAD_BYTES = 4L * 1024L * 1024L * 1024L;
     private static final long WAKE_LOCK_TIMEOUT_MS = 30L * 60L * 1000L;
     private static final long WAKE_LOCK_RENEW_MS = 10L * 60L * 1000L;
     private static final int TASK_THREADS = Math.max(1, Math.min(2, Runtime.getRuntime().availableProcessors()));
     private static final ThreadPoolExecutor TASK_EXECUTOR = new ThreadPoolExecutor(TASK_THREADS, TASK_THREADS,
             30L, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(48));
     private static final ConcurrentHashMap<Long, Control> CONTROLS = new ConcurrentHashMap<Long, Control>();
+    // The app-private fallback publisher chooses a name by probing the directory.
+    // Serialize the probe and copy so two simultaneous tasks cannot select the
+    // same target and truncate each other's completed file.
+    private static final Object PUBLISH_LOCK = new Object();
+    private static final Object CLEANUP_LOCK = new Object();
 
     private final AtomicInteger activeTasks = new AtomicInteger();
     private NotificationManager notificationManager;
@@ -119,27 +131,55 @@ public final class AdaptiveDownloadService extends Service {
 
         if (ACTION_PAUSE.equals(action)) {
             Control control = CONTROLS.get(Long.valueOf(id));
+            boolean handled = false;
             if (control != null) {
-                control.pause("已手动暂停");
-                markPaused(id, "已手动暂停");
+                synchronized (control) {
+                    if (CONTROLS.get(Long.valueOf(id)) == control) {
+                        handled = true;
+                        if (control.pause("已手动暂停")) markPaused(id, "已手动暂停");
+                    }
+                }
             }
-            else {
+            if (!handled) {
                 markPaused(id, "已手动暂停");
                 stopSelfResult(startId);
             }
             return START_NOT_STICKY;
         }
         if (ACTION_CANCEL.equals(action)) {
-            Control control = CONTROLS.get(Long.valueOf(id));
-            if (control != null) {
-                control.cancel();
-                DownloadStore.Item item = store.get(id);
-                if (item != null) store.updateAdaptive(id, DownloadStore.STATUS_CANCELLED, "正在取消",
-                        item.downloadedBytes, item.totalBytes, 0L, null);
+            DownloadStore.Item current = store.get(id);
+            // A stale notification action can arrive after completion telemetry
+            // was committed but while the worker is still cleaning up. Never turn
+            // a completed record back into cancelled or hide its published URI.
+            if (current != null && DownloadStore.STATUS_COMPLETED.equals(current.status)) {
+                notifyTask(Task.fromStore(this, current), "已完成", 100, current.downloadedBytes,
+                        current.totalBytes, false, false);
+                stopSelfResult(startId);
+                return START_NOT_STICKY;
             }
-            else {
-                deletePartialFiles(id);
+            Control control = CONTROLS.get(Long.valueOf(id));
+            boolean handled = false;
+            if (control != null) {
+                synchronized (control) {
+                    if (CONTROLS.get(Long.valueOf(id)) == control) {
+                        handled = true;
+                        if (control.cancel()) {
+                            DownloadStore.Item item = store.get(id);
+                            if (item != null) store.updateAdaptive(id, DownloadStore.STATUS_CANCELLED, "正在取消",
+                                    item.downloadedBytes, item.totalBytes, 0L, null);
+                        }
+                    }
+                }
+            }
+            if (!handled) {
                 DownloadStore.Item item = store.get(id);
+                // The worker may have committed and removed its Control after the
+                // earlier lookup. Re-read before acting on a stale notification.
+                if (item != null && DownloadStore.STATUS_COMPLETED.equals(item.status)) {
+                    stopSelfResult(startId);
+                    return START_NOT_STICKY;
+                }
+                deletePartialFiles(id);
                 long total = item == null ? 0L : item.totalBytes;
                 store.updateAdaptive(id, DownloadStore.STATUS_CANCELLED, "已取消", 0L, total, 0L, null);
                 if (item != null) notifyTask(Task.fromStore(this, item), "已取消", 0, 0L, total, false, false);
@@ -148,6 +188,13 @@ public final class AdaptiveDownloadService extends Service {
             return START_NOT_STICKY;
         }
         if (!ACTION_DOWNLOAD.equals(action) && !ACTION_RESUME.equals(action)) return START_NOT_STICKY;
+
+        DownloadStore.Item current = store.get(id);
+        if (current == null || DownloadStore.STATUS_CANCELLED.equals(current.status)) {
+            deletePartialFiles(id);
+            stopSelfResult(startId);
+            return START_NOT_STICKY;
+        }
 
         final Task task = ACTION_RESUME.equals(action) ? taskFromStore(id) : Task.fromIntent(intent);
         if (task == null || task.id >= 0L || task.url.length() == 0) {
@@ -235,6 +282,13 @@ public final class AdaptiveDownloadService extends Service {
     private void markPaused(long id, String reason) {
         DownloadStore.Item item = store.get(id);
         if (item == null || !item.isAdaptive()) return;
+        // Notification actions can outlive the task that created them. A late pause must
+        // never turn a completed/cancelled record back into an active-looking state.
+        if (item.isTerminal()) {
+            notifyTask(Task.fromStore(this, item), item.reason, percent(item.downloadedBytes, item.totalBytes),
+                    item.downloadedBytes, item.totalBytes, false, false);
+            return;
+        }
         store.updateAdaptiveTelemetry(id, DownloadStore.STATUS_PAUSED, reason,
                 item.downloadedBytes, item.totalBytes, 0L, null, item.etaSeconds, item.retryCount);
         notifyTask(Task.fromStore(this, item), reason, percent(item.downloadedBytes, item.totalBytes),
@@ -245,18 +299,49 @@ public final class AdaptiveDownloadService extends Service {
         File temp = partialFile(task.id);
         File stateFile = stateFile(task.id);
         Locks locks = null;
+        Uri publishedUri = null;
         boolean completed = false;
         boolean cancelled = false;
         try {
+            // START_REDELIVER_INTENT can replay an original download intent after
+            // completion telemetry was persisted but before the worker reached its
+            // cleanup path. Publishing again would create a duplicate visible file.
+            DownloadStore.Item persisted = store.get(task.id);
+            if (persisted == null || DownloadStore.STATUS_CANCELLED.equals(persisted.status)) {
+                cancelled = true;
+                return;
+            }
+            if (DownloadStore.STATUS_COMPLETED.equals(persisted.status)) {
+                completed = true;
+                return;
+            }
+            control.check();
+            DownloadState rollbackState = DownloadState.load(stateFile);
+            if (rollbackState != null && rollbackState.publishRollback) {
+                if (!rollbackPublished(task.id, rollbackState, stateFile, null))
+                    throw new IllegalStateException("下载文件夹暂时无法清理未完成文件，请恢复文件夹访问后重试");
+                persisted = store.get(task.id);
+            }
+            if (persisted != null && persisted.isAdaptive() && value(persisted.localUri).length() > 0 &&
+                    recoverPublished(task, persisted, temp, stateFile, control)) return;
+            if (task.expectedTotalBytes > MAX_DOWNLOAD_BYTES)
+                throw new IllegalArgumentException("下载文件超过 4 GB 安全上限");
+            DownloadState publishedState = DownloadState.load(stateFile);
+            if (publishedState != null && publishedState.publishPending) {
+                if (value(publishedState.publishUri).length() > 0 &&
+                        recoverPublishedState(task, publishedState, temp, stateFile, control)) return;
+                clearPublishingState(publishedState, stateFile);
+            }
             waitForConstraints(task, control);
             control.check();
 
             DownloadState state = DownloadState.load(stateFile);
             boolean incompatible = state != null && (!task.url.equals(state.originalUrl) ||
+                    state.totalBytes > MAX_DOWNLOAD_BYTES || state.downloaded() > MAX_DOWNLOAD_BYTES ||
                     state.downloaded() > temp.length());
             if (state == null || incompatible || !temp.exists()) {
                 deleteQuietly(temp);
-                deleteQuietly(stateFile);
+                deleteStateFile(stateFile);
                 state = DownloadState.create(task);
                 preparePartialFile(temp, state);
                 state.persist(stateFile, true);
@@ -268,7 +353,7 @@ public final class AdaptiveDownloadService extends Service {
             DownloadStore.Item knownItem = store.get(task.id);
             long knownTotal = state.totalBytes > 0L ? state.totalBytes : Math.max(task.expectedTotalBytes,
                     knownItem == null ? 0L : knownItem.totalBytes);
-            ProgressTracker tracker = new ProgressTracker(task, control, locks, knownTotal, state.downloaded());
+            final ProgressTracker tracker = new ProgressTracker(task, control, locks, knownTotal, state.downloaded());
             tracker.reportState(DownloadStore.STATUS_DOWNLOADING, "Median 单连接", state, null, true);
 
             boolean dataComplete = state.totalBytes > 0L && state.downloaded() == state.totalBytes;
@@ -282,44 +367,96 @@ public final class AdaptiveDownloadService extends Service {
                 store.updateMetadata(task.id, task.filename, task.mime);
             }
             locks.renewIfDue(SystemClock.elapsedRealtime());
-            Uri uri = publish(task, temp, control);
-            tracker.forceReport(DownloadStore.STATUS_COMPLETED, "已完成", state, uri.toString());
-            notifyTask(task, "已完成", 100, tracker.downloaded, tracker.totalBytes, false, false);
+            state.publishPending = true;
+            state.publishUri = "";
+            state.persist(stateFile, true);
+            publishedUri = publish(task, temp, control, state, stateFile);
+            final Uri uri = publishedUri;
+            final DownloadState completeState = state;
+            // This commit shares the cancel/pause monitor. Whichever action gets
+            // it first wins, including the gap after the publisher's final check.
+            control.complete(new Runnable() {
+                @Override public void run() {
+                    tracker.forceReport(DownloadStore.STATUS_COMPLETED, "已完成", completeState, uri.toString());
+                }
+            });
             completed = true;
+            clearPublishingState(state, stateFile);
+            notifyTask(task, "已完成", 100, tracker.downloaded, tracker.totalBytes, false, false);
         } catch (Paused paused) {
             DownloadState state = DownloadState.load(stateFile);
+            rollbackPublished(task.id, state, stateFile, publishedUri);
             DownloadStore.Item current = store.get(task.id);
             long downloaded = state == null ? (current == null ? 0L : current.downloadedBytes) : state.downloaded();
             long total = DownloadCenterPolicy.resolvedTotal(current == null ? 0L : current.totalBytes,
                     state == null ? 0L : state.totalBytes);
             if (state != null) state.persist(stateFile, true);
-            store.updateAdaptiveTelemetry(task.id, DownloadStore.STATUS_PAUSED, paused.reason,
-                    downloaded, total, 0L, null, 0L, current == null ? 0 : current.retryCount);
-            notifyTask(task, paused.reason, percent(downloaded, total), downloaded, total, false, true);
+            synchronized (control) {
+                if (control.cancelled.get()) {
+                    cancelled = true;
+                    store.updateAdaptive(task.id, DownloadStore.STATUS_CANCELLED, "已取消", 0L, total, 0L, null);
+                    notifyTask(task, "已取消", 0, 0L, total, false, false);
+                } else {
+                    store.updateAdaptiveTelemetry(task.id, DownloadStore.STATUS_PAUSED, paused.reason,
+                            downloaded, total, 0L, null, 0L, current == null ? 0 : current.retryCount);
+                    notifyTask(task, paused.reason, percent(downloaded, total), downloaded, total, false, true);
+                }
+            }
         } catch (Cancelled ignored) {
             cancelled = true;
+            rollbackPublished(task.id, DownloadState.load(stateFile), stateFile, publishedUri);
             DownloadStore.Item current = store.get(task.id);
             long total = current == null ? 0L : current.totalBytes;
             store.updateAdaptive(task.id, DownloadStore.STATUS_CANCELLED, "已取消", 0L, total, 0L, null);
             notifyTask(task, "已取消", 0, 0L, total, false, false);
         } catch (Throwable error) {
+            if (completed || control.completed) return;
             String reason = ErrorText.message(error, 140);
             DownloadState state = DownloadState.load(stateFile);
+            rollbackPublished(task.id, state, stateFile, publishedUri);
             if (state != null) state.persist(stateFile, true);
             DownloadStore.Item current = store.get(task.id);
             long downloaded = state == null ? (current == null ? 0L : current.downloadedBytes) : state.downloaded();
             long total = DownloadCenterPolicy.resolvedTotal(current == null ? 0L : current.totalBytes,
                     state == null ? 0L : state.totalBytes);
             int retries = current == null ? 1 : current.retryCount + 1;
-            store.updateAdaptiveTelemetry(task.id, DownloadStore.STATUS_FAILED, reason, downloaded, total, 0L,
-                    null, 0L, retries);
-            notifyTask(task, "失败 · " + reason, percent(downloaded, total), downloaded, total, false, true);
+            synchronized (control) {
+                if (control.cancelled.get()) {
+                    cancelled = true;
+                    store.updateAdaptive(task.id, DownloadStore.STATUS_CANCELLED, "已取消", 0L, total, 0L, null);
+                    notifyTask(task, "已取消", 0, 0L, total, false, false);
+                } else if (control.paused.get()) {
+                    store.updateAdaptiveTelemetry(task.id, DownloadStore.STATUS_PAUSED, control.pauseReason,
+                            downloaded, total, 0L, null, 0L, current == null ? 0 : current.retryCount);
+                    notifyTask(task, control.pauseReason, percent(downloaded, total), downloaded, total, false, true);
+                } else {
+                    store.updateAdaptiveTelemetry(task.id, DownloadStore.STATUS_FAILED, reason, downloaded, total, 0L,
+                            null, 0L, retries);
+                    notifyTask(task, "失败 · " + reason, percent(downloaded, total), downloaded, total, false, true);
+                }
+            }
         } finally {
-            CONTROLS.remove(Long.valueOf(task.id));
+            DownloadStore.Item finalCancelled = null;
+            synchronized (control) {
+                // A cancel can arrive after a paused/failed catch wrote its final
+                // status. Retire the Control and settle that last action together;
+                // stale lookups then use the inactive-task cancellation path.
+                cancelled = cancelled || control.cancelled.get();
+                if (cancelled && !completed && !control.completed) {
+                    finalCancelled = store.get(task.id);
+                    if (finalCancelled != null) store.updateAdaptive(task.id, DownloadStore.STATUS_CANCELLED,
+                            "已取消", 0L, finalCancelled.totalBytes, 0L, null);
+                }
+                CONTROLS.remove(Long.valueOf(task.id), control);
+            }
             if (locks != null) locks.release();
-            if (completed || cancelled) {
+            if (completed || control.completed) {
                 deleteQuietly(temp);
-                deleteQuietly(stateFile);
+                deleteStateFile(stateFile);
+            } else if (cancelled) {
+                deletePartialFiles(task.id);
+                if (finalCancelled != null) notifyTask(task, "已取消", 0, 0L,
+                        finalCancelled.totalBytes, false, false);
             }
         }
     }
@@ -426,13 +563,20 @@ public final class AdaptiveDownloadService extends Service {
                 if (code < 200 || code >= 300) throw new HttpFailure(code);
                 long[] contentRange = parseContentRange(connection.getHeaderField("Content-Range"));
                 long responseTotal = responseTotal(connection, cursor, contentRange);
+                if (responseTotal > MAX_DOWNLOAD_BYTES)
+                    throw new IllegalArgumentException("下载文件超过 4 GB 安全上限");
                 if (responseTotal > 0L) {
                     state.totalBytes = responseTotal;
                     tracker.totalBytes = state.totalBytes;
                 }
                 state.resolvedUrl = connection.getURL().toString();
-                state.etag = value(connection.getHeaderField("ETag"));
-                state.lastModified = value(connection.getHeaderField("Last-Modified"));
+                // Some range endpoints omit validators on 206 responses. Do not
+                // erase a validator learned from the initial response in that
+                // case, otherwise a later resume loses the only identity check.
+                String responseEtag = value(connection.getHeaderField("ETag"));
+                if (responseEtag.length() > 0) state.etag = responseEtag;
+                String responseLastModified = value(connection.getHeaderField("Last-Modified"));
+                if (responseLastModified.length() > 0) state.lastModified = responseLastModified;
                 applyResponseMetadata(task, connection);
                 state.persist(stateFile, true);
                 tracker.reportState(DownloadStore.STATUS_DOWNLOADING, "Median 单连接", state, null, true);
@@ -450,6 +594,8 @@ public final class AdaptiveDownloadService extends Service {
                     read = input.read(buffer, 0, request);
                     if (read == -1) break;
                     control.check();
+                    if (state.downloaded() > MAX_DOWNLOAD_BYTES - read)
+                        throw new IllegalArgumentException("下载文件超过 4 GB 安全上限");
                     output.write(buffer, 0, read);
                     state.advance(read);
                     tracker.add(read, state, stateFile);
@@ -482,19 +628,78 @@ public final class AdaptiveDownloadService extends Service {
         if (last != null) throw last;
     }
 
-    private Uri publish(Task task, File temp, Control control) throws Exception {
+    private Uri publish(Task task, File temp, Control control, DownloadState state,
+                        File stateFile) throws Exception {
         control.check();
-        if (Build.VERSION.SDK_INT < 29) return publishToAppDownloads(task, temp, control);
+        Uri tree = DownloadDirectory.selectedTree(this);
+        if (tree != null) return publishToSelectedDirectory(task, temp, control, state, stateFile, tree);
+        if (Build.VERSION.SDK_INT < 29) return publishToAppDownloads(task, temp, control, state, stateFile);
         try {
-            return publishToMediaStore(task, temp, control);
+            return publishToMediaStore(task, temp, control, state, stateFile);
         } catch (Paused paused) { throw paused;
         } catch (Cancelled cancelled) { throw cancelled;
         } catch (Exception mediaStoreFailure) {
-            return publishToAppDownloads(task, temp, control);
+            if (state.publishRollback) throw mediaStoreFailure;
+            return publishToAppDownloads(task, temp, control, state, stateFile);
         }
     }
 
-    private Uri publishToMediaStore(Task task, File temp, Control control) throws Exception {
+    private Uri publishToSelectedDirectory(Task task, File temp, Control control, DownloadState state,
+                                           File stateFile, Uri tree) throws Exception {
+        DownloadDirectory.requireWritable(this, tree);
+        synchronized (PUBLISH_LOCK) {
+            control.check();
+            ContentResolver resolver = getContentResolver();
+            Uri parent = DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree));
+            Uri uri = DocumentsContract.createDocument(resolver, parent,
+                    task.mime.length() == 0 ? "application/octet-stream" : task.mime, task.filename);
+            if (uri == null) throw new IllegalStateException("无法在所选下载文件夹创建文件");
+            markPublishingState(state, stateFile, uri);
+            markPublishing(task, uri);
+            try {
+                try (InputStream input = new BufferedInputStream(new FileInputStream(temp), 256 * 1024);
+                     OutputStream output = selectedDirectoryOutput(resolver, uri)) {
+                    byte[] buffer = new byte[256 * 1024];
+                    int read;
+                    while ((read = input.read(buffer)) != -1) {
+                        control.check();
+                        output.write(buffer, 0, read);
+                    }
+                    output.flush();
+                }
+                control.check();
+                try (Cursor cursor = resolver.query(uri, new String[] { DocumentsContract.Document.COLUMN_DISPLAY_NAME },
+                        null, null, null)) {
+                    if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) {
+                        task.filename = cursor.getString(0);
+                        store.updateMetadata(task.id, task.filename, task.mime);
+                    }
+                } catch (RuntimeException ignored) {}
+                control.check();
+                return uri;
+            } catch (Throwable error) {
+                rollbackPublished(task.id, state, stateFile, uri);
+                if (error instanceof Paused) throw (Paused) error;
+                if (error instanceof Cancelled) throw (Cancelled) error;
+                if (error instanceof SecurityException)
+                    throw new IllegalStateException("下载文件夹授权已失效，请重新选择文件夹后重试", error);
+                if (error instanceof Exception) throw (Exception) error;
+                throw new IllegalStateException(ErrorText.message(error, 140));
+            }
+        }
+    }
+
+    private OutputStream selectedDirectoryOutput(ContentResolver resolver, Uri uri) throws Exception {
+        OutputStream output = resolver.openOutputStream(uri, "w");
+        if (output == null) throw new IllegalStateException("无法写入所选下载文件夹，请重新选择文件夹后重试");
+        return new BufferedOutputStream(output, 256 * 1024);
+    }
+
+    private Uri publishToMediaStore(Task task, File temp, Control control, DownloadState state,
+                                    File stateFile) throws Exception {
+        // Also guard the API at its point of use, rather than relying only on publish().
+        if (Build.VERSION.SDK_INT < 29)
+            return publishToAppDownloads(task, temp, control, state, stateFile);
         ContentResolver resolver = getContentResolver();
         ContentValues values = new ContentValues();
         values.put(MediaStore.MediaColumns.DISPLAY_NAME, task.filename);
@@ -503,6 +708,8 @@ public final class AdaptiveDownloadService extends Service {
         values.put(MediaStore.MediaColumns.IS_PENDING, 1);
         Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
         if (uri == null) throw new IllegalStateException("无法创建下载文件");
+        markPublishingState(state, stateFile, uri);
+        markPublishing(task, uri);
         InputStream input = null;
         OutputStream output = null;
         try {
@@ -517,13 +724,24 @@ public final class AdaptiveDownloadService extends Service {
                 output.write(buffer, 0, read);
             }
             output.flush();
+            output.close();
+            output = null;
+            input.close();
+            input = null;
+            control.check();
             values.clear();
             values.put(MediaStore.MediaColumns.IS_PENDING, 0);
             values.put(MediaStore.MediaColumns.SIZE, temp.length());
-            resolver.update(uri, values, null, null);
+            if (resolver.update(uri, values, null, null) <= 0)
+                throw new IllegalStateException("无法完成下载文件发布");
+            control.check();
             return uri;
         } catch (Throwable error) {
-            resolver.delete(uri, null, null);
+            closeQuietly(input);
+            input = null;
+            closeQuietly(output);
+            output = null;
+            rollbackPublished(task.id, state, stateFile, uri);
             if (error instanceof Paused) throw (Paused) error;
             if (error instanceof Cancelled) throw (Cancelled) error;
             if (error instanceof Exception) throw (Exception) error;
@@ -534,34 +752,48 @@ public final class AdaptiveDownloadService extends Service {
         }
     }
 
-    private Uri publishToAppDownloads(Task task, File temp, Control control) throws Exception {
-        control.check();
-        File root = DownloadContentProvider.root(this);
-        if (!root.isDirectory() && !root.mkdirs()) throw new IllegalStateException("无法创建应用下载目录");
-        File target = uniquePublishedFile(root, task.filename);
-        if (temp.renameTo(target)) return DownloadContentProvider.uriFor(target);
-        InputStream input = null;
-        OutputStream output = null;
-        try {
-            input = new BufferedInputStream(new FileInputStream(temp), 256 * 1024);
-            output = new BufferedOutputStream(new FileOutputStream(target, false), 256 * 1024);
-            byte[] buffer = new byte[256 * 1024];
-            int read;
-            while ((read = input.read(buffer)) != -1) {
+    private Uri publishToAppDownloads(Task task, File temp, Control control, DownloadState state,
+                                      File stateFile) throws Exception {
+        synchronized (PUBLISH_LOCK) {
+            control.check();
+            File root = DownloadContentProvider.root(this);
+            if (!root.isDirectory() && !root.mkdirs()) throw new IllegalStateException("无法创建应用下载目录");
+            File target = uniquePublishedFile(root, task.filename);
+            Uri targetUri = DownloadContentProvider.uriFor(target);
+            markPublishingState(state, stateFile, targetUri);
+            markPublishing(task, targetUri);
+            InputStream input = null;
+            OutputStream output = null;
+            try {
+                input = new BufferedInputStream(new FileInputStream(temp), 256 * 1024);
+                output = new BufferedOutputStream(new FileOutputStream(target, false), 256 * 1024);
+                byte[] buffer = new byte[256 * 1024];
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    control.check();
+                    output.write(buffer, 0, read);
+                }
+                output.flush();
+                output.close();
+                output = null;
+                input.close();
+                input = null;
                 control.check();
-                output.write(buffer, 0, read);
+                return targetUri;
+            } catch (Throwable error) {
+                closeQuietly(input);
+                input = null;
+                closeQuietly(output);
+                output = null;
+                rollbackPublished(task.id, state, stateFile, targetUri);
+                if (error instanceof Paused) throw (Paused) error;
+                if (error instanceof Cancelled) throw (Cancelled) error;
+                if (error instanceof Exception) throw (Exception) error;
+                throw new IllegalStateException(ErrorText.message(error, 140));
+            } finally {
+                closeQuietly(input);
+                closeQuietly(output);
             }
-            output.flush();
-            return DownloadContentProvider.uriFor(target);
-        } catch (Throwable error) {
-            deleteQuietly(target);
-            if (error instanceof Paused) throw (Paused) error;
-            if (error instanceof Cancelled) throw (Cancelled) error;
-            if (error instanceof Exception) throw (Exception) error;
-            throw new IllegalStateException(ErrorText.message(error, 140));
-        } finally {
-            closeQuietly(input);
-            closeQuietly(output);
         }
     }
 
@@ -578,6 +810,211 @@ public final class AdaptiveDownloadService extends Service {
             if (!candidate.exists()) return candidate;
         }
         return new File(root, base + '-' + System.currentTimeMillis() + extension);
+    }
+
+    /** Persists the destination before bytes are published so a process restart can recover it. */
+    private void markPublishing(Task task, Uri uri) {
+        if (task == null || uri == null) return;
+        DownloadStore.Item current = store.get(task.id);
+        if (current == null || !current.isAdaptive()) return;
+        String status = current.status == null || current.status.length() == 0 ?
+                DownloadStore.STATUS_DOWNLOADING : current.status;
+        store.updateAdaptive(task.id, status, "正在发布", current.downloadedBytes, current.totalBytes,
+                current.bytesPerSecond, uri.toString());
+    }
+
+    private void markPublishingState(DownloadState state, File stateFile, Uri uri) {
+        if (state == null || stateFile == null || uri == null) return;
+        state.publishPending = true;
+        state.publishRollback = false;
+        state.publishUri = uri.toString();
+        state.persist(stateFile, true);
+    }
+
+    private void clearPublishingState(DownloadState state, File stateFile) {
+        if (state == null || stateFile == null) return;
+        state.publishPending = false;
+        state.publishRollback = false;
+        state.publishUri = "";
+        state.persist(stateFile, true);
+    }
+
+    /** Completes or rolls back a destination left behind by a killed publisher. */
+    private boolean recoverPublished(final Task task, final DownloadStore.Item persisted,
+                                     File temp, File stateFile, Control control) throws Exception {
+        Uri uri;
+        try { uri = Uri.parse(value(persisted.localUri)); }
+        catch (RuntimeException ignored) { uri = null; }
+        if (uri == null || !hasCompletePublishedData(uri,
+                Math.max(persisted.totalBytes, persisted.downloadedBytes))) {
+            if (!rollbackPublished(task.id, DownloadState.load(stateFile), stateFile, uri))
+                throw new IllegalStateException("下载文件夹暂时无法清理未完成文件，请恢复文件夹访问后重试");
+            return false;
+        }
+        long size = persisted.totalBytes;
+        try {
+            android.os.ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(uri, "r");
+            if (descriptor != null) {
+                long stat = descriptor.getStatSize();
+                if (stat > size) size = stat;
+                descriptor.close();
+            }
+        } catch (Exception ignored) {}
+        final long recoveredSize = size;
+        final Uri recoveredUri = uri;
+        control.complete(new Runnable() {
+            @Override public void run() {
+                store.updateAdaptive(task.id, DownloadStore.STATUS_COMPLETED, "已完成",
+                        Math.max(persisted.downloadedBytes, recoveredSize), Math.max(persisted.totalBytes, recoveredSize),
+                        persisted.bytesPerSecond, recoveredUri.toString());
+            }
+        });
+        deleteQuietly(temp);
+        deleteStateFile(stateFile);
+        return true;
+    }
+
+    private boolean recoverPublishedState(final Task task, DownloadState state,
+                                          File temp, File stateFile, Control control) throws Exception {
+        Uri uri;
+        try { uri = Uri.parse(value(state.publishUri)); }
+        catch (RuntimeException ignored) { uri = null; }
+        final DownloadStore.Item current = store.get(task.id);
+        if (current == null || !current.isAdaptive()) {
+            deletePartialFiles(task.id);
+            return true;
+        }
+        long expected = Math.max(state.totalBytes, current == null ? 0L :
+                Math.max(current.totalBytes, current.downloadedBytes));
+        if (uri == null || !hasCompletePublishedData(uri, expected)) {
+            if (!rollbackPublished(task.id, state, stateFile, uri))
+                throw new IllegalStateException("下载文件夹暂时无法清理未完成文件，请恢复文件夹访问后重试");
+            return false;
+        }
+        long size = expected;
+        try {
+            android.os.ParcelFileDescriptor descriptor = getContentResolver().openFileDescriptor(uri, "r");
+            if (descriptor != null) {
+                long stat = descriptor.getStatSize();
+                if (stat > size) size = stat;
+                descriptor.close();
+            }
+        } catch (Exception ignored) {}
+        final long recoveredSize = size;
+        final long expectedSize = expected;
+        final Uri recoveredUri = uri;
+        control.complete(new Runnable() {
+            @Override public void run() {
+                store.updateAdaptive(task.id, DownloadStore.STATUS_COMPLETED, "已完成",
+                        recoveredSize, Math.max(expectedSize, recoveredSize), current.bytesPerSecond,
+                        recoveredUri.toString());
+            }
+        });
+        deleteQuietly(temp);
+        deleteStateFile(stateFile);
+        return true;
+    }
+
+    private boolean hasCompletePublishedData(Uri uri, long expectedBytes) {
+        if (uri == null) return false;
+        if (DownloadContentProvider.AUTHORITY.equals(uri.getAuthority())) {
+            String name = uri.getLastPathSegment();
+            if (name == null || name.length() == 0) return false;
+            try {
+                File root = DownloadContentProvider.root(this).getCanonicalFile();
+                File file = new File(root, name).getCanonicalFile();
+                return root.equals(file.getParentFile()) && file.isFile() &&
+                        (expectedBytes <= 0L || file.length() >= expectedBytes);
+            } catch (Exception ignored) { return false; }
+        }
+        if (DownloadDirectory.isTreeDocument(uri)) {
+            long size = -1L;
+            try (Cursor cursor = getContentResolver().query(uri,
+                    new String[] { DocumentsContract.Document.COLUMN_SIZE }, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) size = cursor.getLong(0);
+            } catch (Exception ignored) {}
+            if (size < 0L) try (android.os.ParcelFileDescriptor descriptor =
+                    getContentResolver().openFileDescriptor(uri, "r")) {
+                if (descriptor != null) size = descriptor.getStatSize();
+            } catch (Exception ignored) {}
+            // A cloud provider may not expose size; count only during crash recovery.
+            if (size < 0L) try (InputStream input = getContentResolver().openInputStream(uri)) {
+                if (input == null) return false;
+                byte[] buffer = new byte[128 * 1024];
+                size = 0L;
+                int read;
+                while ((read = input.read(buffer)) != -1) {
+                    size += read;
+                    if (size > MAX_DOWNLOAD_BYTES) return false;
+                }
+            } catch (Exception ignored) { return false; }
+            return size >= 0L && (expectedBytes <= 0L || size == expectedBytes);
+        }
+        if (!"media".equals(uri.getAuthority())) return false;
+        Cursor cursor = null;
+        try {
+            cursor = getContentResolver().query(uri,
+                    new String[] { MediaStore.MediaColumns.IS_PENDING, MediaStore.MediaColumns.SIZE },
+                    null, null, null);
+            if (cursor == null || !cursor.moveToFirst()) return false;
+            int pending = cursor.getInt(0);
+            long size = cursor.isNull(1) ? 0L : Math.max(0L, cursor.getLong(1));
+            return pending == 0 && (expectedBytes <= 0L || size >= expectedBytes);
+        } catch (Exception ignored) { return false;
+        } finally { if (cursor != null) cursor.close(); }
+    }
+
+    /** Retains the destination until deletion succeeds, so provider outages can be retried. */
+    private boolean rollbackPublished(long taskId, DownloadState state, File stateFile, Uri explicitUri) {
+        Uri uri = explicitUri;
+        DownloadStore.Item current = store.get(taskId);
+        if (uri == null && state != null && value(state.publishUri).length() > 0)
+            uri = Uri.parse(state.publishUri);
+        if (uri == null && current != null && value(current.localUri).length() > 0)
+            uri = Uri.parse(current.localUri);
+        if (uri == null) {
+            clearPublishingState(state, stateFile);
+            return true;
+        }
+        if (state == null) {
+            state = current == null ? new DownloadState() : DownloadState.create(Task.fromStore(this, current));
+        }
+        state.publishPending = true;
+        state.publishRollback = true;
+        state.publishUri = uri.toString();
+        state.persist(stateFile, true);
+        if (!deletePublishedUri(uri)) return false;
+        clearPublishingState(state, stateFile);
+        store.clearAdaptiveLocalUri(taskId, uri.toString());
+        return true;
+    }
+
+    private boolean deletePublishedUri(Uri uri) {
+        if (uri == null) return true;
+        if (DownloadContentProvider.AUTHORITY.equals(uri.getAuthority())) {
+            String name = uri.getLastPathSegment();
+            if (name == null || name.length() == 0) return false;
+            try {
+                File root = DownloadContentProvider.root(this).getCanonicalFile();
+                File file = new File(root, name).getCanonicalFile();
+                return root.equals(file.getParentFile()) && (!file.exists() || file.delete());
+            } catch (Exception ignored) { return false; }
+        } else if (DownloadDirectory.isTreeDocument(uri)) {
+            try {
+                if (DocumentsContract.deleteDocument(getContentResolver(), uri)) return true;
+                return isPublishedUriAbsent(uri);
+            } catch (Exception ignored) { return false; }
+        } else if ("media".equals(uri.getAuthority())) {
+            try { return getContentResolver().delete(uri, null, null) > 0 || isPublishedUriAbsent(uri); }
+            catch (RuntimeException ignored) { return false; }
+        }
+        return false;
+    }
+
+    private boolean isPublishedUriAbsent(Uri uri) {
+        try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
+            return cursor != null && !cursor.moveToFirst();
+        } catch (Exception ignored) { return false; }
     }
 
     private HttpURLConnection open(Task task, String url, String range, int connectTimeout, int readTimeout,
@@ -612,6 +1049,12 @@ public final class AdaptiveDownloadService extends Service {
                     if (!sameOrigin && NetworkSecurity.isCredentialHeader(header.getKey())) continue;
                     connection.setRequestProperty(header.getKey(), header.getValue());
                 }
+                // DNS is resolved by HttpURLConnection when connect() runs. Recheck
+                // immediately after that resolution so a hostname that was rebound to a
+                // private address between the preflight and socket setup is rejected.
+                connection.connect();
+                if (task.publicOnly && NetworkSecurity.isLocalOrPrivateHost(NetworkSecurity.normalizedHost(current)))
+                    throw new IllegalArgumentException("本地或私有网络下载目标已拒绝");
                 int status = connection.getResponseCode();
                 storeResponseCookies(current, connection);
                 if (!NetworkSecurity.isRedirect(status)) return connection;
@@ -656,8 +1099,21 @@ public final class AdaptiveDownloadService extends Service {
     private File stateFile(long id) { return new File(partialDirectory(), "median-" + safeTaskId(id) + ".state"); }
 
     private void deletePartialFiles(long id) {
-        deleteQuietly(partialFile(id));
-        deleteQuietly(stateFile(id));
+        synchronized (CLEANUP_LOCK) {
+            // Retirement and a stale cancellation can both request cleanup. Avoid
+            // concurrent AtomicFile writes that could lose a retained rollback URI.
+            File stateFile = stateFile(id);
+            DownloadState pending = DownloadState.load(stateFile);
+            boolean cleaned = rollbackPublished(id, pending, stateFile, null);
+            deleteQuietly(partialFile(id));
+            if (cleaned) deleteStateFile(stateFile);
+        }
+    }
+
+    private static void deleteStateFile(File file) {
+        if (file == null) return;
+        try { new AtomicFile(file).delete(); } catch (RuntimeException ignored) {}
+        deleteQuietly(new File(file.getAbsolutePath() + ".tmp"));
     }
 
     private Locks acquireLocks() {
@@ -926,8 +1382,25 @@ public final class AdaptiveDownloadService extends Service {
         final AtomicBoolean paused = new AtomicBoolean(false);
         volatile String pauseReason = "已暂停";
         volatile HttpURLConnection connection;
-        void cancel() { cancelled.set(true); disconnect(); }
-        void pause(String reason) { pauseReason = value(reason); paused.set(true); disconnect(); }
+        volatile boolean completed;
+        synchronized boolean cancel() {
+            if (completed) return false;
+            cancelled.set(true);
+            disconnect();
+            return true;
+        }
+        synchronized boolean pause(String reason) {
+            if (completed || cancelled.get()) return false;
+            pauseReason = value(reason);
+            paused.set(true);
+            disconnect();
+            return true;
+        }
+        synchronized void complete(Runnable commit) throws Cancelled, Paused {
+            check();
+            commit.run();
+            completed = true;
+        }
         void attach(HttpURLConnection value) { connection = value; }
         void detach(HttpURLConnection value) { if (connection == value) connection = null; }
         void disconnect() {
@@ -976,12 +1449,15 @@ public final class AdaptiveDownloadService extends Service {
     }
 
     private static final class DownloadState {
-        String originalUrl;
-        String resolvedUrl;
-        String etag;
-        String lastModified;
+        String originalUrl = "";
+        String resolvedUrl = "";
+        String etag = "";
+        String lastModified = "";
         long totalBytes;
         long cursor;
+        boolean publishPending;
+        boolean publishRollback;
+        String publishUri = "";
         private long lastPersistAt;
 
         static DownloadState create(Task task) {
@@ -991,6 +1467,9 @@ public final class AdaptiveDownloadService extends Service {
             state.etag = "";
             state.lastModified = "";
             state.totalBytes = 0L;
+            state.publishPending = false;
+            state.publishRollback = false;
+            state.publishUri = "";
             return state;
         }
 
@@ -1002,34 +1481,41 @@ public final class AdaptiveDownloadService extends Service {
             long now = SystemClock.elapsedRealtime();
             if (!force && now - lastPersistAt < 2000L) return;
             FileOutputStream output = null;
+            AtomicFile atomic = null;
             try {
                 JSONObject object = new JSONObject();
-                object.put("version", 2);
+                object.put("version", 3);
                 object.put("originalUrl", originalUrl);
                 object.put("resolvedUrl", resolvedUrl);
                 object.put("etag", etag);
                 object.put("lastModified", lastModified);
                 object.put("totalBytes", totalBytes);
                 object.put("cursor", cursor);
-                File temp = new File(file.getAbsolutePath() + ".tmp");
-                output = new FileOutputStream(temp, false);
+                object.put("publishPending", publishPending);
+                object.put("publishRollback", publishRollback);
+                object.put("publishUri", publishUri);
+                atomic = new AtomicFile(file);
+                output = atomic.startWrite();
                 output.write(object.toString().getBytes("UTF-8"));
+                output.flush();
                 if (force) output.getFD().sync();
-                output.close();
+                atomic.finishWrite(output);
                 output = null;
-                if (file.exists() && !file.delete()) return;
-                if (!temp.renameTo(file)) temp.delete();
                 lastPersistAt = now;
             } catch (Exception ignored) {
+                if (atomic != null && output != null) atomic.failWrite(output);
+                output = null;
             } finally { closeQuietly(output); }
         }
 
         static DownloadState load(File file) {
-            if (file == null || !file.isFile() || file.length() <= 0L || file.length() > 512L * 1024L) return null;
+            if (file == null) return null;
             FileInputStream input = null;
             try {
-                input = new FileInputStream(file);
-                byte[] data = new byte[(int) file.length()];
+                input = new AtomicFile(file).openRead();
+                long length = input.getChannel().size();
+                if (length <= 0L || length > 512L * 1024L) return null;
+                byte[] data = new byte[(int) length];
                 int offset = 0;
                 while (offset < data.length) {
                     int read = input.read(data, offset, data.length - offset);
@@ -1038,20 +1524,23 @@ public final class AdaptiveDownloadService extends Service {
                 }
                 JSONObject object = new JSONObject(new String(data, 0, offset, "UTF-8"));
                 int version = object.optInt("version", 0);
-                if (version != 1 && version != 2) return null;
+                if (version != 1 && version != 2 && version != 3) return null;
                 DownloadState state = new DownloadState();
                 state.originalUrl = object.optString("originalUrl", "");
                 state.resolvedUrl = object.optString("resolvedUrl", state.originalUrl);
                 state.etag = object.optString("etag", "");
                 state.lastModified = object.optString("lastModified", "");
                 state.totalBytes = object.optLong("totalBytes", 0L);
-                if (version == 2) state.cursor = Math.max(0L, object.optLong("cursor", 0L));
+                if (version == 2 || version == 3) state.cursor = Math.max(0L, object.optLong("cursor", 0L));
                 else {
                     JSONArray array = object.optJSONArray("segments");
                     JSONObject first = array == null ? null : array.optJSONObject(0);
                     if (first == null || array.length() != 1) return null;
                     state.cursor = Math.max(0L, first.optLong("cursor", 0L));
                 }
+                state.publishPending = version >= 3 && object.optBoolean("publishPending", false);
+                state.publishRollback = version >= 3 && object.optBoolean("publishRollback", false);
+                state.publishUri = version >= 3 ? object.optString("publishUri", "") : "";
                 if (state.totalBytes > 0L) state.cursor = Math.min(state.cursor, state.totalBytes);
                 return state;
             } catch (Exception ignored) { return null;

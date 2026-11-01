@@ -10,6 +10,11 @@ public final class MediaManifestParserSelfTest {
         require(parsed.variants.get(0).label.contains("1920x1080") && parsed.variants.get(0).label.contains("2500 kbps"), "quality label");
         require(parsed.encrypted && parsed.live, "encryption/live flags");
 
+        MediaManifestParser.Playlist average = MediaManifestParser.parseHls("https://media.example/average.m3u8",
+                "#EXTM3U\n#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=1800000,BANDWIDTH=2500000\nstream.m3u8\n");
+        require(average.variants.size() == 1 && average.variants.get(0).label.contains("1800 kbps"),
+                "exact average bandwidth attribute");
+
         MediaManifestParser.Playlist vod = MediaManifestParser.parseHls("https://media.example/vod.m3u8",
                 "#EXTM3U\n#EXTINF:5,\na.ts\n#EXTINF:5,\nb.ts\n#EXT-X-ENDLIST\n");
         require(vod.variants.isEmpty() && vod.segments == 2 && !vod.live, "media playlist summary");

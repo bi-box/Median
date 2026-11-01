@@ -30,15 +30,16 @@ final class PageAssistant {
         if (view == null) { callback.onResult(null, new IllegalArgumentException("没有活动页面")); return; }
         String css = "#__median_reader{position:fixed;inset:0;z-index:2147483647;overflow:auto;padding:28px 7vw 80px;background:" +
                 (dark ? "#17191c;color:#e8eaed" : "#faf8f3;color:#202124") +
-                ";font:18px/1.78 system-ui,sans-serif}#__median_reader article{max-width:760px;margin:auto}#__median_reader h1{font-size:2em;line-height:1.25}#__median_reader img,#__median_reader video{max-width:100%;height:auto}#__median_reader a{color:" +
-                (dark ? "#8ab4f8" : "#185abc") + ";text-decoration:none}#__median_reader pre{overflow:auto;padding:12px;background:rgba(127,127,127,.12)}";
-        String js = "(function(){var old=document.getElementById('__median_reader');if(old){old.remove();document.documentElement.style.overflow='';return 'off';}" +
+                ";font:18px/1.78 system-ui,sans-serif;box-sizing:border-box;overflow-wrap:anywhere}#__median_reader article{max-width:760px;margin:auto;min-width:0}#__median_reader h1{font-size:2em;line-height:1.25}#__median_reader img,#__median_reader video,#__median_reader svg{max-width:100%;height:auto}#__median_reader table{display:block;width:100%;max-width:100%;overflow-x:auto;float:none!important;position:static!important;border-collapse:collapse}#__median_reader figure,#__median_reader aside,#__median_reader section,#__median_reader div{max-width:100%;box-sizing:border-box;float:none!important;position:static!important;inset:auto!important}#__median_reader td,#__median_reader th{max-width:100%;overflow-wrap:anywhere}#__median_reader a{color:" +
+                (dark ? "#8ab4f8" : "#185abc") + ";text-decoration:none}#__median_reader pre{max-width:100%;overflow:auto;padding:12px;background:rgba(127,127,127,.12)}";
+        String js = "(function(){var old=document.getElementById('__median_reader');if(old){var prior=old.getAttribute('data-median-overflow');old.remove();document.documentElement.style.overflow=prior===null?'':prior;return 'off';}" +
+                "var base=Math.max(1,document.documentElement.scrollHeight-window.innerHeight),sy=window.scrollY||document.documentElement.scrollTop||0,ratio=Math.max(0,Math.min(1,(sy+window.innerHeight*.2)/base));" +
                 "var c=document.querySelector('article,[role=main],main'),best=c,score=c?(c.innerText||'').length:0;" +
                 "if(score<400){Array.from(document.querySelectorAll('section,div')).slice(0,700).forEach(function(e){var t=(e.innerText||'').length,p=e.querySelectorAll('p').length,l=e.querySelectorAll('a').length,s=t+p*120-l*24;if(t>300&&s>score){score=s;best=e;}});}" +
                 "if(!best||score<300)return 'none';var n=best.cloneNode(true);n.querySelectorAll('script,style,noscript,iframe,form,button,input,textarea,select,nav,aside,[aria-hidden=true]').forEach(function(e){e.remove();});" +
                 "n.querySelectorAll('*').forEach(function(e){Array.from(e.attributes).forEach(function(a){if(a.name.indexOf('on')===0||a.name==='style'||a.name==='id')e.removeAttribute(a.name);});});" +
-                "var box=document.createElement('div');box.id='__median_reader';var a=document.createElement('article'),h=document.createElement('h1');h.textContent=document.title;a.appendChild(h);a.appendChild(n);box.appendChild(a);" +
-                "var st=document.createElement('style');st.textContent=" + JSONObject.quote(css) + ";box.appendChild(st);document.documentElement.appendChild(box);document.documentElement.style.overflow='hidden';return 'on';})();";
+                "var box=document.createElement('div');box.id='__median_reader';box.setAttribute('data-median-overflow',document.documentElement.style.overflow||'');var a=document.createElement('article'),h=document.createElement('h1');h.textContent=document.title;a.appendChild(h);a.appendChild(n);box.appendChild(a);" +
+                "var st=document.createElement('style');st.textContent=" + JSONObject.quote(css) + ";box.appendChild(st);document.documentElement.appendChild(box);document.documentElement.style.overflow='hidden';requestAnimationFrame(function(){var max=Math.max(0,box.scrollHeight-box.clientHeight);box.scrollTop=Math.round(max*ratio);});return 'on';})();";
         view.evaluateJavascript(js, new ValueCallback<String>() {
             @Override public void onReceiveValue(String value) {
                 try { callback.onResult(String.valueOf(new JSONTokener(value).nextValue()), null); }
@@ -61,7 +62,7 @@ final class PageAssistant {
     void speak(WebView view, final Callback<Boolean> callback) {
         if (view == null) { callback.onResult(Boolean.FALSE, new IllegalArgumentException("没有活动页面")); return; }
         final long requestGeneration = ++speechGeneration;
-        String js = "(function(){var r=document.getElementById('__median_reader'),e=r||document.querySelector('article,[role=main],main')||document.body,t=(e&&e.innerText||'').replace(/\\s+/g,' ').trim();return t.slice(0,60000);})();";
+        String js = "(function(){var r=document.getElementById('__median_reader'),e=r||document.querySelector('article,[role=main],main')||document.body,t=(e&&e.innerText||'').replace(/\\s+/g,' ').trim();return Array.from(t).slice(0,60000).join('');})();";
         view.evaluateJavascript(js, new ValueCallback<String>() {
             @Override public void onReceiveValue(String value) {
                 if (shutdown || requestGeneration != speechGeneration) return;
@@ -147,6 +148,8 @@ final class PageAssistant {
                     }
                 }
             }
+            if (end < text.length() && end > start && Character.isHighSurrogate(text.charAt(end - 1)) &&
+                    Character.isLowSurrogate(text.charAt(end))) end--;
             String chunk = text.substring(start, end).trim();
             if (chunk.length() > 0) {
                 int queued = tts.speak(chunk, sequence == 0 ? TextToSpeech.QUEUE_FLUSH : TextToSpeech.QUEUE_ADD,

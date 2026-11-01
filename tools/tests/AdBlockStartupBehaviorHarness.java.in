@@ -1,0 +1,180 @@
+package com.xinyv.median;
+
+import java.util.*;
+import java.util.concurrent.*;
+
+final class AdBlockStartupBehaviorHarness {
+    static final String STATE_WEBVIEW = "median.webview.state";
+    static final String STATE_TABS = "median.tabs.state";
+    static final String HOME_URL = "https://median.invalid/home";
+    static final long FILTER_SUBSCRIPTION_IDLE_DELAY_MS = 3200L;
+    final AdBlockEngine adBlock = new AdBlockEngine();
+    final Prefs prefs = new Prefs();
+    final BrowserServices services = new BrowserServices();
+    final RecordingHandler uiHandler = new RecordingHandler();
+    final QueueExecutor worker = new QueueExecutor();
+    final Thread uiThread = Thread.currentThread();
+    ExecutorService scriptExecutor = worker;
+    final AdBlockRuleLoader adBlockRuleLoader;
+    WebView webView;
+    boolean activityDestroyed, activityResumed, finishing, startupReady, startupCustomRulesReady;
+    boolean startupFastStarted, startupFastPosted, startupDataReady, startupSessionPending, restoreTabs;
+    boolean deferredStartupPending, deferredStartupComplete, pageFinished, adBlockEnabled;
+    long startupReadyAt, lastExecutorBusyToastAt;
+    String startupExternalUrl = "", pendingStartupInput, currentPageUrl = "", currentPageHost = "";
+    Bundle startupSavedState;
+    Object dataStore;
+    final List<BrowserTab> tabs = new ArrayList<BrowserTab>();
+    final Map<WebView, String> renderedHomeKeys = new HashMap<WebView, String>();
+    String configuredHome = HOME_URL, restoredSessionUrl = "", navigated = "", route = "";
+    int navigations, cosmeticRefreshes, notifications, reloads, updates, publishedCallbacks, failureCallbacks;
+    int currentTabIndex;
+    @@READINESS@@
+    @@DEFERRED@@
+
+    AdBlockStartupBehaviorHarness() {
+        adBlockRuleLoader = new AdBlockRuleLoader(adBlock, prefs, services, uiHandler,
+                new AdBlockRuleLoader.TaskQueue() {
+                    @Override public boolean execute(Runnable task) {
+                        return executeTask(scriptExecutor, task);
+                    }
+                }, new AdBlockRuleLoader.Listener() {
+                    @Override public void onPublished(boolean notifyUser) {
+                        assertUiCallback(); publishedCallbacks++;
+                        onAdBlockRulesLoaded(notifyUser);
+                    }
+                    @Override public void onFailed() {
+                        assertUiCallback(); failureCallbacks++;
+                        onAdBlockRulesLoadFailed();
+                    }
+                });
+        tabs.add(new BrowserTab()); applyStartupProtection();
+    }
+    void applyStartupProtection() { @@PROTECTION@@ }
+    void assertUiCallback() {
+        if (Thread.currentThread() != uiThread) throw new AssertionError("Rule listener ran outside the UI queue");
+    }
+    boolean executeRejected;
+    @@METHODS@@
+
+    void startRules() { rebuildAdBlockRulesAsync(false); }
+    void editRules(String custom, boolean notify) { prefs.custom = custom; rebuildAdBlockRulesAsync(notify); }
+    void nativeReady() {
+        webView = new WebView(); activityResumed = true;
+        startupReadiness.set(StartupReadiness.VIEW, true);
+        startupReadiness.set(StartupReadiness.RESUMED, true);
+        maybeStartFastStartup(); maybeCompleteStartup();
+    }
+    void resume() { activityResumed = true; maybeStartFastStartup(); maybeCompleteStartup(); }
+    void destroy() { activityDestroyed = true; adBlockRuleLoader.close(); services.close(); }
+    void runUi() { Runnable r; while ((r = uiHandler.queue.poll()) != null) r.run(); }
+    Thread runWorker() {
+        Runnable task = worker.queue.poll();
+        if (task == null) throw new AssertionError("No worker task");
+        Thread thread = new RuleWorker(task); thread.start(); return thread;
+    }
+    void finishPage() { pageFinished = true; currentPageUrl = "https://page.example/"; scheduleDeferredStartupWork(); }
+    void runIdle() { Runnable r; while ((r = uiHandler.delayed.poll()) != null) r.run(); }
+    void navigation(String url, String kind) { navigated = url; route = kind; navigations++; }
+    boolean isFinishing() { return finishing; }
+    void postAfterUiTransition(Runnable action) { uiHandler.post(action); }
+    void installPreparedDocumentStartUserScripts(WebView view) {}
+    void refreshCosmeticFilters() { cosmeticRefreshes++; }
+    void reloadWebView(WebView view) { reloads++; }
+    void toast(String message) { notifications++; }
+    void loadInput(String input) { navigation(input, "direct"); }
+    boolean isHomeUrl(String url) { return url != null && url.startsWith(HOME_URL); }
+    boolean isQrScannerUrl(String url) { return url != null && url.endsWith("/scan"); }
+    boolean isNetworkPage(String url) { return url != null && url.startsWith("https://") && !url.startsWith("https://median.invalid/"); }
+    boolean isOfflineUrl(String url) { return url != null && url.startsWith("offline:"); }
+    void showHome() { navigation(configuredHome, "home"); }
+    void showQrScannerPage() { navigation("scan", "qr"); }
+    void prepareNetworkDestination(WebView view, String url, String host) { navigation(url, "restored"); }
+    void prepareOfflineDestination(WebView view, String url) { navigation(url, "offline"); }
+    void applyPageAccessPolicy(WebView view, String url) {}
+    final Map<WebView, String> appliedSiteSettings = new HashMap<WebView, String>();
+    void watchInitialNetworkNavigation(WebView view, String url) {}
+    boolean restoreStartupSession() {
+        if (restoredSessionUrl.isEmpty()) return false;
+        navigation(restoredSessionUrl, "session"); return true;
+    }
+    // Tab-metadata serialization has its own Android tests. These rule-readiness cases use one
+    // fresh tab and exercise production startup selection plus legacy WebView-state restoration.
+    boolean restoreTabMetadata(Bundle state) { return false; }
+    String configuredHomeUrl() { return configuredHome; }
+    String hostOf(String url) { return android.net.Uri.parse(url).getHost(); }
+    void loadNetworkUrl(WebView view, String url) { navigation(url, "configured-network"); }
+    void requestChromeUpdate() {}
+    void showCommunityNoticeOnFirstLaunch(Bundle state) {}
+    void updateFilterSubscriptions(boolean automatic) { updates++; }
+}
+
+final class Prefs implements android.content.SharedPreferences {
+    volatile String custom = "";
+    boolean enabled = true;
+    public String getString(String key, String fallback) { return custom; }
+    public boolean getBoolean(String key, boolean fallback) { return enabled; }
+}
+final class BrowserServices {
+    final FilterSubscriptionStore store = new FilterSubscriptionStore();
+    int filterAcquisitions;
+    boolean closed;
+    synchronized FilterSubscriptionStore filters() {
+        if (closed) throw new AssertionError("Filter store acquired after service teardown");
+        filterAcquisitions++;
+        return store;
+    }
+    synchronized void close() { closed = true; }
+}
+final class FilterSubscriptionStore {
+    CountDownLatch entered, release;
+    int reads;
+    boolean fail;
+    List<String> sources = Collections.singletonList("||subscription.example^\npage.example##.subscription-ad");
+    List<String> readEnabledRuleSources() {
+        reads++;
+        if (entered != null) entered.countDown();
+        if (release != null) try {
+            if (!release.await(5, TimeUnit.SECONDS)) throw new AssertionError("Timed out test subscription read");
+        } catch (InterruptedException e) { throw new AssertionError(e); }
+        if (fail) throw new IllegalStateException("Test read failure");
+        return sources;
+    }
+}
+final class RecordingHandler extends android.os.Handler {
+    final Queue<Runnable> queue = new ConcurrentLinkedQueue<Runnable>();
+    final Queue<Runnable> delayed = new ConcurrentLinkedQueue<Runnable>();
+    long delay;
+    public boolean post(Runnable action) { queue.add(action); return true; }
+    void postDelayed(Runnable action, long milliseconds) { delay = milliseconds; delayed.add(action); }
+}
+final class QueueExecutor extends AbstractExecutorService {
+    final Queue<Runnable> queue = new ConcurrentLinkedQueue<Runnable>();
+    boolean reject, shutdown;
+    public void execute(Runnable task) { if (reject || shutdown) throw new RejectedExecutionException(); queue.add(task); }
+    public void shutdown() { shutdown = true; }
+    public List<Runnable> shutdownNow() { shutdown = true; return Collections.emptyList(); }
+    public boolean isShutdown() { return shutdown; }
+    public boolean isTerminated() { return shutdown; }
+    public boolean awaitTermination(long timeout, TimeUnit unit) { return shutdown; }
+}
+final class RuleWorker extends Thread {
+    volatile Throwable failure;
+    RuleWorker(Runnable task) { super(task, "test-rule-worker"); }
+    @Override public void run() {
+        try { super.run(); } catch (Throwable error) { failure = error; }
+    }
+}
+final class SystemClock { static long elapsedRealtime() { return 100L; } static long uptimeMillis() { return 10000L; } }
+final class BrowserTab { String url = ""; }
+final class WebView {
+    String restoredUrl;
+    boolean isAttachedToWindow() { return true; }
+    Object restoreState(Bundle state) { if (state == null || state.url == null) return null; restoredUrl = state.url; return new Object(); }
+    String getUrl() { return restoredUrl; }
+}
+final class Bundle {
+    String url;
+    boolean containsKey(String key) { return false; }
+    Bundle getBundle(String key) { return null; }
+}

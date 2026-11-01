@@ -7,6 +7,27 @@ import sys
 import zlib
 from pathlib import Path
 
+
+def zopfli_candidate(data, consider):
+    """Use an exhaustive offline search when python-zopfli is available."""
+    try:
+        import zopfli.zlib as zopfli_zlib
+    except ImportError:
+        return
+    wrapped = zopfli_zlib.compress(
+        data,
+        numiterations=30,
+        blocksplitting=True,
+        blocksplittinglast=False,
+        blocksplittingmax=0,
+    )
+    if len(wrapped) <= 6:
+        return
+    candidate = wrapped[2:-4]
+    if zlib.decompress(candidate, -15) == data:
+        consider(candidate)
+
+
 def libdeflate_candidates(data, consider):
     """Use libdeflate's denser maximum levels when the build host provides it."""
     library = ctypes.util.find_library("deflate")
@@ -67,6 +88,7 @@ def best_raw_deflate(payload):
             consider(compressor.compress(payload) + compressor.flush())
 
     libdeflate_candidates(payload, consider)
+    zopfli_candidate(payload, consider)
     return best
 
 

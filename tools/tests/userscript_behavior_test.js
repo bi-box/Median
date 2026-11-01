@@ -51,17 +51,21 @@ function assert(value, message) { if (!value) throw new Error(message); }
 (async () => {
   vm.runInContext(payload, context);
   assert(context.__medianRunCount === 1, 'document-start script did not execute once');
-  assert(context.__medianTestGM && context.__medianTestGM.info.version === '2.3.0', 'modern GM runtime missing');
+  assert(context.__medianTestGM && context.__medianTestGM.info.version === '2.4.0', 'modern GM runtime missing');
   assert(await context.__medianTestGM.getValue('missing', 42) === 42, 'missing-value default was not preserved');
   assert(await context.__medianTestGM.getResourceText('sample') === 'hello', 'resource text decoding failed');
   await context.__medianTestGM.setValue('x', 1);
+  await context.__medianTestGM.saveTab({ ready: true });
+  assert(typeof (await context.__medianTestGM.getTab()) === 'object', 'modern tab API missing');
   const dispatchers = Object.getOwnPropertyNames(context)
     .filter(name => name.startsWith('__medianDispatch_')).map(name => context[name]);
   const menuOwner = dispatchers.find(dispatcher => dispatcher.menus(bridgeToken).length === 1);
   assert(menuOwner, 'registered script command was not exposed');
   const menu = menuOwner.menus(bridgeToken)[0];
   assert(menuOwner.runMenu(bridgeToken, menu.id), 'script command did not run');
-  assert(calls.some(call => call.a === 'xhr') && calls.some(call => call.a === 'setValue'), 'native bridge actions were not issued');
+  assert(calls.some(call => call.a === 'xhr') && calls.some(call => call.a === 'setValue') &&
+    calls.some(call => call.a === 'saveTab') && calls.some(call => call.a === 'getTab'),
+    'native bridge actions were not issued');
   const beforeCalls = calls.length;
   const beforeNodes = appended.length;
   vm.runInContext(payload, context);

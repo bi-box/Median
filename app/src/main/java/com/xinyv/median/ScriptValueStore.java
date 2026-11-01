@@ -7,14 +7,24 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 import org.json.JSONTokener;
 
-import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 /** Persistent, origin-independent userscript storage. */
 final class ScriptValueStore {
     private static final String PREFS = "median_script_values_v1";
+    static final int MAX_KEY_LENGTH = 256;
+    static final int MAX_VALUE_CHARS = 1024 * 1024;
+    static final int MAX_TOTAL_CHARS = 4 * 1024 * 1024;
+    static final int MAX_ENTRIES = 256;
     private final SharedPreferences prefs;
-    private final HashMap<String, JSONObject> cache = new HashMap<String, JSONObject>();
+    private final LinkedHashMap<String, JSONObject> cache =
+            new LinkedHashMap<String, JSONObject>(16, .75f, true) {
+                @Override protected boolean removeEldestEntry(Map.Entry<String, JSONObject> eldest) {
+                    return size() > 64;
+                }
+            };
 
     ScriptValueStore(Context context) {
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
@@ -32,15 +42,23 @@ final class ScriptValueStore {
     }
 
     synchronized boolean setJson(String scriptId, String key, String valueJson) {
-        if (!validKey(key)) return false;
+        if (!validKey(key) || valueJson == null || valueJson.length() > MAX_VALUE_CHARS) return false;
         String storageKey = prefKey(scriptId);
         JSONObject values = read(scriptId);
         boolean existed = values.has(key);
         Object previous = values.opt(key);
         try {
             Object value = new JSONTokener(normalizeJson(valueJson, "null")).nextValue();
+            String encodedValue = encodeJsonValue(value);
+            if (encodedValue.length() > MAX_VALUE_CHARS) return false;
+            if (!existed && values.length() >= MAX_ENTRIES) return false;
             values.put(key, value);
             String encoded = values.toString();
+            if (encoded.length() > MAX_TOTAL_CHARS) {
+                if (existed) values.put(key, previous);
+                else values.remove(key);
+                return false;
+            }
             persistAsync(storageKey, encoded);
             return true;
         } catch (Exception ignored) {
@@ -51,6 +69,7 @@ final class ScriptValueStore {
     }
 
     synchronized boolean delete(String scriptId, String key) {
+        if (!validKey(key)) return false;
         String storageKey = prefKey(scriptId);
         JSONObject values = read(scriptId);
         values.remove(key);
@@ -62,7 +81,8 @@ final class ScriptValueStore {
         JSONObject values = read(scriptId);
         JSONArray result = new JSONArray();
         Iterator<String> keys = values.keys();
-        while (keys.hasNext()) result.put(keys.next());
+        int count = 0;
+        while (keys.hasNext() && count++ < MAX_ENTRIES) result.put(keys.next());
         return result.toString();
     }
 
@@ -71,6 +91,8 @@ final class ScriptValueStore {
         cache.remove(storageKey);
         prefs.edit().remove(storageKey).apply();
     }
+
+    synchronized void trimMemory() { cache.clear(); }
 
     void shutdown() {}
 
@@ -85,7 +107,10 @@ final class ScriptValueStore {
         String storageKey = prefKey(scriptId);
         JSONObject value = cache.get(storageKey);
         if (value != null) return value;
-        try { value = new JSONObject(prefs.getString(storageKey, "{}")); }
+        try {
+            String raw = prefs.getString(storageKey, "{}");
+            value = raw != null && raw.length() <= MAX_TOTAL_CHARS ? new JSONObject(raw) : new JSONObject();
+        }
         catch (Exception ignored) { value = new JSONObject(); }
         cache.put(storageKey, value);
         return value;
@@ -104,11 +129,16 @@ final class ScriptValueStore {
     }
 
     private static boolean validKey(String key) {
-        return key != null && key.length() > 0;
+        if (key == null || key.length() == 0 || key.length() > MAX_KEY_LENGTH) return false;
+        for (int i = 0; i < key.length(); i++) {
+            char c = key.charAt(i);
+            if (Character.isISOControl(c)) return false;
+        }
+        return true;
     }
 
     private static String normalizeJson(String raw, String fallback) {
-        if (raw == null || raw.length() == 0) return fallback;
+        if (raw == null || raw.length() == 0 || raw.length() > MAX_VALUE_CHARS) return fallback;
         return raw;
     }
 }

@@ -3,15 +3,16 @@ plugins {
 }
 
 
-final int medianVersionCode = 92
-final String medianVersionName = '2.3.0'
+final int medianVersionCode = 103
+final String medianVersionName = '2.4.0'
 
 android {
     namespace 'com.xinyv.median'
     compileSdk 36
+    buildToolsVersion '35.0.0'
 
     defaultConfig {
-        applicationId 'com.xinyv.median.compat'
+        applicationId providers.gradleProperty('medianApplicationId').getOrElse('com.xinyv.median.compat')
         minSdk 26
         targetSdk 36
         versionCode medianVersionCode
@@ -22,10 +23,10 @@ android {
 
     signingConfigs {
         release {
-            def storeFileValue = System.getenv('MEDIAN_KEYSTORE')
-            def storePasswordValue = System.getenv('MEDIAN_STOREPASS')
-            def keyAliasValue = System.getenv('MEDIAN_KEY_ALIAS')
-            def keyPasswordValue = System.getenv('MEDIAN_KEYPASS') ?: storePasswordValue
+            def storeFileValue = System.getenv('MEDIAN_KEYSTORE') ?: project.findProperty('MEDIAN_KEYSTORE')
+            def storePasswordValue = System.getenv('MEDIAN_STOREPASS') ?: project.findProperty('MEDIAN_STOREPASS')
+            def keyAliasValue = System.getenv('MEDIAN_KEY_ALIAS') ?: project.findProperty('MEDIAN_KEY_ALIAS')
+            def keyPasswordValue = System.getenv('MEDIAN_KEYPASS') ?: project.findProperty('MEDIAN_KEYPASS') ?: storePasswordValue
             if (storeFileValue && storePasswordValue && keyAliasValue && keyPasswordValue) {
                 storeFile file(storeFileValue)
                 storePassword storePasswordValue

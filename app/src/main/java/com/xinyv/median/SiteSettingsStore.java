@@ -70,7 +70,7 @@ final class SiteSettingsStore {
     private static final long WRITE_DELAY_MS = 180L;
     private final SharedPreferences prefs;
     private final HashMap<String, SiteSettings> cache = new HashMap<String, SiteSettings>();
-    private final Handler io;
+    private Handler io;
     private boolean dirty;
     private boolean closed;
     private long generation;
@@ -81,7 +81,6 @@ final class SiteSettingsStore {
     SiteSettingsStore(Context context) {
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         load();
-        io = LocalDataIo.acquire();
     }
 
     synchronized SiteSettings forHost(String host) {
@@ -123,7 +122,7 @@ final class SiteSettingsStore {
         HashMap<String, SiteSettings> restored = parse(raw);
         synchronized (this) {
             if (closed) throw new IllegalStateException("网站设置存储已关闭");
-            io.removeCallbacks(writer);
+            if (io != null) io.removeCallbacks(writer);
             generation++;
             if (!prefs.edit().putString(KEY, serialize(restored)).commit())
                 throw new IllegalStateException("网站设置保存失败");
@@ -135,16 +134,19 @@ final class SiteSettingsStore {
 
     synchronized void flush() {
         if (closed || !dirty) return;
-        io.removeCallbacks(writer);
-        io.post(writer);
+        Handler handler = ioLocked();
+        handler.removeCallbacks(writer);
+        handler.post(writer);
     }
 
     synchronized void close() {
         if (closed) return;
         closed = true;
-        io.removeCallbacks(writer);
-        if (dirty) io.post(writer);
-        LocalDataIo.release();
+        if (io != null) {
+            io.removeCallbacks(writer);
+            if (dirty) io.post(writer);
+            LocalDataIo.release();
+        }
     }
 
     private synchronized void load() {
@@ -158,8 +160,14 @@ final class SiteSettingsStore {
         if (closed) return;
         generation++;
         dirty = true;
-        io.removeCallbacks(writer);
-        io.postDelayed(writer, WRITE_DELAY_MS);
+        Handler handler = ioLocked();
+        handler.removeCallbacks(writer);
+        handler.postDelayed(writer, WRITE_DELAY_MS);
+    }
+
+    private Handler ioLocked() {
+        if (io == null) io = LocalDataIo.acquire();
+        return io;
     }
 
     private void writeSnapshot() {

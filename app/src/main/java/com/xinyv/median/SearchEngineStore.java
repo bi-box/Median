@@ -168,6 +168,6 @@ final class SearchEngineStore {
     private static String cleanName(String value) {
         String name = value == null ? "" : value.trim();
         if (name.length() == 0) name = "自定义";
-        return name.length() > 32 ? name.substring(0, 32) : name;
+        return UiText.truncate(name, 32);
     }
 }

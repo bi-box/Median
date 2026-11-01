@@ -23,10 +23,8 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 
 import javax.crypto.Cipher;
 import javax.crypto.KeyGenerator;
@@ -37,6 +35,7 @@ final class PasswordVault {
     static final class Credential implements Cloneable {
         String id;
         String host;
+        int port = 443;
         String username;
         String password;
         long updatedAt;
@@ -44,6 +43,15 @@ final class PasswordVault {
         Credential copy() {
             try { return (Credential) super.clone(); }
             catch (CloneNotSupportedException impossible) { throw new AssertionError(impossible); }
+        }
+
+        void clear() {
+            id = "";
+            host = "";
+            port = 0;
+            username = "";
+            password = "";
+            updatedAt = 0L;
         }
     }
 
@@ -65,32 +73,40 @@ final class PasswordVault {
     private static final int MAX_CREDENTIALS = 500;
 
     private final SharedPreferences prefs;
-    private final ThreadPoolExecutor worker = new ThreadPoolExecutor(
-            1, 1, 30L, TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(32));
+    private final ThreadPoolExecutor worker =
+            BackgroundExecutor.create(1, 32, "median-vault", false);
     private final Handler main = new Handler(Looper.getMainLooper());
     // Accessed only by the single vault worker. Decrypt/JSON parse happens once per warm session.
     private ArrayList<Credential> memoryCache;
 
     PasswordVault(Context context) {
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        worker.allowCoreThreadTimeOut(true);
     }
 
     void saveCredential(final String host, final String username, final String password, Callback<Void> callback) {
+        saveCredential(host, 443, username, password, callback);
+    }
+
+    void saveCredential(final String host, final int port, final String username, final String password, Callback<Void> callback) {
         submit(new Operation<Void>() {
             @Override public Void run() throws Exception {
-                saveCredentialBlocking(host, username, password);
+                saveCredentialBlocking(host, port, username, password);
                 return null;
             }
         }, callback);
     }
 
     void forHost(final String host, Callback<List<Credential>> callback) {
+        forOrigin(host, 443, callback);
+    }
+
+    void forOrigin(final String host, final int port, Callback<List<Credential>> callback) {
         submit(new Operation<List<Credential>>() {
             @Override public List<Credential> run() throws Exception {
                 String normalized = normalizeHost(host);
                 ArrayList<Credential> result = new ArrayList<Credential>();
-                for (Credential item : ensureLoaded()) if (item.host.equals(normalized)) result.add(copy(item));
+                if (!validPort(port)) throw new IllegalArgumentException("密码端口无效");
+                for (Credential item : ensureLoaded()) if (item.host.equals(normalized) && item.port == port) result.add(copy(item));
                 Collections.sort(result, new Comparator<Credential>() {
                     @Override public int compare(Credential left, Credential right) {
                         return left.updatedAt == right.updatedAt ? 0 : (left.updatedAt < right.updatedAt ? 1 : -1);
@@ -124,6 +140,7 @@ final class PasswordVault {
                 for (Credential credential : ensureLoaded()) {
                     JSONObject object = new JSONObject();
                     object.put("host", credential.host);
+                    object.put("port", credential.port);
                     object.put("username", credential.username);
                     object.put("password", credential.password);
                     object.put("updatedAt", credential.updatedAt);
@@ -145,13 +162,15 @@ final class PasswordVault {
                     JSONObject object = array.optJSONObject(i);
                     if (object == null) continue;
                     String host = normalizeHost(object.optString("host", ""));
+                    int port = object.optInt("port", 443);
                     String username = object.optString("username", "");
                     String password = object.optString("password", "");
-                    if (!validHost(host) || username.length() == 0 || username.length() > 512 ||
+                    if (!validHost(host) || !validPort(port) || username.length() == 0 || username.length() > 512 ||
                             password.length() == 0 || password.length() > 8192) throw new IllegalArgumentException("密码条目无效");
                     Credential credential = new Credential();
-                    credential.id = String.valueOf(System.currentTimeMillis()) + "-" + i + "-" + UrlCleaner.stableId(host + "\n" + username);
+                    credential.id = String.valueOf(System.currentTimeMillis()) + "-" + i + "-" + UrlCleaner.stableId(host + ":" + port + "\n" + username);
                     credential.host = host;
+                    credential.port = port;
                     credential.username = username;
                     credential.password = password;
                     credential.updatedAt = object.optLong("updatedAt", System.currentTimeMillis());
@@ -167,18 +186,32 @@ final class PasswordVault {
         submit(new Operation<Void>() {
             @Override public Void run() throws Exception {
                 ArrayList<Credential> all = ensureLoaded();
-                for (int i = all.size() - 1; i >= 0; i--) if (all.get(i).id.equals(id)) all.remove(i);
+                for (int i = all.size() - 1; i >= 0; i--) if (all.get(i).id.equals(id)) {
+                    Credential removed = all.remove(i);
+                    if (removed != null) removed.clear();
+                }
                 writeAll(all);
                 return null;
             }
         }, callback);
     }
 
+    void lock() {
+        if (worker.isShutdown()) return;
+        try {
+            worker.execute(new Runnable() {
+                @Override public void run() { clearMemoryCache(); }
+            });
+        } catch (RejectedExecutionException ignored) {
+            // close() owns the final synchronous wipe once the worker starts shutting down.
+        }
+    }
+
     void trimMemory() {
         if (worker.isShutdown()) return;
         try {
             worker.execute(new Runnable() {
-                @Override public void run() { memoryCache = null; }
+                @Override public void run() { clearMemoryCache(); }
             });
         } catch (RejectedExecutionException ignored) {
             // A queued vault mutation is more important than an advisory cache trim.
@@ -186,8 +219,8 @@ final class PasswordVault {
     }
 
     void close() {
-        memoryCache = null;
         worker.shutdownNow();
+        clearMemoryCache();
         main.removeCallbacksAndMessages(null);
     }
 
@@ -222,16 +255,16 @@ final class PasswordVault {
         }
     }
 
-    private void saveCredentialBlocking(String host, String username, String password) throws Exception {
+    private void saveCredentialBlocking(String host, int port, String username, String password) throws Exception {
         String normalized = normalizeHost(host);
-        if (!validHost(normalized) || username == null || username.length() == 0 ||
+        if (!validHost(normalized) || !validPort(port) || username == null || username.length() == 0 ||
                 username.length() > 512 || password == null || password.length() == 0 || password.length() > 8192) {
             throw new IllegalArgumentException("账号数据超过安全限制");
         }
         ArrayList<Credential> all = ensureLoaded();
         Credential target = null;
         for (Credential item : all) {
-            if (item.host.equals(normalized) && item.username.equals(username)) {
+            if (item.host.equals(normalized) && item.port == port && item.username.equals(username)) {
                 target = item;
                 break;
             }
@@ -239,10 +272,11 @@ final class PasswordVault {
         if (target == null) {
             if (all.size() >= MAX_CREDENTIALS) throw new IllegalStateException("密码库已达到 500 条上限");
             target = new Credential();
-            target.id = String.valueOf(System.currentTimeMillis()) + "-" + UrlCleaner.stableId(normalized + "\n" + username);
+            target.id = String.valueOf(System.currentTimeMillis()) + "-" + UrlCleaner.stableId(normalized + ":" + port + "\n" + username);
             all.add(target);
         }
         target.host = normalized;
+        target.port = port;
         target.username = username;
         target.password = password;
         target.updatedAt = System.currentTimeMillis();
@@ -261,14 +295,15 @@ final class PasswordVault {
                 if (object == null) continue;
                 Credential credential = new Credential();
                 credential.host = normalizeHost(object.optString("host", ""));
+                credential.port = object.optInt("port", 443);
                 credential.username = object.optString("username", "");
                 credential.password = object.optString("password", "");
-                if (!validHost(credential.host) || credential.username.length() == 0 || credential.username.length() > 512 ||
+                if (!validHost(credential.host) || !validPort(credential.port) || credential.username.length() == 0 || credential.username.length() > 512 ||
                         credential.password.length() == 0 || credential.password.length() > 8192)
                     throw new IllegalStateException("密码库内容损坏");
                 credential.id = object.optString("id", "");
                 if (credential.id.length() == 0 || credential.id.length() > 160)
-                    credential.id = String.valueOf(i) + '-' + UrlCleaner.stableId(credential.host + "\n" + credential.username);
+                    credential.id = String.valueOf(i) + '-' + UrlCleaner.stableId(credential.host + ":" + credential.port + "\n" + credential.username);
                 credential.updatedAt = object.optLong("updatedAt", 0L);
                 result.add(credential);
             }
@@ -284,14 +319,23 @@ final class PasswordVault {
             JSONObject object = new JSONObject();
             object.put("id", credential.id);
             object.put("host", credential.host);
+            object.put("port", credential.port);
             object.put("username", credential.username);
             object.put("password", credential.password);
             object.put("updatedAt", credential.updatedAt);
             array.put(object);
         }
         encryptAndStore(array.toString());
-        memoryCache = copyList(all);
-        writeHostIndex(all);
+        ArrayList<Credential> nextCache = copyList(all);
+        clearMemoryCache();
+        memoryCache = nextCache;
+        writeHostIndex(nextCache);
+    }
+
+    private void clearMemoryCache() {
+        clearCredentials(memoryCache);
+        if (memoryCache != null) memoryCache.clear();
+        memoryCache = null;
     }
 
     private void writeHostIndex(List<Credential> all) {
@@ -305,6 +349,8 @@ final class PasswordVault {
         return UrlCleaner.stableId("credential-host\n" + host);
     }
 
+    private static boolean validPort(int port) { return port >= 1 && port <= 65535; }
+
     private static ArrayList<Credential> copyList(List<Credential> all) {
         ArrayList<Credential> copy = new ArrayList<Credential>(all.size());
         for (Credential item : all) copy.add(copy(item));
@@ -313,6 +359,11 @@ final class PasswordVault {
 
     private static Credential copy(Credential source) {
         return source.copy();
+    }
+
+    static void clearCredentials(List<Credential> credentials) {
+        if (credentials == null) return;
+        for (Credential credential : credentials) if (credential != null) credential.clear();
     }
 
     private SecretKey getOrCreateKey() throws Exception {

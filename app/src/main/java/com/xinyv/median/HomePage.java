@@ -42,7 +42,7 @@ final class HomePage {
             ".engines{display:flex;justify-content:center;margin-top:15px;flex-wrap:wrap}.chip{border:0;background:transparent;border-radius:18px;padding:8px 14px;margin:3px;font-size:13px;color:var(--secondary)}.chip:active{transform:scale(.9)}.chip.active{background:var(--accent);font-weight:650;color:#fff}" +
             ".shortcuts{display:grid;gap:16px 8px;margin:28px auto 0;max-width:440px}.shortcut{text-decoration:none;color:var(--fg);min-width:0;display:flex;flex-direction:column;align-items:center}" +
             ".tile{display:grid;place-items:center;width:50px;height:50px;border-radius:var(--tile-radius);background:var(--surface);font-size:19px;font-weight:650;box-shadow:0 1px 5px rgba(0,0,0,.13);transition:transform .14s;-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}" +
-            ".favicon{width:30px;height:30px;object-fit:contain;border-radius:7px}.fallback[hidden]{display:none}.folder-mark{position:relative;width:29px;height:21px;border:2px solid var(--secondary);border-radius:4px}.folder-mark:before{content:'';position:absolute;left:2px;top:-7px;width:12px;height:7px;border:2px solid var(--secondary);border-bottom:0;border-radius:4px 4px 0 0}" +
+            ".tile{position:relative}.favicon,.fallback{grid-area:1/1}.favicon{width:30px;height:30px;object-fit:contain;border-radius:7px}.fallback{font-size:19px;line-height:1}.fallback[hidden]{display:none}.folder-mark{position:relative;width:29px;height:21px;border:2px solid var(--secondary);border-radius:4px}.folder-mark:before{content:'';position:absolute;left:2px;top:-7px;width:12px;height:7px;border:2px solid var(--secondary);border-bottom:0;border-radius:4px 4px 0 0}" +
             ".shortcut:active .tile{transform:scale(.86)}.label{width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:7px;font-size:12px;text-shadow:var(--label-shadow)}" +
             ".empty{grid-column:1/-1;border:1px dashed var(--border);background:transparent;color:var(--secondary);border-radius:16px;padding:16px}.corner{position:fixed;z-index:2;top:16px;left:18px;font-size:13px;font-weight:650;color:var(--secondary);text-shadow:var(--corner-shadow)}" +
             ".custom-home{position:fixed;z-index:1;inset:0;width:100%;height:100%;border:0;background:transparent}" +
@@ -98,18 +98,19 @@ final class HomePage {
             for (int i = 0; i < count; i++) {
                 Shortcut item = homeShortcuts.get(i);
                 String title = item.title.trim().length() == 0 ? (item.folder ? "文件夹" : host(item.url)) : item.title.trim();
-                if (title.length() > 18) title = title.substring(0, 18) + "…";
+                title = UiText.ellipsize(title, 18);
                 if (item.folder) {
                     shortcuts.append("<a class='shortcut' href='median://folder?id=")
                             .append(percentEncode(item.id)).append("'><span class='tile'><span class='folder-mark'></span></span><span class='label'>")
                             .append(escape(title)).append("</span></a>");
                 } else {
-                    String letter = title.length() == 0 ? "•" : title.substring(0, 1).toUpperCase(java.util.Locale.getDefault());
-                    String shortcutHost = faviconHost(item.url);
+                    String letter = UiText.firstCodePoint(title, "•").toUpperCase(java.util.Locale.getDefault());
+                    String shortcutHost = faviconHostForUrl(item.url);
                     shortcuts.append("<a class='shortcut' href='median://open?url=")
                             .append(percentEncode(item.url)).append("'><span class='tile'><img class='favicon' src='/favicon?host=")
-                            .append(percentEncode(shortcutHost)).append("' alt='' onerror=\"this.hidden=true;this.nextElementSibling.hidden=false\">")
-                            .append("<span class='fallback' hidden>").append(escape(letter)).append("</span></span><span class='label'>")
+                            .append(percentEncode(shortcutHost)).append("' data-favicon-host='")
+                            .append(escape(shortcutHost)).append("' alt='' onload=\"this.nextElementSibling.hidden=true\" onerror=\"this.hidden=true;this.nextElementSibling.hidden=false\">")
+                            .append("<span class='fallback'>").append(escape(letter)).append("</span></span><span class='label'>")
                             .append(escape(title)).append("</span></a>");
                 }
             }
@@ -188,7 +189,7 @@ final class HomePage {
         } catch (Exception ignored) { return "书签"; }
     }
 
-    private static String faviconHost(String url) {
+    static String faviconHostForUrl(String url) {
         try {
             String value = new URI(url).getHost();
             return value == null ? "" : value.toLowerCase(java.util.Locale.US);

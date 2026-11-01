@@ -1,0 +1,319 @@
+import java.util.ArrayList;
+import java.util.List;
+
+/** Host fixture. Production methods are injected verbatim by motion_behavior_test.js. */
+public final class MotionBehaviorSelfTest {
+    private int pendingProgress;
+    private boolean progressUpdatePending;
+    private int renderedProgress = -1;
+    private final View rootFrame = new View();
+    private final View webView = new View();
+    private final ProgressBar progressBar = new ProgressBar();
+    private final View topBar = new View();
+    private View customView;
+    private boolean chromeHiddenByScroll;
+    private boolean immersiveGestureActive;
+    private float immersiveGestureOffset;
+    private boolean pictureInPicture;
+    private boolean reduced;
+    private View activeOverlayPanel;
+    private int dismissed;
+    private int step = 8;
+    private static int checks;
+    private static final List<String> failures = new ArrayList<String>();
+
+    private int dp(int value) { return value; }
+    private boolean reduceMotion() { return reduced; }
+    private boolean isInPictureInPictureMode() { return pictureInPicture; }
+    private int progressStep() { return step; }
+    private void dismissOverlay() { dismissed++; }
+
+    /* @SHEET@ */
+
+    /* @PROGRESS@ */
+
+    /* @SYNCPROGRESS@ */
+
+    private static final class Motion {
+        /* @DRAWABLE@ */
+    }
+
+    // MotionEvents are recomputed in the target's current local coordinates each dispatch.
+    // Ancestor translation therefore affects getY(), while getRawY() remains screen-stable.
+    private static final class MotionEvent {
+        static final int ACTION_DOWN = 0, ACTION_UP = 1, ACTION_MOVE = 2, ACTION_CANCEL = 3;
+        private final int action;
+        private final float x, y, rawX, rawY;
+        private final long at;
+        MotionEvent(int action, float rawX, float rawY, long at, View target) {
+            this.action = action; this.rawX = rawX; this.rawY = rawY; this.at = at;
+            x = rawX - target.screenX(); y = rawY - target.screenY();
+        }
+        int getActionMasked() { return action; }
+        float getRawX() { return rawX; }
+        float getRawY() { return rawY; }
+        float getX() { return x; }
+        float getY() { return y; }
+        long getEventTime() { return at; }
+    }
+
+    private static final class ViewConfiguration {
+        static ViewConfiguration get(Object ignored) { return new ViewConfiguration(); }
+        int getScaledTouchSlop() { return 8; }
+    }
+
+    private static class View {
+        static final int VISIBLE = 0, INVISIBLE = 4, GONE = 8;
+        interface OnTouchListener { boolean onTouch(View view, MotionEvent event); }
+        View parent;
+        float left = 0f, top = 0f, translationY = 0f, alpha = 1f;
+        int height = 400, visibility = VISIBLE;
+        OnTouchListener listener;
+        final Animator animator = new Animator(this);
+        final List<Runnable> frames = new ArrayList<Runnable>();
+        Object getContext() { return this; }
+        int getHeight() { return height; }
+        float getTranslationY() { return translationY; }
+        void setTranslationY(float value) { translationY = value; }
+        float getAlpha() { return alpha; }
+        void setAlpha(float value) { alpha = value; }
+        int getVisibility() { return visibility; }
+        void setVisibility(int value) { visibility = value; }
+        void setOnTouchListener(OnTouchListener value) { listener = value; }
+        Animator animate() { return animator; }
+        void postOnAnimation(Runnable runnable) { frames.add(runnable); }
+        float screenX() { return left + (parent == null ? 0f : parent.screenX()); }
+        float screenY() { return top + translationY + (parent == null ? 0f : parent.screenY()); }
+        boolean event(int action, float rawX, float rawY, long at) {
+            return listener.onTouch(this, new MotionEvent(action, rawX, rawY, at, this));
+        }
+        void frame() {
+            List<Runnable> work = new ArrayList<Runnable>(frames);
+            frames.clear();
+            for (Runnable runnable : work) runnable.run();
+        }
+    }
+
+    private static final class ProgressBar extends View {
+        int progress, plainCalls, animatedCalls;
+        void setProgress(int value) { progress = value; plainCalls++; }
+        void setProgress(int value, boolean animated) {
+            progress = value;
+            if (animated) animatedCalls++; else plainCalls++;
+        }
+    }
+
+    // Alpha/translation animations are asynchronous, unlike drawable progress changes.
+    // Android withEndAction is suppressed on cancel. A saved stale token cannot finish later.
+    private static final class Animator {
+        final View view;
+        Float targetAlpha, targetTranslation;
+        Runnable end;
+        long duration;
+        Animation running;
+        int starts, cancels;
+        Animator(View view) { this.view = view; }
+        Animator alpha(float value) { targetAlpha = value; return this; }
+        Animator translationY(float value) { targetTranslation = value; return this; }
+        Animator setDuration(long value) { duration = value; return this; }
+        Animator withEndAction(Runnable value) { end = value; return this; }
+        void start() {
+            running = new Animation(this, targetAlpha, targetTranslation, end, duration);
+            starts++;
+            targetAlpha = null; targetTranslation = null; end = null;
+        }
+        void cancel() {
+            cancels++;
+            if (running != null) running.cancelled = true;
+            running = null;
+            targetAlpha = null; targetTranslation = null; end = null;
+        }
+    }
+
+    private static final class Animation {
+        final Animator animator;
+        final Float alpha, translation;
+        final Runnable end;
+        final long duration;
+        boolean cancelled, finished;
+        Animation(Animator animator, Float alpha, Float translation, Runnable end, long duration) {
+            this.animator = animator; this.alpha = alpha; this.translation = translation;
+            this.end = end; this.duration = duration;
+        }
+        void finish() {
+            if (cancelled || finished || animator.running != this) return;
+            finished = true;
+            if (alpha != null) animator.view.setAlpha(alpha);
+            if (translation != null) animator.view.setTranslationY(translation);
+            animator.running = null;
+            if (end != null) end.run();
+        }
+    }
+
+    private static void check(boolean condition, String message) {
+        checks++;
+        if (!condition) throw new AssertionError(message);
+    }
+    private static void near(float actual, float expected, String message) {
+        check(Math.abs(actual - expected) < .001f, message + ": expected " + expected + ", got " + actual);
+    }
+    private static void run(String name, Runnable test) {
+        try { test.run(); System.out.println("PASS " + name); }
+        catch (Throwable error) { failures.add(name + ": " + error); System.out.println("FAIL " + name + ": " + error); }
+    }
+    private static View child(View panel) {
+        View target = new View(); target.parent = panel; target.top = 10f; return target;
+    }
+
+    private static void sheetFollowsScreenCoordinates() {
+        MotionBehaviorSelfTest host = new MotionBehaviorSelfTest();
+        View panel = new View(), target = child(panel);
+        host.activeOverlayPanel = panel;
+        host.installSheetDrag(target, panel);
+        check(target.event(MotionEvent.ACTION_DOWN, 100, 110, 0), "sheet owns its handle stream");
+        for (int dy : new int[] { 24, 32, 40, 48, 56, 64 }) {
+            target.event(MotionEvent.ACTION_MOVE, 100, 110 + dy, dy * 10L);
+            near(panel.translationY, dy, "monotonic finger displacement must produce matching panel displacement");
+        }
+        target.event(MotionEvent.ACTION_MOVE, 100, 158, 700);
+        near(panel.translationY, 48, "reversal follows the very next move");
+        target.event(MotionEvent.ACTION_MOVE, 100, 90, 800);
+        near(panel.translationY, 0, "panel movement clamps at its shown position");
+        target.event(MotionEvent.ACTION_MOVE, 100, 710, 900);
+        near(panel.translationY, 400, "panel movement clamps at measured panel height");
+        target.event(MotionEvent.ACTION_CANCEL, 100, 710, 920);
+        check(panel.animator.running != null, "cancel settles an owned drag");
+        panel.animator.running.finish();
+        near(panel.translationY, 0, "cancel returns the sheet to its shown position");
+        check(host.dismissed == 0, "cancel cannot dismiss a sheet");
+    }
+
+    private static void sheetInterruptsAnimation() {
+        MotionBehaviorSelfTest host = new MotionBehaviorSelfTest();
+        View panel = new View(), target = child(panel);
+        host.activeOverlayPanel = panel;
+        host.installSheetDrag(target, panel);
+        panel.animate().translationY(0).setDuration(150).start();
+        Animation old = panel.animator.running;
+        panel.translationY = 12;
+        target.event(MotionEvent.ACTION_DOWN, 100, 122, 0);
+        check(old.cancelled, "DOWN must cancel a running entrance/rebound animation");
+        target.event(MotionEvent.ACTION_MOVE, 100, 146, 100);
+        near(panel.translationY, 36, "drag captures the current translated position without a jump");
+        old.finish();
+        near(panel.translationY, 36, "stale animation cannot overwrite the new drag");
+        target.event(MotionEvent.ACTION_UP, 100, 146, 1000);
+        check(host.dismissed == 0, "short slow drag settles instead of dismissing");
+        check(panel.animator.running != null && panel.animator.running.duration == 150,
+                "slow release uses the configured settle animation");
+        panel.animator.running.finish();
+        near(panel.translationY, 0, "slow release ends at zero");
+    }
+
+    private static void sheetPreservesIntentAndDismissal() {
+        MotionBehaviorSelfTest host = new MotionBehaviorSelfTest();
+        View panel = new View(), target = child(panel);
+        host.activeOverlayPanel = panel; host.installSheetDrag(target, panel);
+        target.event(MotionEvent.ACTION_DOWN, 100, 110, 0);
+        target.event(MotionEvent.ACTION_MOVE, 130, 114, 10);
+        target.event(MotionEvent.ACTION_MOVE, 130, 210, 20);
+        near(panel.translationY, 0, "horizontal intent does not become sheet ownership mid-stream");
+        target.event(MotionEvent.ACTION_UP, 130, 210, 30);
+        check(host.dismissed == 0, "horizontal gesture does not dismiss");
+        target.event(MotionEvent.ACTION_DOWN, 100, 110, 100);
+        target.event(MotionEvent.ACTION_MOVE, 100, 86, 120);
+        near(panel.translationY, 0, "upward initial gesture is left alone");
+        target.event(MotionEvent.ACTION_UP, 100, 86, 140);
+        target.event(MotionEvent.ACTION_DOWN, 100, 110, 200);
+        target.event(MotionEvent.ACTION_MOVE, 100, 230, 400);
+        target.event(MotionEvent.ACTION_UP, 100, 230, 1000);
+        check(host.dismissed == 1, "deliberate drag beyond one-quarter height dismisses");
+        panel.translationY = 0;
+        target.event(MotionEvent.ACTION_DOWN, 100, 110, 1100);
+        target.event(MotionEvent.ACTION_MOVE, 100, 140, 1110);
+        target.event(MotionEvent.ACTION_UP, 100, 140, 1120);
+        check(host.dismissed == 2, "short quick downward fling retains dismissal behavior");
+    }
+
+    private static void progressOldFadeCannotHideNewLoad() {
+        MotionBehaviorSelfTest host = new MotionBehaviorSelfTest();
+        host.renderedProgress = 88;
+        host.scheduleProgressUpdate(100); host.rootFrame.frame();
+        Animation old = host.progressBar.animator.running;
+        check(old != null && old.end != null, "completed load schedules an asynchronous fade-out");
+        host.progressBar.alpha = .35f;
+        host.scheduleProgressUpdate(10); host.rootFrame.frame();
+        check(old.cancelled, "new load must cancel a still-visible previous completion fade");
+        check(host.renderedProgress == 10 && host.progressBar.progress == 10, "new load progress is applied");
+        old.finish();
+        if (host.progressBar.animator.running != null) host.progressBar.animator.running.finish();
+        check(host.progressBar.visibility == View.VISIBLE, "old completion cannot hide a new load");
+        near(host.progressBar.alpha, 1, "new active load becomes fully opaque");
+    }
+
+    private static void progressCoalescesAndHonorsStep() {
+        MotionBehaviorSelfTest host = new MotionBehaviorSelfTest();
+        host.progressBar.visibility = View.GONE;
+        host.scheduleProgressUpdate(10); host.scheduleProgressUpdate(20); host.scheduleProgressUpdate(30);
+        check(host.rootFrame.frames.size() == 1, "same-frame callbacks coalesce");
+        host.rootFrame.frame();
+        check(!host.progressUpdatePending && host.renderedProgress == 30 && host.progressBar.progress == 30,
+                "coalesced callback renders the most recent value");
+        check(host.progressBar.visibility == View.VISIBLE, "an initially hidden bar appears for a new load");
+        if (host.progressBar.animator.running != null) host.progressBar.animator.running.finish();
+        int count = host.progressBar.plainCalls + host.progressBar.animatedCalls;
+        int starts = host.progressBar.animator.starts;
+        host.scheduleProgressUpdate(34); host.rootFrame.frame();
+        check(host.renderedProgress == 30 && count == host.progressBar.plainCalls + host.progressBar.animatedCalls &&
+                starts == host.progressBar.animator.starts, "sub-step progress is a full no-op");
+        host.scheduleProgressUpdate(100); host.rootFrame.frame();
+        check(host.renderedProgress == 100, "completion bypasses progress stepping");
+        host.progressBar.animator.running.finish();
+        check(host.progressBar.visibility == View.GONE, "completion eventually hides the bar");
+        near(host.progressBar.alpha, 1, "completion resets alpha for reuse");
+    }
+
+    private static void progressHiddenAndReducedPaths() {
+        MotionBehaviorSelfTest host = new MotionBehaviorSelfTest();
+        host.chromeHiddenByScroll = true;
+        host.scheduleProgressUpdate(25); host.rootFrame.frame();
+        check(host.progressBar.visibility == View.GONE, "hidden chrome keeps progress hidden");
+        check(host.progressBar.plainCalls + host.progressBar.animatedCalls == 0, "hidden chrome avoids drawable updates");
+        host.chromeHiddenByScroll = false; host.pictureInPicture = true;
+        host.scheduleProgressUpdate(50); host.rootFrame.frame();
+        check(host.progressBar.visibility == View.GONE, "PiP keeps progress hidden");
+        host.pictureInPicture = false; host.reduced = true;
+        host.scheduleProgressUpdate(75); host.rootFrame.frame();
+        check(host.progressBar.visibility == View.VISIBLE, "leaving hidden mode permits active progress");
+        check(host.progressBar.plainCalls == 1 && host.progressBar.animatedCalls == 0,
+                "reduced-motion progress uses an immediate drawable update");
+        host.scheduleProgressUpdate(100); host.rootFrame.frame();
+        check(host.progressBar.animator.running.duration == 70, "reduced-motion completion has bounded duration");
+    }
+
+    private static void drawableProgressPaths() {
+        Motion.animateProgress(null, 1, 2, false);
+        ProgressBar bar = new ProgressBar();
+        Motion.animateProgress(bar, -1, 20, false);
+        Motion.animateProgress(bar, 100, 10, false);
+        Motion.animateProgress(bar, 20, 20, false);
+        Motion.animateProgress(bar, 20, 10, false);
+        Motion.animateProgress(bar, 20, 28, true);
+        check(bar.plainCalls == 5 && bar.animatedCalls == 0, "initial/reset/equal/backward/reduced values are immediate");
+        Motion.animateProgress(bar, 20, 28, false);
+        check(bar.animatedCalls == 1 && bar.progress == 28, "forward progress uses the native drawable transition");
+        check(bar.animator.starts == 0, "drawable progress does not create view-alpha animations");
+    }
+
+    public static void main(String[] args) {
+        run("sheet follows raw coordinates, reversals, and bounds", () -> sheetFollowsScreenCoordinates());
+        run("sheet DOWN interrupts animation and retains current offset", () -> sheetInterruptsAnimation());
+        run("sheet intent and dismissal behavior", () -> sheetPreservesIntentAndDismissal());
+        run("new progress cancels the previous load's unfinished fade", () -> progressOldFadeCannotHideNewLoad());
+        run("progress frame coalescing, stepping, and completion", () -> progressCoalescesAndHonorsStep());
+        run("hidden chrome, PiP, and reduced-motion progress", () -> progressHiddenAndReducedPaths());
+        run("native drawable progress paths", () -> drawableProgressPaths());
+        System.out.println("MotionBehaviorSelfTest: " + checks + " assertions, " + failures.size() + " failed cases");
+        if (!failures.isEmpty()) throw new AssertionError(failures.toString());
+    }
+}

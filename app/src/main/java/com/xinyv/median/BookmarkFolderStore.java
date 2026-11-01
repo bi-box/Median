@@ -131,23 +131,20 @@ final class BookmarkFolderStore {
     }
 
     synchronized String parentForUrl(String url) {
-        String parent = bookmarkParents.get(normalizeUrl(url));
+        String parent = resolvedParentValue(url);
         return validFolder(parent) ? parent : ROOT;
     }
 
     synchronized void setParentForUrl(String url, String folderId) {
-        String key = normalizeUrl(url);
-        if (key.length() == 0) return;
-        String parent = validFolder(folderId) ? folderId : ROOT;
-        if (parent.length() == 0) bookmarkParents.remove(key); else bookmarkParents.put(key, parent);
+        setParentMapping(url, folderId);
         persist();
     }
 
     synchronized void updateUrl(String oldUrl, String newUrl) {
         String oldKey = normalizeUrl(oldUrl);
-        String nextKey = normalizeUrl(newUrl);
-        String parent = bookmarkParents.remove(oldKey);
-        if (parent != null && nextKey.length() > 0 && validFolder(parent)) bookmarkParents.put(nextKey, parent);
+        String parent = resolvedParentValue(oldUrl);
+        bookmarkParents.remove(oldKey);
+        if (parent != null) setParentMapping(newUrl, parent);
         persist();
     }
 
@@ -204,7 +201,8 @@ final class BookmarkFolderStore {
         State parsed = parse(raw);
         for (Folder folder : parsed.folders.values()) if (!folders.containsKey(folder.id)) folders.put(folder.id, folder);
         for (Map.Entry<String, String> item : parsed.parents.entrySet())
-            if (folders.containsKey(item.getValue())) bookmarkParents.put(item.getKey(), item.getValue());
+            if (item.getValue().length() == 0 || folders.containsKey(item.getValue()))
+                bookmarkParents.put(item.getKey(), item.getValue());
         persist();
     }
 
@@ -247,7 +245,8 @@ final class BookmarkFolderStore {
                 String rawUrl = names.next();
                 String url = normalizeUrl(rawUrl);
                 String parent = safeId(savedParents.optString(rawUrl, ""));
-                if (url.length() > 0 && parsedFolders.containsKey(parent)) parents.put(url, parent);
+                if (url.length() > 0 && (parent.length() == 0 || parsedFolders.containsKey(parent)))
+                    parents.put(url, parent);
             }
         }
         return new State(parsedFolders, parents);
@@ -268,11 +267,34 @@ final class BookmarkFolderStore {
     private boolean validFolder(String id) { return id != null && id.length() > 0 && folders.containsKey(id); }
     private static boolean same(Folder a, Folder b) { return a.name.equals(b.name) && a.parentId.equals(b.parentId) && a.showOnHome == b.showOnHome; }
     private static String safeId(String value) { return value == null ? ROOT : value.trim(); }
-    private static String cleanName(String value) { String v = value == null ? "" : value.trim(); return v.length() > 80 ? v.substring(0, 80) : v; }
+    private static String cleanName(String value) { return UiText.truncate(value == null ? "" : value.trim(), 80); }
     private static String normalizeUrl(String value) {
+        return UrlStoragePolicy.normalize(value);
+    }
+    private static String legacyNormalizeUrl(String value) {
         String url = value == null ? "" : value.trim();
         while (url.endsWith("/") && url.length() > "https://a/".length()) url = url.substring(0, url.length() - 1);
         return url;
+    }
+    /** Reads pre-2.4.1 keys without forcing new, meaningful path slashes to collide. */
+    private String resolvedParentValue(String value) {
+        String key = normalizeUrl(value);
+        if (bookmarkParents.containsKey(key)) return bookmarkParents.get(key);
+        String legacy = legacyNormalizeUrl(value);
+        return legacy.equals(key) ? null : bookmarkParents.get(legacy);
+    }
+    /** Empty values are explicit root markers when an older slash-stripped key would otherwise win. */
+    private void setParentMapping(String value, String folderId) {
+        String key = normalizeUrl(value);
+        if (key.length() == 0) return;
+        String parent = validFolder(folderId) ? folderId : ROOT;
+        if (parent.length() > 0) {
+            bookmarkParents.put(key, parent);
+            return;
+        }
+        String legacy = legacyNormalizeUrl(value);
+        if (!legacy.equals(key) && bookmarkParents.containsKey(legacy)) bookmarkParents.put(key, ROOT);
+        else bookmarkParents.remove(key);
     }
     private void persist() { if (prefs != null) prefs.edit().putString(KEY, exportJson()).apply(); }
 

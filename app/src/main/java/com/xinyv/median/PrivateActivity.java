@@ -56,7 +56,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 public final class PrivateActivity extends Activity {
     private static final int FILE_CHOOSER_REQUEST = 501;
     private static final String HOME = "https://median-private.invalid/";
-    private static final String HOME_TOKEN = UrlCleaner.randomToken();
     private static final long INITIAL_NAVIGATION_ACK_MS = 450L;
     private static final byte[] EMPTY = new byte[0];
     private static boolean privateDataDirectoryConfigured;
@@ -69,9 +68,11 @@ public final class PrivateActivity extends Activity {
     private FilterSubscriptionStore filterStore;
     private FrameLayout webContainer;
     private WebView webView;
+    private String homeToken;
     private EditText address;
     private ProgressBar progress;
     private volatile String pageHost = "";
+    private String startedPageUrl = "";
     private boolean trustedHome;
     private boolean activityResumed;
     private volatile boolean activityDestroyed;
@@ -87,6 +88,9 @@ public final class PrivateActivity extends Activity {
     private String pendingEngine = "google";
     private Object predictiveBackCallback;
     private ValueCallback<Uri[]> fileChooserCallback;
+    private WebView fileChooserView;
+    private String fileChooserDocumentUrl = "";
+    private boolean edgeNavigationEnabled;
 
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -100,14 +104,20 @@ public final class PrivateActivity extends Activity {
         getWindow().setNavigationBarColor(Color.rgb(30, 32, 36));
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         if (android.os.Build.VERSION.SDK_INT >= 30) getWindow().setDecorFitsSystemWindows(false);
-        startupExecutor = BackgroundExecutor.create(2, 4, "median-private-startup", false);
+        edgeNavigationEnabled = getSharedPreferences("median_browser_v2", MODE_PRIVATE)
+                .getBoolean("edge_navigation", true);
+        startupExecutor = BackgroundExecutor.create(1, 4, "median-private-startup", false);
         beginFilterRuleLoad();
         buildUi();
         registerPredictiveBack();
-        initializePrivateWebView();
+        postAfterAttachedFrame(new Runnable() {
+            @Override public void run() { initializePrivateWebView(); }
+        });
     }
 
     private static synchronized boolean ensurePrivateDataDirectory() {
+        // Keep the API boundary local: this method must never touch the normal profile on O.
+        if (android.os.Build.VERSION.SDK_INT < 28) return false;
         if (privateDataDirectoryConfigured) return true;
         try {
             WebView.setDataDirectorySuffix("median_private");
@@ -150,6 +160,8 @@ public final class PrivateActivity extends Activity {
                             completePrivateProfileReset();
                         }
                     });
+                    ExecutorService completedExecutor = startupExecutor;
+                    if (completedExecutor != null) completedExecutor.shutdown();
                 }
             });
         } catch (RejectedExecutionException ignored) {
@@ -352,6 +364,8 @@ public final class PrivateActivity extends Activity {
                 android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
         target.setOnApplyWindowInsetsListener(new View.OnApplyWindowInsetsListener() {
             @Override public android.view.WindowInsets onApplyWindowInsets(View view, android.view.WindowInsets insets) {
+                // The listener is registered only on R+, and may be invoked independently.
+                if (android.os.Build.VERSION.SDK_INT < 30) return insets;
                 android.graphics.Insets bars = insets.getInsets(
                         android.view.WindowInsets.Type.systemBars() | android.view.WindowInsets.Type.displayCutout());
                 view.setPadding(bars.left, bars.top, bars.right, bars.bottom);
@@ -381,6 +395,7 @@ public final class PrivateActivity extends Activity {
         CookieManager.getInstance().setAcceptThirdPartyCookies(target, false);
 
         EdgeNavigationController.attach(target, new EdgeNavigationController.Callback() {
+            @Override public boolean isEnabled() { return edgeNavigationEnabled; }
             @Override public boolean canGoBack() { return webView == target && target.canGoBack(); }
             @Override public boolean canGoForward() { return webView == target && target.canGoForward(); }
             @Override public void goBack() { if (webView == target) target.goBack(); }
@@ -400,9 +415,12 @@ public final class PrivateActivity extends Activity {
             }
             @Override public void onPageStarted(WebView view, String url, android.graphics.Bitmap icon) {
                 if (activityDestroyed || view != webView) return;
+                if (fileChooserCallback != null && fileChooserView == view) finishFileChooser(null);
+                startedPageUrl = navigationDocumentUrl(url);
                 if (InternalNavigationPolicy.shouldClearHomeTrust(isHome(url), url)) trustedHome = false;
                 pageHost = host(url);
-                address.setText(isHome(url) ? "" : url);
+                if (!address.hasFocus()) address.setText(isHome(url) ? "" : url);
+                refreshEdgeGestureExclusion();
             }
             @Override public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
                 String accept = request == null ? "" : request.getRequestHeaders().get("Accept");
@@ -420,7 +438,9 @@ public final class PrivateActivity extends Activity {
             }
             @Override public void onPageFinished(WebView view, String url) {
                 if (activityDestroyed || view != webView) return;
+                if (!startedPageUrl.equals(navigationDocumentUrl(url))) return;
                 initialNavigationGuard.acknowledge(url);
+                refreshEdgeGestureExclusion();
                 if (isHome(url)) verifyTrustedHome(view);
                 String css = adBlock.cosmeticCssForHost(pageHost);
                 if (css.length() > 0) view.evaluateJavascript("(function f(){var p=document.head||document.documentElement;if(!p){setTimeout(f,30);return;}var s=document.getElementById('__median_adblock');if(!s){s=document.createElement('style');s.id='__median_adblock';s.textContent=" + JSONObject.quote(css) + ";p.appendChild(s);}})();", null);
@@ -429,7 +449,7 @@ public final class PrivateActivity extends Activity {
         target.setWebChromeClient(new WebChromeClient() {
             @Override public boolean onJsPrompt(final WebView view, String url, String message,
                                                 final String defaultValue, JsPromptResult result) {
-                if (HOME_TOKEN.equals(message)) {
+                if (homeToken != null && homeToken.equals(message)) {
                     boolean accepted = result != null && view == webView && trustedHome &&
                             isHome(view.getUrl()) && defaultValue != null &&
                             defaultValue.startsWith("median://");
@@ -452,10 +472,16 @@ public final class PrivateActivity extends Activity {
             }
             @Override public void onPermissionRequest(android.webkit.PermissionRequest request) { if (request != null) request.deny(); }
             @Override public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback, FileChooserParams params) {
-                if (fileChooserCallback != null) fileChooserCallback.onReceiveValue(null);
+                finishFileChooser(null);
                 fileChooserCallback = callback;
+                fileChooserView = view;
+                fileChooserDocumentUrl = navigationDocumentUrl(view == null ? null : view.getUrl());
                 try { startActivityForResult(params.createIntent(), FILE_CHOOSER_REQUEST); return true; }
-                catch (Exception e) { fileChooserCallback = null; Toast.makeText(PrivateActivity.this, "文件选择器不可用", Toast.LENGTH_SHORT).show(); return false; }
+                catch (Exception e) {
+                    finishFileChooser(null);
+                    Toast.makeText(PrivateActivity.this, "文件选择器不可用", Toast.LENGTH_SHORT).show();
+                    return true;
+                }
             }
         });
         target.setDownloadListener(new android.webkit.DownloadListener() {
@@ -486,8 +512,8 @@ public final class PrivateActivity extends Activity {
                 return true;
             }
         }
-        if ("about:blank".equals(url)) return false;
-        if (url.startsWith("data:") || url.startsWith("about:")) {
+        if ("about:blank".equalsIgnoreCase(url)) return false;
+        if ("data".equalsIgnoreCase(scheme) || "about".equalsIgnoreCase(scheme)) {
             Toast.makeText(this, "已阻止网页跳转到不透明内部地址", Toast.LENGTH_SHORT).show();
             return true;
         }
@@ -562,21 +588,38 @@ public final class PrivateActivity extends Activity {
     }
 
     private static boolean isNetworkUrl(String url) {
-        return url != null && (url.startsWith("https://") || url.startsWith("http://"));
+        return url != null && (url.regionMatches(true, 0, "https://", 0, 8) ||
+                url.regionMatches(true, 0, "http://", 0, 7));
+    }
+
+    private static String navigationDocumentUrl(String url) {
+        if (url == null) return "";
+        int fragment = url.indexOf('#');
+        return fragment < 0 ? url : url.substring(0, fragment);
+    }
+
+    private String homeToken() {
+        if (homeToken == null) homeToken = UrlCleaner.randomToken();
+        return homeToken;
     }
 
     private void showHome() {
         if (webView == null || !privateProfileReady) return;
         pageHost = "";
         trustedHome = true;
-        webView.loadDataWithBaseURL(HOME, HomePage.html("google", Collections.<BrowserDataStore.Bookmark>emptyList(), true, HOME_TOKEN), "text/html", "UTF-8", HOME);
+        webView.loadDataWithBaseURL(HOME, HomePage.html("google", Collections.<BrowserDataStore.Bookmark>emptyList(), true, homeToken()), "text/html", "UTF-8", HOME);
     }
 
     private void verifyTrustedHome(final WebView view) {
+        if (view == null || activityDestroyed || view != webView) return;
         view.evaluateJavascript("(function(){var m=document.querySelector('meta[name=median-home-token]');return !!m&&m.content===" +
-                JSONObject.quote(HOME_TOKEN) + ";})();", new ValueCallback<String>() {
+                JSONObject.quote(homeToken()) + ";})();", new ValueCallback<String>() {
             @Override public void onReceiveValue(String value) {
                 try {
+                    if (activityDestroyed || view != webView) {
+                        trustedHome = false;
+                        return;
+                    }
                     trustedHome = "true".equals(value) && webView == view && isHome(view.getUrl());
                 } catch (RuntimeException ignored) {
                     trustedHome = false;
@@ -592,7 +635,7 @@ public final class PrivateActivity extends Activity {
                     @Override public void onClick(android.content.DialogInterface dialog, int which) {
                         try {
                             Intent intent;
-                            if (url.startsWith("intent:")) {
+                            if (url.regionMatches(true, 0, "intent:", 0, 7)) {
                                 Intent parsed = Intent.parseUri(url, Intent.URI_INTENT_SCHEME);
                                 if (parsed.getData() == null) throw new IllegalArgumentException("外部地址无效");
                                 intent = new Intent(Intent.ACTION_VIEW, parsed.getData());
@@ -623,14 +666,35 @@ public final class PrivateActivity extends Activity {
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode == FILE_CHOOSER_REQUEST && fileChooserCallback != null) {
-            fileChooserCallback.onReceiveValue(WebChromeClient.FileChooserParams.parseResult(resultCode, data));
-            fileChooserCallback = null;
+            Uri[] result = null;
+            try { result = WebChromeClient.FileChooserParams.parseResult(resultCode, data); }
+            catch (RuntimeException ignored) {}
+            WebView chooserView = fileChooserView;
+            String current = chooserView == null ? null : chooserView.getUrl();
+            if (chooserView == null || chooserView != webView || activityDestroyed ||
+                    !fileChooserDocumentUrl.equals(navigationDocumentUrl(current))) result = null;
+            finishFileChooser(result);
         }
+    }
+
+    private void finishFileChooser(Uri[] result) {
+        ValueCallback<Uri[]> callback = fileChooserCallback;
+        fileChooserCallback = null;
+        fileChooserView = null;
+        fileChooserDocumentUrl = "";
+        if (callback != null) try { callback.onReceiveValue(result); } catch (RuntimeException ignored) {}
     }
 
     private void handlePrivateBack() {
         if (webView != null && webView.canGoBack()) webView.goBack();
         else finishAndRemoveTask();
+    }
+
+    private void refreshEdgeGestureExclusion() {
+        WebView target = webView;
+        if (target == null) return;
+        EdgeNavigationController.updateSystemGestureExclusion(target, edgeNavigationEnabled,
+                target.canGoBack(), target.canGoForward());
     }
 
     private void registerPredictiveBack() {
@@ -670,6 +734,9 @@ public final class PrivateActivity extends Activity {
 
     @Override protected void onResume() {
         super.onResume();
+        edgeNavigationEnabled = getSharedPreferences("median_browser_v2", MODE_PRIVATE)
+                .getBoolean("edge_navigation", true);
+        refreshEdgeGestureExclusion();
         activityResumed = true;
         if (webView != null) try { webView.onResume(); } catch (RuntimeException ignored) {}
         startupReadiness.set(StartupReadiness.RESUMED, true);
@@ -686,7 +753,7 @@ public final class PrivateActivity extends Activity {
         handler.removeCallbacksAndMessages(null);
         if (startupExecutor != null) startupExecutor.shutdownNow();
         startupExecutor = null;
-        if (fileChooserCallback != null) { fileChooserCallback.onReceiveValue(null); fileChooserCallback = null; }
+        finishFileChooser(null);
         if (webView != null) {
             WebView closing = webView;
             webView = null;

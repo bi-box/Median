@@ -24,7 +24,7 @@ final class TlsInspector {
         int responseCode;
 
         String summary() {
-            return "主机：" + host + "\n响应：HTTP " + responseCode + "\n加密套件：" + cipher +
+            return "主机：" + host + "\n探测请求响应：HTTP " + responseCode + "\n加密套件：" + cipher +
                     "\n\n证书主体：" + subject + "\n签发者：" + issuer +
                     "\n有效期：" + validFrom + " 至 " + validUntil + "\nSHA-256：\n" + sha256;
         }
@@ -32,7 +32,9 @@ final class TlsInspector {
 
     private TlsInspector() {}
 
-    static Result inspect(String rawUrl) throws Exception {
+    static Result inspect(String rawUrl) throws Exception { return inspect(rawUrl, null); }
+
+    static Result inspect(String rawUrl, String userAgent) throws Exception {
         URL url = new URL(rawUrl);
         if (!"https".equalsIgnoreCase(url.getProtocol())) throw new IllegalArgumentException("当前页面不是 HTTPS");
         HttpsURLConnection connection = (HttpsURLConnection) url.openConnection();
@@ -41,7 +43,9 @@ final class TlsInspector {
             connection.setReadTimeout(10000);
             connection.setInstanceFollowRedirects(false);
             connection.setRequestMethod("HEAD");
-            connection.setRequestProperty("User-Agent", "MedianBrowser/2.0 TLS inspector");
+            connection.setRequestProperty("User-Agent", userAgent == null || userAgent.trim().length() == 0 ?
+                    "MedianBrowser TLS inspector" : userAgent);
+            connection.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
             Result result = new Result();
             result.host = url.getHost();
             result.responseCode = connection.getResponseCode();

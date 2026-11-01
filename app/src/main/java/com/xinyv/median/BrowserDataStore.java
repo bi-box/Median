@@ -76,7 +76,7 @@ final class BrowserDataStore {
     private final ArrayList<Bookmark> bookmarks = new ArrayList<Bookmark>();
     private final ArrayList<HistoryItem> history = new ArrayList<HistoryItem>();
     private final ArrayList<SessionTab> session = new ArrayList<SessionTab>();
-    private final Handler io;
+    private Handler io;
     private int sessionIndex;
     private volatile boolean closed;
     private boolean dirty;
@@ -91,7 +91,6 @@ final class BrowserDataStore {
         file = new AtomicFile(new File(directory, FILE_NAME));
         backup = new AtomicFile(new File(directory, FILE_NAME + ".good"));
         readBlocking();
-        io = LocalDataIo.acquire();
     }
 
     List<Bookmark> bookmarks() {
@@ -226,6 +225,25 @@ final class BrowserDataStore {
         return result;
     }
 
+    int historyCount() {
+        synchronized (lock) { return history.size(); }
+    }
+
+    void removeHistory(String url) {
+        String normalized = normalizeUrl(url);
+        if (!isWebUrl(normalized)) return;
+        boolean changed = false;
+        synchronized (lock) {
+            for (int i = history.size() - 1; i >= 0; i--) {
+                if (sameNormalizedUrl(history.get(i).url, normalized)) {
+                    history.remove(i);
+                    changed = true;
+                }
+            }
+        }
+        if (changed) scheduleWrite();
+    }
+
     void clearHistory() {
         boolean changed;
         synchronized (lock) {
@@ -235,16 +253,30 @@ final class BrowserDataStore {
         if (changed) scheduleWrite();
     }
 
+    void clearSession() {
+        boolean changed;
+        synchronized (lock) {
+            changed = !session.isEmpty() || sessionIndex != 0;
+            session.clear();
+            sessionIndex = 0;
+        }
+        if (changed) scheduleWrite();
+    }
+
     void saveSession(List<SessionTab> tabs, int selectedIndex) {
         ArrayList<SessionTab> next = new ArrayList<SessionTab>();
         int count = Math.min(MAX_SESSION_TABS, tabs == null ? 0 : tabs.size());
+        boolean[] accepted = new boolean[count];
         for (int i = 0; i < count; i++) {
             SessionTab tab = tabs.get(i);
             if (tab == null) continue;
             String url = normalizeSessionUrl(tab.url);
-            if (isWebUrl(url) || isHomePage(url)) next.add(new SessionTab(safeTitle(tab.title, url), url, tab.pinned));
+            if (isWebUrl(url) || isHomePage(url)) {
+                accepted[i] = true;
+                next.add(new SessionTab(safeTitle(tab.title, url), url, tab.pinned));
+            }
         }
-        int nextIndex = next.size() == 0 ? 0 : Math.max(0, Math.min(selectedIndex, next.size() - 1));
+        int nextIndex = SessionIndexPolicy.remap(accepted, selectedIndex);
         boolean changed;
         synchronized (lock) {
             changed = sessionIndex != nextIndex || session.size() != next.size();
@@ -310,26 +342,32 @@ final class BrowserDataStore {
                     safeTitle(value.optString("title", ""), url), url, value.optLong("createdAt", 0L)));
         }
         JSONArray savedHistory = root.optJSONArray("history");
+        HashSet<String> knownHistory = new HashSet<String>();
         if (savedHistory != null) for (int i = 0; i < savedHistory.length() && loadedHistory.size() < MAX_HISTORY; i++) {
             JSONObject value = savedHistory.optJSONObject(i);
             if (value == null) continue;
             String url = normalizeUrl(value.optString("url", ""));
-            if (isWebUrl(url)) loadedHistory.add(new HistoryItem(safeTitle(value.optString("title", ""), url), url,
+            if (isWebUrl(url) && knownHistory.add(url)) loadedHistory.add(new HistoryItem(safeTitle(value.optString("title", ""), url), url,
                     value.optLong("visitedAt", 0L), Math.max(1, value.optInt("visits", 1))));
         }
         JSONArray savedSession = root.optJSONArray("session");
-        if (savedSession != null) for (int i = 0; i < savedSession.length() && loadedSession.size() < MAX_SESSION_TABS; i++) {
+        int savedSessionCount = savedSession == null ? 0 : Math.min(savedSession.length(), MAX_SESSION_TABS);
+        boolean[] acceptedSession = new boolean[savedSessionCount];
+        if (savedSession != null) for (int i = 0; i < savedSessionCount; i++) {
             JSONObject value = savedSession.optJSONObject(i);
             if (value == null) continue;
             String url = normalizeSessionUrl(value.optString("url", ""));
-            if (isWebUrl(url) || isHomePage(url)) loadedSession.add(new SessionTab(
-                    safeTitle(value.optString("title", ""), url), url, value.optBoolean("pinned", false)));
+            if (isWebUrl(url) || isHomePage(url)) {
+                acceptedSession[i] = true;
+                loadedSession.add(new SessionTab(safeTitle(value.optString("title", ""), url), url,
+                        value.optBoolean("pinned", false)));
+            }
         }
         synchronized (lock) {
             bookmarks.clear(); bookmarks.addAll(loadedBookmarks);
             history.clear(); history.addAll(loadedHistory);
             session.clear(); session.addAll(loadedSession);
-            sessionIndex = Math.max(0, Math.min(root.optInt("sessionIndex", 0), Math.max(0, session.size() - 1)));
+            sessionIndex = SessionIndexPolicy.remap(acceptedSession, root.optInt("sessionIndex", 0));
         }
         scheduleWrite();
         return loadedBookmarks.size();
@@ -367,22 +405,25 @@ final class BrowserDataStore {
         synchronized (lock) {
             if (closed || !dirty) return;
             retryPending = false;
+            Handler handler = ioLocked();
+            handler.removeCallbacks(writer);
+            handler.post(writer);
         }
-        io.removeCallbacks(writer);
-        io.post(writer);
     }
 
     void close() {
-        boolean shouldWrite;
+        Handler handler;
         synchronized (lock) {
             if (closed) return;
             closed = true;
             retryPending = false;
-            shouldWrite = dirty;
+            handler = io;
+            if (handler != null) {
+                handler.removeCallbacks(writer);
+                if (dirty) handler.post(writer);
+            }
         }
-        io.removeCallbacks(writer);
-        if (shouldWrite) io.post(writer);
-        LocalDataIo.release();
+        if (handler != null) LocalDataIo.release();
     }
 
     private void scheduleWrite() {
@@ -390,9 +431,16 @@ final class BrowserDataStore {
             if (closed) return;
             dirty = true;
             retryPending = false;
+            Handler handler = ioLocked();
+            handler.removeCallbacks(writer);
+            handler.postDelayed(writer, WRITE_DELAY_MS);
         }
-        io.removeCallbacks(writer);
-        io.postDelayed(writer, WRITE_DELAY_MS);
+    }
+
+    /** Reading the library during startup must not allocate a fourth background thread. */
+    private Handler ioLocked() {
+        if (io == null) io = LocalDataIo.acquire();
+        return io;
     }
 
     private JSONObject snapshotJson() {
@@ -458,25 +506,30 @@ final class BrowserDataStore {
             ArrayList<Bookmark> loadedBookmarks = new ArrayList<Bookmark>();
             ArrayList<HistoryItem> loadedHistory = new ArrayList<HistoryItem>();
             ArrayList<SessionTab> loadedSession = new ArrayList<SessionTab>();
+            HashSet<String> knownBookmarks = new HashSet<String>();
+            HashSet<String> knownHistory = new HashSet<String>();
             if (savedBookmarks != null) for (int i = 0; i < savedBookmarks.length() && loadedBookmarks.size() < MAX_BOOKMARKS; i++) {
                 JSONObject value = savedBookmarks.optJSONObject(i);
                 if (value == null) continue;
                 String url = normalizeUrl(value.optString("url", ""));
-                if (isWebUrl(url)) loadedBookmarks.add(new Bookmark(safeTitle(value.optString("title", ""), url), url,
+                if (isWebUrl(url) && knownBookmarks.add(url)) loadedBookmarks.add(new Bookmark(safeTitle(value.optString("title", ""), url), url,
                         value.optLong("createdAt", 0L)));
             }
             if (savedHistory != null) for (int i = 0; i < savedHistory.length() && loadedHistory.size() < MAX_HISTORY; i++) {
                 JSONObject value = savedHistory.optJSONObject(i);
                 if (value == null) continue;
                 String url = normalizeUrl(value.optString("url", ""));
-                if (isWebUrl(url)) loadedHistory.add(new HistoryItem(safeTitle(value.optString("title", ""), url), url,
+                if (isWebUrl(url) && knownHistory.add(url)) loadedHistory.add(new HistoryItem(safeTitle(value.optString("title", ""), url), url,
                         value.optLong("visitedAt", 0L), Math.max(1, value.optInt("visits", 1))));
             }
-            if (savedSession != null) for (int i = 0; i < savedSession.length() && loadedSession.size() < MAX_SESSION_TABS; i++) {
+            int savedSessionCount = savedSession == null ? 0 : Math.min(savedSession.length(), MAX_SESSION_TABS);
+            boolean[] acceptedSession = new boolean[savedSessionCount];
+            if (savedSession != null) for (int i = 0; i < savedSessionCount; i++) {
                 JSONObject value = savedSession.optJSONObject(i);
                 if (value == null) continue;
                 String url = normalizeSessionUrl(value.optString("url", ""));
                 if (isWebUrl(url) || isHomePage(url)) {
+                    acceptedSession[i] = true;
                     loadedSession.add(new SessionTab(safeTitle(value.optString("title", ""), url), url, value.optBoolean("pinned", false)));
                 }
             }
@@ -486,7 +539,7 @@ final class BrowserDataStore {
             bookmarks.addAll(loadedBookmarks);
             history.addAll(loadedHistory);
             session.addAll(loadedSession);
-            sessionIndex = Math.max(0, Math.min(root.optInt("sessionIndex", 0), Math.max(0, session.size() - 1)));
+            sessionIndex = SessionIndexPolicy.remap(acceptedSession, root.optInt("sessionIndex", 0));
             return true;
         } catch (Exception ignored) {
             return false;
@@ -522,15 +575,13 @@ final class BrowserDataStore {
     }
 
     private static String normalizeUrl(String url) {
-        if (url == null) return "";
-        String value = url.trim();
-        while (value.endsWith("/") && value.length() > "https://a/".length()) value = value.substring(0, value.length() - 1);
-        return value;
+        return UrlStoragePolicy.normalize(url);
     }
 
     private static String normalizeSessionUrl(String url) {
         String value = normalizeUrl(url);
-        if (isHomePage(value) || UrlCleaner.isInternalPage(value, "median.home")) return HOME_URL;
+        if (isHomePage(value) || isInternalHost(value, "median.invalid") ||
+                isInternalHost(value, "median.home")) return HOME_URL;
         return value;
     }
 
@@ -541,14 +592,23 @@ final class BrowserDataStore {
     private static boolean isWebUrl(String url) {
         if (url == null || url.length() > 2048) return false;
         try {
-            NetworkSecurity.parseHttpUrl(url);
-            return true;
+            java.net.URL parsed = NetworkSecurity.parseHttpUrl(url);
+            return !"median.invalid".equalsIgnoreCase(parsed.getHost()) &&
+                    !"median.home".equalsIgnoreCase(parsed.getHost());
+        } catch (Exception ignored) { return false; }
+    }
+
+    private static boolean isInternalHost(String url, String expectedHost) {
+        try {
+            java.net.URL parsed = NetworkSecurity.parseHttpsUrl(url);
+            return expectedHost.equalsIgnoreCase(parsed.getHost()) &&
+                    (parsed.getPort() == -1 || parsed.getPort() == 443);
         } catch (Exception ignored) { return false; }
     }
 
     private static String safeTitle(String title, String url) {
         String value = title == null ? "" : title.trim();
         if (value.length() == 0) value = url;
-        return value.length() > 160 ? value.substring(0, 160) : value;
+        return UiText.truncate(value, 160);
     }
 }

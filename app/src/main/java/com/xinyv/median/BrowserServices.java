@@ -58,14 +58,13 @@ final class BrowserServices {
         return performance;
     }
 
-    /** Decodes local list indexes after the first page, before their menus are opened. */
-    synchronized void warmLocalIndexes() {
-        if (downloads == null) downloads = new DownloadStore(context);
-        if (offlinePages == null) offlinePages = new OfflinePageStore(context);
-    }
-
     synchronized void trimMemory() {
         if (passwords != null) passwords.trimMemory();
+        if (scriptValues != null) scriptValues.trimMemory();
+    }
+
+    synchronized void lockVault() {
+        if (passwords != null) passwords.lock();
     }
 
     synchronized void close() {

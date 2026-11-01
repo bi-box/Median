@@ -5,12 +5,12 @@ import android.content.SharedPreferences;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.Process;
+import android.util.AtomicFile;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -21,10 +21,8 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /** HTTPS filter subscriptions with bounded downloads and atomic on-disk replacement. */
@@ -61,8 +59,8 @@ final class FilterSubscriptionStore {
     private final SharedPreferences prefs;
     private final File directory;
     private final ArrayList<Subscription> subscriptions = new ArrayList<Subscription>();
-    private final ThreadPoolExecutor worker = new ThreadPoolExecutor(
-            1, 1, 30L, TimeUnit.SECONDS, new ArrayBlockingQueue<Runnable>(1));
+    private final ThreadPoolExecutor worker =
+            BackgroundExecutor.create(1, 1, "median-filter", false);
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean updateInFlight = new AtomicBoolean();
     private final AtomicBoolean manualUpdatePending = new AtomicBoolean();
@@ -73,7 +71,6 @@ final class FilterSubscriptionStore {
         prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         directory = new File(context.getFilesDir(), "filter-subscriptions");
         if (!directory.isDirectory()) directory.mkdirs();
-        worker.allowCoreThreadTimeOut(true);
         load();
     }
 
@@ -270,19 +267,18 @@ final class FilterSubscriptionStore {
             int count = plausibleRuleCount(text);
             if (count < 10) throw new IllegalArgumentException("订阅内容不像有效规则列表");
             File targetFile = fileFor(target);
-            File temporary = new File(directory, targetFile.getName() + ".tmp");
-            FileOutputStream output = new FileOutputStream(temporary);
+            AtomicFile atomic = new AtomicFile(targetFile);
+            FileOutputStream output = null;
             try {
+                output = atomic.startWrite();
                 output.write(bytes);
                 output.flush();
                 output.getFD().sync();
-            } finally {
-                output.close();
-            }
-            if (!temporary.renameTo(targetFile)) {
-                FileOutputStream direct = new FileOutputStream(targetFile);
-                try { direct.write(bytes); } finally { direct.close(); }
-                temporary.delete();
+                atomic.finishWrite(output);
+                output = null;
+            } catch (Exception writeError) {
+                if (output != null) atomic.failWrite(output);
+                throw writeError;
             }
             updateMetadata(target.id, System.currentTimeMillis(), count,
                     value(connection.getHeaderField("ETag")), value(connection.getHeaderField("Last-Modified")), "");
@@ -399,7 +395,7 @@ final class FilterSubscriptionStore {
     }
 
     private static byte[] readFile(File file, int maxBytes) throws Exception {
-        return NetworkSecurity.readBounded(new FileInputStream(file), maxBytes, "下载内容超过大小限制");
+        return BoundedFileReader.read(file, maxBytes, "下载内容超过大小限制");
     }
 
     private static boolean isHttps(String url) {
@@ -418,7 +414,7 @@ final class FilterSubscriptionStore {
 
     private static String bounded(String value, int max) {
         String result = value == null ? "" : value;
-        return result.length() > max ? result.substring(0, max) : result;
+        return UiText.truncate(result, max);
     }
 
     private static String hostOf(String url) {
@@ -429,7 +425,7 @@ final class FilterSubscriptionStore {
         String value = name == null ? "" : name.trim();
         if (value.length() == 0) value = fallback;
         if (value.length() == 0) value = "自定义订阅";
-        return value.length() > 80 ? value.substring(0, 80) : value;
+        return UiText.truncate(value, 80);
     }
 
     private static String value(String value) { return value == null ? "" : value; }

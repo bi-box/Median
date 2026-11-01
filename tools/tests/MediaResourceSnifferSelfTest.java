@@ -5,6 +5,7 @@ import java.util.List;
 public final class MediaResourceSnifferSelfTest {
     public static void main(String[] args) {
         expect(MediaResourceSniffer.isCandidate("https://cdn.example/master.m3u8?token=x", ""), "HLS extension");
+        expect(MediaResourceSniffer.isCandidate("HTTPS://cdn.example/master.m3u8", ""), "case-insensitive HTTP scheme");
         expect(MediaResourceSniffer.isCandidate("https://cdn.example/api?url=https%3A%2F%2Fx%2Fmaster.m3u8", ""), "encoded HLS URL");
         expect(MediaResourceSniffer.isCandidate("https://cdn.example/api?url=https%253A%252F%252Fx%252Fmaster%252Em3u8", ""), "double-encoded HLS URL");
         expect(MediaResourceSniffer.isCandidate("https://cdn.example/opaque?id=7", "video/mp4; q=1"), "extensionless MIME");
@@ -22,6 +23,9 @@ public final class MediaResourceSnifferSelfTest {
         expect(MediaResourceSniffer.shouldInspectRequest("/assets/app.js", "source=movie%252Emp4", ""), "encoded static query remains inspectable");
         expect(MediaResourceSniffer.shouldInspectRequest("/api/resource", "id=7", ""), "extensionless request remains inspectable");
         expect(MediaResourceSniffer.shouldInspectRequest("/assets/app.js", "", "video/mp4"), "media MIME bypasses static rejection");
+        expect(MediaResourceSniffer.shouldProbeMediaHeaders("/play", "id=7"), "extensionless playback endpoint gets a header probe");
+        expect(MediaResourceSniffer.shouldProbeMediaHeaders("/api/resource", "mime_type=video/mp4"), "media query gets a header probe");
+        reject(MediaResourceSniffer.shouldProbeMediaHeaders("/api/resource", "id=7"), "ordinary API avoids a header probe");
         expect(MediaResourceSniffer.isObviousLoadResource("https://cdn.example/MOVIE.MP4?sig=1"), "cheap obvious resource gate");
         reject(MediaResourceSniffer.isObviousLoadResource("https://cdn.example/assets/application.js"), "cheap ordinary resource gate");
 
@@ -38,6 +42,8 @@ public final class MediaResourceSnifferSelfTest {
         expect("HLS 流".equals(all.get(0).kind), "manifest priority");
         all.get(0).kind = "changed";
         expect("HLS 流".equals(sniffer.getAll().get(0).kind), "resource snapshot isolation");
+        sniffer.beginPage("https://page.example/a#section");
+        expect(sniffer.size() > 0, "fragment-only navigation must retain media");
         sniffer.beginPage("https://page.example/b");
         expect(sniffer.size() == 0, "navigation reset");
         System.out.println("MediaResourceSnifferSelfTest passed");

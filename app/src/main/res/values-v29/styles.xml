@@ -1,0 +1,26 @@
+<resources>
+    <style name="AppTheme" parent="AppThemeBase">
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:isLightTheme">true</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+    <style name="AppThemeDark" parent="AppThemeDarkBase">
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:isLightTheme">false</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+    <style name="AppThemeSignalLight" parent="AppThemeSignalLightBase">
+        <item name="android:isLightTheme">true</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+    <style name="AppThemeSignalDark" parent="AppThemeSignalDarkBase">
+        <item name="android:isLightTheme">false</item>
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+    <style name="MedianAlertDialogLight" parent="MedianAlertDialogLightBase">
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+    <style name="MedianAlertDialogDark" parent="MedianAlertDialogDarkBase">
+        <item name="android:forceDarkAllowed">false</item>
+    </style>
+</resources>
