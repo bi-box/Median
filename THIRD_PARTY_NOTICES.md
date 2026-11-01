@@ -1,5 +1,7 @@
 # 第三方组件声明
 
+Median Browser 本体以 GNU General Public License v3.0 发布，完整条款见根目录 [`LICENSE`](LICENSE)。下列第三方组件保留各自的原始许可，随本项目一同分发时其许可条款继续适用。
+
 Median Browser 的网页渲染由 Android 系统提供的 Android System WebView 完成。项目还包含用于 WebView document-start 能力的兼容接口，以及相应的 Chromium support-library boundary 接口。
 
 ## 运行时所含组件

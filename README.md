@@ -19,7 +19,7 @@
   <img src="https://img.shields.io/badge/Android-8.0%2B-3DDC84?style=for-the-badge&amp;logo=android&amp;logoColor=white" alt="Android 8.0+">
   <img src="https://img.shields.io/badge/Engine-System%20WebView-181A1F?style=for-the-badge" alt="Android System WebView">
   <img src="https://img.shields.io/badge/APK-~300%20KB-E8A33D?style=for-the-badge" alt="APK 约 300 KB">
-  <img src="https://img.shields.io/badge/License-All%20rights%20reserved-6E7681?style=for-the-badge" alt="保留所有权利">
+  <img src="https://img.shields.io/badge/License-GPL--3.0-6E7681?style=for-the-badge" alt="GPL-3.0 开源许可">
 </p>
 
 <p>
@@ -250,7 +250,7 @@ Median 用设备自带的 **Android System WebView** 渲染网页，因此应用
 <details>
 <summary><strong>Median 是开源软件吗？</strong></summary>
 
-源码在 GitHub 上公开可读，但许可证为「保留所有权利」，并非 MIT、Apache 或 GPL 等开源许可证。使用、修改、分发或商用前，请先阅读 [LICENSE](LICENSE) 并取得所需授权。
+是。项目以 **GNU General Public License v3.0（GPL-3.0）** 发布：可以自由使用、修改和分发，包括商用；但分发衍生作品时须同样以 GPL-3.0 开源，并保留版权与许可声明。完整条款见 [LICENSE](LICENSE)。
 
 </details>
 
@@ -304,6 +304,10 @@ Release 附件只上传 `MedianBrowser-2.4.0.apk`，SHA-256：
 - [安全策略](SECURITY.md)
 - [第三方组件声明](THIRD_PARTY_NOTICES.md)
 - [软件许可](LICENSE)
+
+### 许可
+
+Median Browser 以 [GNU General Public License v3.0](LICENSE) 发布，可自由使用、修改与分发；再分发时需以同一协议开放源码并保留版权声明。随源码打包的第三方组件保留其原始许可（Apache-2.0、BSD-style、EPL 等），详见[第三方组件声明](THIRD_PARTY_NOTICES.md)。
 
 <div align="center">
 

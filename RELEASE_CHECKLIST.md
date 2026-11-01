@@ -3,7 +3,7 @@
 ## 1. Identity and legal
 
 - [ ] 确认应用名、applicationId `com.xinyv.median.compat`、开发者名称和商标不会与他人冲突。
-- [ ] 选择并确认源码许可证；当前 `LICENSE` 为保留全部权利。
+- [x] 源码许可证已确认为 GNU GPL v3.0，`LICENSE` 为完整条款文本；发布物需随附源码或提供源码获取方式。
 - [ ] 将 `PRIVACY_POLICY.md` 发布到永久公开 HTTPS URL，并确认商店开发者联系邮箱有效。
 - [ ] 完成 Google Play 内容分级、目标受众、广告声明、应用访问权限、Data Safety，以及 dataSync 前台服务用途声明。
 
