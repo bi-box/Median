@@ -1,0 +1,37 @@
+Median Browser is a lightweight Android browser that renders pages with the device's own Android System WebView, so the app itself stays around 300 KB instead of bundling a private Chromium build.
+
+Everything you expect from a daily browser is built in, and everything it stores stays on your device.
+
+AD BLOCKING
+• ABP / hosts rules, filter subscriptions, per-site switches and element hiding
+• Pick an ad element on the page to hide it, with selector validation before saving
+• Rule updates apply immediately, no restart needed
+
+LOCAL PASSWORD VAULT
+• Encrypted with Android Keystore and AES-GCM
+• Autofill on HTTPS pages, save prompts, encrypted portable backups
+• Locks again as soon as the app goes to the background
+
+USER SCRIPTS
+• Tampermonkey-style userscripts with common GM / GM4 APIs
+• Document-start injection, per-site matching, @connect checks for network requests
+• Install from Greasy Fork, from a link, or by pasting code
+
+DOWNLOADS AND OFFLINE READING
+• Pause, resume and multi-segment downloads with retry
+• Save pages as local offline archives; reading mode, system TTS, translation, find in page
+• Choose the download folder, or hand the link to another download manager
+
+PRIVACY
+• Independent private window with its own session, cleared on exit
+• No advertising, analytics or crash-reporting SDKs
+• No developer account, sync server or telemetry backend
+• Per-site permissions, and optional on-demand TLS certificate inspection
+
+MAKE IT YOURS
+• Custom home page: background, layout, search engines, shortcuts
+• Tab management, themes, edge-swipe navigation, QR scanner, media discovery
+
+Median Browser is free software licensed under the GPL-3.0. Source code and issue tracker: https://github.com/bi-box/Median
+
+Requires Android 8.0 (API 26) or newer. The private window requires Android 9.0 (API 28). Page compatibility follows the Android System WebView installed on your device, so keep it up to date.

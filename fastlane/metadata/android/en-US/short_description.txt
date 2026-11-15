@@ -1,0 +1,1 @@
+Ultra-lightweight (~300 KB) privacy-focused Android browser built on WebView.

@@ -1,0 +1,9 @@
+2.4.0
+
+• Hide any ad element by tapping it, with selector validation before saving
+• Filter rules reload immediately without restarting the browser
+• Built-in QR scanner and bookmark HTML import
+• Choose the download folder or hand links to an external download app
+• Preconnect hints reduce time to first byte
+• GM_getTab / GM_saveTab support for userscripts
+• Faster, more reliable page restore and tab state
