@@ -27,7 +27,7 @@
   &nbsp;·&nbsp;
   <a href= "https://github.com/bi-box/Median/issues">🐞 问题反馈</a>
    &nbsp;·&nbsp;
-  <a href="https://sponsorship.forztn.com/github.com/bi-box/Median">Sponsorship by ForZT</a>
+  <a href="https://sponsorship.forztn.com/github.com/bi-box/Median">Sponsored by ForZTN</a>
  
 </p>
 
