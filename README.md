@@ -26,6 +26,8 @@
   <a href="https://t.me/MedianBeta">💬 加入 Telegram 社区</a>
   &nbsp;·&nbsp;
   <a href="https://github.com/bi-box/Median/issues">🐞 问题反馈</a>
+  <a href="https://sponsorship.forztn.com/github.com/bi-box/Median">sponsorship</a>
+ 
 </p>
 
 <sub><a href="#设计哲学">设计哲学</a> &nbsp;·&nbsp; <a href="#核心功能">核心功能</a> &nbsp;·&nbsp; <a href="#界面预览">界面预览</a> &nbsp;·&nbsp; <a href="#立即安装">立即安装</a> &nbsp;·&nbsp; <a href="#隐私与安全">隐私与安全</a> &nbsp;·&nbsp; <a href="#常见问题">常见问题</a> &nbsp;·&nbsp; <a href="#开发者">开发者</a></sub>
