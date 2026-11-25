@@ -25,7 +25,8 @@
 <p>
   <a href="https://t.me/MedianBeta">💬 加入 Telegram 社区</a>
   &nbsp;·&nbsp;
-  <a href="https://github.com/bi-box/Median/issues">🐞 问题反馈</a>
+  <a href= "https://github.com/bi-box/Median/issues">🐞 问题反馈</a>
+   &nbsp;·&nbsp;
   <a href="https://sponsorship.forztn.com/github.com/bi-box/Median">sponsorship</a>
  
 </p>
